@@ -98,7 +98,7 @@ MAX_PENDING_ACK_CRCS = 64
 # CMD_SEND_ANON_REQ (owner requests, etc.) is supported.
 # 10+ provides support for multi-byte path lengths.
 # 11+ adds channel binary datagrams and default flood scope commands.
-FIRMWARE_VER_CODE = 11
+FIRMWARE_VER_CODE = 10
 
 # ---------------------------------------------------------------------------
 # Commands (app -> radio)
