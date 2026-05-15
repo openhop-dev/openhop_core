@@ -164,6 +164,7 @@ class SX1262Radio(LoRaRadio):
         # Track event loop for thread-safe interrupt handling
         self._event_loop = None
 
+
         # Store CAD results from interrupt handler
         self._last_cad_detected = False
         self._last_cad_irq_status = 0
@@ -541,7 +542,8 @@ class SX1262Radio(LoRaRadio):
 
             except Exception as e:
                 logger.error(f"[RX Task] Unexpected error: {e}")
-                await asyncio.sleep(1.0)  # Wait and continue
+                self._initialized = False
+                break
 
         logger.warning("[RX] RX IRQ background task exiting")
 

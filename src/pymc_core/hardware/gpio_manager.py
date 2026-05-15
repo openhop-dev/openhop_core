@@ -254,7 +254,7 @@ class GPIOPinManager:
                 print(f"\nDebug: sudo lsof /dev/gpiochip* | grep {pin_number}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"GPIO pin {pin_number} is already in use by another process") from e
             elif "permission denied" in error_msg:
                 logger.error(f"Permission denied for GPIO pin {pin_number}: {e}")
                 print(f"\nFATAL: Permission denied for GPIO pin {pin_number}")
@@ -263,7 +263,7 @@ class GPIOPinManager:
                 print("  • Add user to gpio group: sudo usermod -a -G gpio $USER")
                 print("  • Then logout and login again")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Permission denied for GPIO pin {pin_number}") from e
             else:
                 logger.error(
                     f"Failed to setup output pin {pin_number} on {self._gpio_chip} "
@@ -277,7 +277,7 @@ class GPIOPinManager:
                 print(f"Error: {e}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Cannot setup GPIO output pin {pin_number}: {e}") from e
 
     def setup_input_pin(
         self,
@@ -340,7 +340,7 @@ class GPIOPinManager:
                 print(f"\nDebug: sudo lsof /dev/gpiochip* | grep {pin_number}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"GPIO pin {pin_number} is already in use by another process") from e
             elif "permission denied" in error_msg:
                 logger.error(f"Permission denied for GPIO pin {pin_number}: {e}")
                 print(f"\nFATAL: Permission denied for GPIO pin {pin_number}")
@@ -349,7 +349,7 @@ class GPIOPinManager:
                 print("  • Add user to gpio group: sudo usermod -a -G gpio $USER")
                 print("  • Then logout and login again")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Permission denied for GPIO pin {pin_number}") from e
             else:
                 logger.error(
                     f"Failed to setup input pin {pin_number} on {self._gpio_chip} "
@@ -363,7 +363,7 @@ class GPIOPinManager:
                 print(f"Error: {e}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Cannot setup GPIO input pin {pin_number}: {e}") from e
 
     def setup_interrupt_pin(
         self,
@@ -423,7 +423,7 @@ class GPIOPinManager:
                 print(f"\nDebug: sudo lsof /dev/gpiochip* | grep {pin_number}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"GPIO pin {pin_number} is already in use by another process") from e
             elif "permission denied" in error_msg:
                 print(f"\nFATAL: Permission denied for GPIO pin {pin_number}")
                 print("━" * 60)
@@ -431,7 +431,7 @@ class GPIOPinManager:
                 print("  • Add user to gpio group: sudo usermod -a -G gpio $USER")
                 print("  • Then logout and login again")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Permission denied for GPIO pin {pin_number}") from e
             else:
                 logger.error(
                     f"Failed to setup interrupt pin {pin_number} on {self._gpio_chip} "
@@ -445,7 +445,7 @@ class GPIOPinManager:
                 print(f"Error: {e}")
                 print("\nThe system cannot function without GPIO access.")
                 print("━" * 60)
-                sys.exit(1)
+                raise RuntimeError(f"Cannot setup GPIO interrupt pin {pin_number}: {e}") from e
 
     def _start_edge_detection(self, pin_number: int) -> None:
         """Start hardware edge detection thread"""

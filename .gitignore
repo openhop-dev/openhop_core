@@ -124,3 +124,9 @@ dmypy.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Session tracking (git-excluded by convention)
+RULES.md
+PROBLEM_STATEMENT.md
+PR_DESCRIPTION.md
+REPEATER_CHANGES.md

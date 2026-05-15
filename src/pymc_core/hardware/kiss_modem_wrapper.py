@@ -273,7 +273,6 @@ class KissModemWrapper(LoRaRadio):
         self.preamble_length = self.radio_config.get("preamble_length", 17)
 
         self.serial_conn: Optional[serial.Serial] = None
-        self.is_connected = False
 
         self.rx_buffer = deque(maxlen=RX_BUFFER_SIZE)
         self.tx_buffer = deque(maxlen=TX_BUFFER_SIZE)
@@ -291,6 +290,7 @@ class KissModemWrapper(LoRaRadio):
 
         # Event loop for thread-safe async callback invocation
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+
         # When no event loop is set, run callback in a worker so RX thread never blocks
         self._callback_executor: Optional[ThreadPoolExecutor] = None
 
@@ -339,6 +339,13 @@ class KissModemWrapper(LoRaRadio):
         self._event_loop = loop
         logger.debug("Event loop set for thread-safe callbacks")
 
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self.rx_thread is not None and self.rx_thread.is_alive()
+            and self.tx_thread is not None and self.tx_thread.is_alive()
+        )
+
     def set_lbt_enabled(self, enabled: bool) -> None:
         """
         Enable or disable host-side Listen-Before-Talk before each send.
@@ -371,7 +378,6 @@ class KissModemWrapper(LoRaRadio):
                 stopbits=serial.STOPBITS_ONE,
             )
 
-            self.is_connected = True
             self.stop_event.clear()
 
             # Start communication threads
@@ -409,12 +415,10 @@ class KissModemWrapper(LoRaRadio):
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
-            self.is_connected = False
             return False
 
     def disconnect(self):
         """Disconnect from serial port and stop threads"""
-        self.is_connected = False
         self.stop_event.set()
 
         # Wait for threads to finish
@@ -1440,7 +1444,7 @@ class KissModemWrapper(LoRaRadio):
 
     def _rx_worker(self):
         """Background thread for receiving data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while not self.stop_event.is_set():
             try:
                 if self.serial_conn and self.serial_conn.in_waiting > 0:
                     data = self.serial_conn.read(self.serial_conn.in_waiting)
@@ -1452,13 +1456,12 @@ class KissModemWrapper(LoRaRadio):
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                if self.is_connected:
-                    logger.error(f"RX worker error: {e}")
+                logger.error(f"RX worker error: {e}")
                 break
 
     def _tx_worker(self):
         """Background thread for sending data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while not self.stop_event.is_set():
             try:
                 if self.tx_buffer:
                     frame = self.tx_buffer.popleft()
@@ -1475,8 +1478,7 @@ class KissModemWrapper(LoRaRadio):
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                if self.is_connected:
-                    logger.error(f"TX worker error: {e}")
+                logger.error(f"TX worker error: {e}")
                 break
 
     def __enter__(self):

@@ -87,7 +87,6 @@ class KissSerialWrapper(LoRaRadio):
         self.kiss_mode_active = False
 
         self.serial_conn: Optional[serial.Serial] = None
-        self.is_connected = False
 
         self.rx_buffer = deque(maxlen=RX_BUFFER_SIZE)
         self.tx_buffer = deque(maxlen=TX_BUFFER_SIZE)
@@ -102,6 +101,7 @@ class KissSerialWrapper(LoRaRadio):
 
         # Callbacks
         self.on_frame_received = on_frame_received
+
 
         # KISS Configuration
         self.config = {
@@ -124,6 +124,13 @@ class KissSerialWrapper(LoRaRadio):
             "noise_floor": None,
         }
 
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self.rx_thread is not None and self.rx_thread.is_alive()
+            and self.tx_thread is not None and self.tx_thread.is_alive()
+        )
+
     def connect(self) -> bool:
         """
         Connect to serial port and start communication threads
@@ -141,7 +148,6 @@ class KissSerialWrapper(LoRaRadio):
                 stopbits=serial.STOPBITS_ONE,
             )
 
-            self.is_connected = True
             self.stop_event.clear()
 
             # Start communication threads
@@ -163,12 +169,10 @@ class KissSerialWrapper(LoRaRadio):
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
-            self.is_connected = False
             return False
 
     def disconnect(self):
         """Disconnect from serial port and stop threads"""
-        self.is_connected = False
         self.stop_event.set()
 
         # Wait for threads to finish
@@ -649,7 +653,7 @@ class KissSerialWrapper(LoRaRadio):
 
     def _rx_worker(self):
         """Background thread for receiving data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while not self.stop_event.is_set():
             try:
                 if self.serial_conn and self.serial_conn.in_waiting > 0:
                     # Read available bytes
@@ -664,13 +668,12 @@ class KissSerialWrapper(LoRaRadio):
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                if self.is_connected:  # Only log if we expect to be connected
-                    logger.error(f"RX worker error: {e}")
+                logger.error(f"RX worker error: {e}")
                 break
 
     def _tx_worker(self):
         """Background thread for sending data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        while not self.stop_event.is_set():
             try:
                 if self.tx_buffer:
                     # Get frame from buffer
@@ -690,8 +693,7 @@ class KissSerialWrapper(LoRaRadio):
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                if self.is_connected:  # Only log if we expect to be connected
-                    logger.error(f"TX worker error: {e}")
+                logger.error(f"TX worker error: {e}")
                 break
 
     def __enter__(self):
