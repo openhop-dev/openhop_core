@@ -1398,6 +1398,59 @@ class SX1262Radio(LoRaRadio):
             "set bandwidth", set_bw, f"Bandwidth set to {bw/1000:.0f} kHz"
         )
 
+    def configure_radio(
+        self,
+        frequency: Optional[int] = None,
+        bandwidth: Optional[int] = None,
+        spreading_factor: Optional[int] = None,
+        coding_rate: Optional[int] = None,
+    ) -> bool:
+        if not self._initialized or self.lora is None:
+            logger.error("Cannot configure radio: not initialised")
+            return False
+
+        freq = frequency        if frequency        is not None else self.frequency
+        bw   = bandwidth        if bandwidth        is not None else self.bandwidth
+        sf   = spreading_factor if spreading_factor is not None else self.spreading_factor
+        cr   = coding_rate      if coding_rate      is not None else self.coding_rate
+        ldro = sf >= 11 and bw <= 125000
+
+        deadline = time.monotonic() + 10.0
+        while self._tx_lock.locked():
+            if time.monotonic() > deadline:
+                logger.error("configure_radio: TX did not complete within 10s")
+                return False
+            time.sleep(0.05)
+
+        try:
+            self.lora.clearIrqStatus(0xFFFF)
+            self.lora.setStandby(self.lora.STANDBY_RC)
+            time.sleep(self._RADIO_TIMING_DELAY)
+            self.lora.setFrequency(freq)
+            self.lora.setLoRaModulation(sf, bw, cr, ldro)
+            self.frequency        = freq
+            self.bandwidth        = bw
+            self.spreading_factor = sf
+            self.coding_rate      = cr
+            self._noise_floor      = -99.0
+            self._num_floor_samples = 0
+            self._floor_sample_sum  = 0.0
+            rx_mask = self._get_rx_irq_mask()
+            self.lora.clearIrqStatus(0xFFFF)
+            self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
+            self.lora.request(self.lora.RX_CONTINUOUS)
+            time.sleep(self._RADIO_TIMING_DELAY)
+            self.lora.clearIrqStatus(0xFFFF)
+            self._control_tx_rx_pins(tx_mode=False)
+            logger.info(
+                "Radio reconfigured: %.3f MHz BW=%.1f kHz SF%d CR4/%d",
+                freq / 1e6, bw / 1000, sf, cr,
+            )
+            return True
+        except Exception as e:
+            logger.error("Failed to configure radio: %s", e)
+            return False
+
     def get_status(self) -> dict:
         """Get radio status information"""
         status = {
