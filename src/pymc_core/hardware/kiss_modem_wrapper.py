@@ -437,6 +437,9 @@ class KissModemWrapper(LoRaRadio):
 
         logger.info(f"KISS modem disconnected from {self.port}")
 
+    def cleanup(self) -> None:
+        self.disconnect()
+
     def _write_frame(self, frame: bytes) -> bool:
         """
         Write a complete KISS frame to the serial port.

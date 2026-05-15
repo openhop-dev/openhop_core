@@ -526,7 +526,7 @@ class GPIOPinManager:
             while not stop_event.is_set() and pin_number in self._pins:
                 try:
                     # Wait for edge event (kernel blocks until interrupt)
-                    if gpio.poll(30.0) and not stop_event.is_set():
+                    if gpio.poll(1.0) and not stop_event.is_set():
                         # Consume event from kernel queue to prevent repeated triggers
                         event: EdgeEvent = gpio.read_event()
 

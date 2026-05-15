@@ -187,6 +187,9 @@ class KissSerialWrapper(LoRaRadio):
 
         logger.info(f"KISS serial disconnected from {self.port}")
 
+    def cleanup(self) -> None:
+        self.disconnect()
+
     def send_frame(self, data: bytes) -> bool:
         """
         Send a data frame via KISS protocol

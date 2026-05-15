@@ -1654,6 +1654,9 @@ class SX1262Radio(LoRaRadio):
 
     def cleanup(self) -> None:
         """Clean up radio resources"""
+        if hasattr(self, "_rx_irq_task") and self._rx_irq_task and not self._rx_irq_task.done():
+            self._rx_irq_task.cancel()
+
         if hasattr(self, "lora") and self.lora:
             try:
                 self.lora.end()
@@ -1661,6 +1664,11 @@ class SX1262Radio(LoRaRadio):
                 logger.error(f"Error during cleanup: {e}")
 
         if hasattr(self, "_gpio_manager"):
+            for pin in [self.txen_pin, self.rxen_pin]:
+                if pin != -1:
+                    self._gpio_manager.set_pin_low(pin)
+            for pin in self.en_pins:
+                self._gpio_manager.set_pin_low(pin)
             self._gpio_manager.cleanup_all()
 
         self._interrupt_setup = False
