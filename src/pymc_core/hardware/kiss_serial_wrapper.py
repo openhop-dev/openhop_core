@@ -669,6 +669,8 @@ class KissSerialWrapper(LoRaRadio):
 
             except Exception as e:
                 logger.error(f"RX worker error: {e}")
+                self.is_connected = False
+                self.stop_event.set()
                 break
 
     def _tx_worker(self):
@@ -694,6 +696,8 @@ class KissSerialWrapper(LoRaRadio):
 
             except Exception as e:
                 logger.error(f"TX worker error: {e}")
+                self.is_connected = False
+                self.stop_event.set()
                 break
 
     def __enter__(self):
