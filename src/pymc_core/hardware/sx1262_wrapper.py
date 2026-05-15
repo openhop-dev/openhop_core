@@ -542,8 +542,7 @@ class SX1262Radio(LoRaRadio):
 
             except Exception as e:
                 logger.error(f"[RX Task] Unexpected error: {e}")
-                self._initialized = False
-                break
+                await asyncio.sleep(1.0)
 
         logger.warning("[RX] RX IRQ background task exiting")
 
@@ -833,7 +832,7 @@ class SX1262Radio(LoRaRadio):
         except Exception as e:
             logger.error(f"Failed to initialize SX1262 radio: '{e}'")
             self._initialized = False
-            # Hard fail immediately - no retries
+            self.cleanup()
             raise RuntimeError(f"Failed to initialize SX1262 radio: {e}") from e
 
     def _calculate_tx_timeout(self, packet_length: int) -> tuple[int, int]:

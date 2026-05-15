@@ -87,6 +87,7 @@ class KissSerialWrapper(LoRaRadio):
         self.kiss_mode_active = False
 
         self.serial_conn: Optional[serial.Serial] = None
+        self.is_connected = False
 
         self.rx_buffer = deque(maxlen=RX_BUFFER_SIZE)
         self.tx_buffer = deque(maxlen=TX_BUFFER_SIZE)
@@ -124,13 +125,6 @@ class KissSerialWrapper(LoRaRadio):
             "noise_floor": None,
         }
 
-    @property
-    def is_connected(self) -> bool:
-        return (
-            self.rx_thread is not None and self.rx_thread.is_alive()
-            and self.tx_thread is not None and self.tx_thread.is_alive()
-        )
-
     def connect(self) -> bool:
         """
         Connect to serial port and start communication threads
@@ -148,6 +142,7 @@ class KissSerialWrapper(LoRaRadio):
                 stopbits=serial.STOPBITS_ONE,
             )
 
+            self.is_connected = True
             self.stop_event.clear()
 
             # Start communication threads
@@ -169,10 +164,12 @@ class KissSerialWrapper(LoRaRadio):
 
         except Exception as e:
             logger.error(f"Failed to connect to {self.port}: {e}")
+            self.is_connected = False
             return False
 
     def disconnect(self):
         """Disconnect from serial port and stop threads"""
+        self.is_connected = False
         self.stop_event.set()
 
         # Wait for threads to finish
