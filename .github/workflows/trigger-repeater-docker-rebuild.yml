@@ -1,0 +1,76 @@
+name: Trigger Repeater Docker Rebuild
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+    inputs:
+      repeater_repository:
+        description: "Repository to dispatch the repeater image rebuild to"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: |
+      github.repository == 'pyMC-dev/pyMC_core' ||
+      github.repository == 'rightup/pyMC_core' ||
+      github.repository == 'yellowcooln/pyMC_core'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine dispatch target
+        id: target
+        shell: bash
+        env:
+          INPUT_REPEATER_REPOSITORY: ${{ inputs.repeater_repository }}
+        run: |
+          set -euo pipefail
+
+          channel="${GITHUB_REF_NAME}"
+          case "${channel}" in
+            main|dev) ;;
+            *)
+              echo "Unsupported core channel: ${channel}" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ -n "${INPUT_REPEATER_REPOSITORY}" ]; then
+            repeater_repository="${INPUT_REPEATER_REPOSITORY}"
+          elif [ "${GITHUB_REPOSITORY}" = "yellowcooln/pyMC_core" ]; then
+            repeater_repository="yellowcooln/pyMC_Repeater"
+          else
+            repeater_repository="pyMC-dev/pyMC_Repeater"
+          fi
+
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+          echo "repeater_repository=${repeater_repository}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger repeater image rebuild
+        env:
+          DISPATCH_TOKEN: ${{ secrets.REPEATER_REPO_DISPATCH_TOKEN }}
+          REPEATER_REPOSITORY: ${{ steps.target.outputs.repeater_repository }}
+          CHANNEL: ${{ steps.target.outputs.channel }}
+          CORE_SHA: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DISPATCH_TOKEN}" ]; then
+            echo "REPEATER_REPO_DISPATCH_TOKEN is not set" >&2
+            exit 1
+          fi
+
+          curl -fsSL \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            "https://api.github.com/repos/${REPEATER_REPOSITORY}/dispatches" \
+            -d "{\"event_type\":\"rebuild-from-core\",\"client_payload\":{\"channel\":\"${CHANNEL}\",\"core_ref\":\"${CHANNEL}\",\"core_sha\":\"${CORE_SHA}\",\"source_repository\":\"${SOURCE_REPOSITORY}\",\"source_run_url\":\"${SOURCE_RUN_URL}\"}}"
