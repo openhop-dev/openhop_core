@@ -19,7 +19,6 @@ jobs:
   dispatch:
     if: |
       github.repository == 'pyMC-dev/pyMC_core' ||
-      github.repository == 'rightup/pyMC_core' ||
       github.repository == 'yellowcooln/pyMC_core'
     runs-on: ubuntu-latest
 
