@@ -456,11 +456,9 @@ class KissModemWrapper(LoRaRadio):
             except Exception as e:
                 logger.error("Serial write error: %s", e)
                 return False
-        try:
-            self.serial_conn.flush()
-        except Exception as e:
-            logger.error("Serial flush error: %s", e)
-            return False
+        # flush()/tcdrain() removed: hangs indefinitely on USB CDC ACM
+        # (e.g. ESP32 T3S3/S3 with TinyUSB). write() already copies data
+        # to the kernel USB buffer atomically; no drain needed.
         return True
 
     def _set_kiss_tx_delay(self, delay_ms: int) -> None:
