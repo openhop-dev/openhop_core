@@ -1645,6 +1645,11 @@ class SX1262Radio(LoRaRadio):
                 rx_mask = self._get_rx_irq_mask()
                 self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
                 await asyncio.sleep(0.001)
+                if self._tx_lock.locked():
+                    logger.error(
+                        "[CAD] Race condition detected: restoring RX_CONTINUOUS during active TX — "
+                        "FIFO bytes 128+ may be overwritten by a competing reception"
+                    )
                 self.lora.request(self.lora.RX_CONTINUOUS)
                 await asyncio.sleep(self.RADIO_TIMING_DELAY)  # Give hardware time to enter RX mode
 
