@@ -1234,6 +1234,15 @@ class SX1262Radio(LoRaRadio):
                 await asyncio.sleep(self.RADIO_TIMING_DELAY)
                 self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
 
+                if length > 128:
+                    expected = bytes(data_list[128:])
+                    actual = bytes(self.lora.readBuffer(0x80, length - 128))
+                    if actual != expected:
+                        logger.error(
+                            f"[TX] Race 3 confirmed: FIFO corrupted — transmitting bad data. "
+                            f"expected={expected.hex()} actual={actual.hex()}"
+                        )
+
                 if not await self._execute_transmission(driver_timeout):
                     raise RuntimeError("Radio failed to start TX")
 
