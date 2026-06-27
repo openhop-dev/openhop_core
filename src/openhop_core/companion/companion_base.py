@@ -82,6 +82,8 @@ from .timing import DEFAULT_MAX_ATTEMPTS, response_timeout_ms
 
 logger = logging.getLogger("CompanionBase")
 
+ZERO_FLOOD_SCOPE_KEY = b"\x00" * 16
+
 
 def _fmt_path(out_path_len: int, out_path: Any) -> str:
     """Format a contact's out_path for [PATHDIAG] logs without ambiguity.
@@ -222,6 +224,7 @@ class CompanionBase(ABC):
         self._custom_vars: dict[str, str] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
+        self._flood_scope_disabled: bool = False
         # One-shot "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
         # when set, the next flood ignores the default scope and floods unscoped.
         self._flood_unscoped: bool = False
@@ -589,16 +592,29 @@ class CompanionBase(ABC):
     # -------------------------------------------------------------------------
 
     def set_flood_scope(self, transport_key: Optional[bytes] = None) -> None:
-        """Set or clear the flood transport key for scoped flooding.
+        """Set, clear, or explicitly disable flood scoped routing.
 
         Also cancels any pending explicit-unscoped request (firmware sets
         ``send_unscoped = false`` whenever a scope override is set or reset).
+
+        ``meshcore_py`` sends mode 0 with a 16-byte all-zero key for an empty
+        flood scope. Treat that as persistently disabled scoping rather than a
+        valid transport key.
         """
-        if transport_key and len(transport_key) >= 16:
-            self._flood_transport_key = transport_key[:16]
-        else:
-            self._flood_transport_key = None
         self._flood_unscoped = False
+
+        if transport_key and len(transport_key) >= 16:
+            key = bytes(transport_key[:16])
+            if key == ZERO_FLOOD_SCOPE_KEY:
+                self._flood_transport_key = None
+                self._flood_scope_disabled = True
+                return
+            self._flood_transport_key = key
+            self._flood_scope_disabled = False
+            return
+
+        self._flood_transport_key = None
+        self._flood_scope_disabled = False
 
     def set_flood_unscoped(self) -> None:
         """Force the next flood to be unscoped, bypassing the default scope.
@@ -641,19 +657,23 @@ class CompanionBase(ABC):
 
         Derives the 16-byte transport key automatically via SHA-256 of the
         region name.  A leading ``#`` is added if not already present.
-        Pass ``None`` to clear the scope (flood to all).
+        Pass ``None`` to clear this transient region override.
         """
         if region_name:
             if not region_name.startswith("#"):
                 region_name = f"#{region_name}"
             self._flood_transport_key = get_auto_key_for(region_name)
+            self._flood_scope_disabled = False
         else:
             self._flood_transport_key = None
+            self._flood_scope_disabled = False
 
     def _resolve_flood_transport_key(self) -> Optional[bytes]:
-        """Resolve effective flood key: transient key first, then persisted default."""
+        """Resolve effective flood key: transient first, disabled next, then default."""
         if self._flood_transport_key is not None:
             return self._flood_transport_key
+        if getattr(self, "_flood_scope_disabled", False):
+            return None
         default_scope = self.get_default_flood_scope()
         if default_scope is None:
             return None

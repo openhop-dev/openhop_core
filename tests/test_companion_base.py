@@ -326,6 +326,56 @@ def test_apply_flood_scope_uses_default_scope_when_transient_unset():
     assert pkt.transport_codes[0] != 0
 
 
+def test_set_flood_scope_zero_key_disables_scope():
+    """An all-zero key is Remote Terminal's disabled scope, not a transport key."""
+    bridge = _make_bridge(path_hash_mode=0)
+    key = b"\x11" * 16
+    bridge.set_flood_scope(key)
+    assert bridge._resolve_flood_transport_key() == key
+
+    bridge.set_flood_scope(b"\x00" * 16)
+
+    assert bridge._flood_transport_key is None
+    assert bridge._resolve_flood_transport_key() is None
+
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+    assert pkt.transport_codes[0] == 0
+
+
+def test_zero_key_persistently_bypasses_default_flood_scope():
+    """Remote Terminal's empty scope disables default scoping beyond one packet."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", b"\x22" * 16) is True
+    assert bridge._resolve_flood_transport_key() == b"\x22" * 16
+
+    bridge.set_flood_scope(b"\x00" * 16)
+    assert bridge._resolve_flood_transport_key() is None
+
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+
+    pkt2 = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt2)
+    assert pkt2.get_route_type() == ROUTE_TYPE_FLOOD
+
+
+def test_set_flood_scope_none_clears_zero_key_disabled_state():
+    """Mode 0 without a key resets the override and lets default scope apply."""
+    bridge = _make_bridge(path_hash_mode=0)
+    assert bridge.set_default_flood_scope("region1", b"\x33" * 16) is True
+    bridge.set_flood_scope(b"\x00" * 16)
+
+    bridge.set_flood_scope(None)
+
+    assert bridge._resolve_flood_transport_key() == b"\x33" * 16
+    pkt = _make_flood_pkt()
+    bridge._apply_flood_scope(pkt)
+    assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+
+
 def _make_flood_pkt() -> Packet:
     pkt = Packet()
     pkt.header = (PAYLOAD_TYPE_TRACE << 2) | 0x01  # route type FLOOD
