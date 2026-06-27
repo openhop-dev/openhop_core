@@ -1067,6 +1067,7 @@ async def test_cmd_set_flood_scope_dispatches_mode_byte():
     bridge = Mock()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_ok = Mock()
+    server._write_err = Mock()
 
     # mode 1 (v12+): force unscoped
     await server._cmd_set_flood_scope(bytes([0x01]))
@@ -1084,6 +1085,15 @@ async def test_cmd_set_flood_scope_dispatches_mode_byte():
     bridge.reset_mock()
     await server._cmd_set_flood_scope(bytes([0x00]))
     bridge.set_flood_scope.assert_called_once_with(None)
+
+    # unknown mode: firmware falls through to unsupported command
+    bridge.reset_mock()
+    server._write_ok.reset_mock()
+    await server._cmd_set_flood_scope(bytes([0x02]) + bytes(range(16)))
+    bridge.set_flood_scope.assert_not_called()
+    bridge.set_flood_unscoped.assert_not_called()
+    server._write_ok.assert_not_called()
+    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
 
 
 def test_max_frame_size_is_176():

@@ -352,9 +352,10 @@ For MeshCore v1.15 parity, the frame protocol also supports a persisted default 
 
 openhop-core resolves effective flood scope as:
 
-1. transient key set by `CMD_SET_FLOOD_SCOPE` / `set_flood_scope()`
-2. otherwise persisted default key (if configured)
-3. otherwise unscoped flood
+1. explicit unscoped mode (`CMD_SET_FLOOD_SCOPE` mode 1) until mode 0 sets/resets scope
+2. transient key set by `CMD_SET_FLOOD_SCOPE` mode 0 / `set_flood_scope()`
+3. otherwise persisted default key (if configured)
+4. otherwise unscoped flood
 
 When a flood scope is active, all flood packets are tagged with a 16-bit transport code
 (HMAC-SHA256 derived) and sent as `ROUTE_TYPE_TRANSPORT_FLOOD`. Direct-routed packets

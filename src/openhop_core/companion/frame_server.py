@@ -1829,18 +1829,23 @@ class CompanionFrameServer:
         The firmware (MyMesh.cpp:1909) treats data[0] as a mode selector:
           * mode 0: set the scope override key (data[1:17]) when present, else
             reset the override; cancels any pending explicit-unscoped request.
-          * mode 1 (FIRMWARE_VER_CODE 12+, PR #2492): force the next flood to be
-            unscoped, ignoring the configured default scope.
+          * mode 1 (FIRMWARE_VER_CODE 12+, PR #2492): force following floods to
+            be unscoped, ignoring the configured default scope until mode 0.
         Older apps always sent mode 0, so this is backward compatible.
         """
         mode = data[0] if len(data) >= 1 else 0
         if mode == 1:
             self.bridge.set_flood_unscoped()
-        elif len(data) >= 17:
-            self.bridge.set_flood_scope(data[1:17])
-        else:
-            self.bridge.set_flood_scope(None)
-        self._write_ok()
+            self._write_ok()
+            return
+        if mode == 0:
+            if len(data) >= 17:
+                self.bridge.set_flood_scope(data[1:17])
+            else:
+                self.bridge.set_flood_scope(None)
+            self._write_ok()
+            return
+        self._write_err(ERR_CODE_UNSUPPORTED_CMD)
 
     async def _cmd_set_default_flood_scope(self, data: bytes) -> None:
         """Handle CMD_SET_DEFAULT_FLOOD_SCOPE (63)."""

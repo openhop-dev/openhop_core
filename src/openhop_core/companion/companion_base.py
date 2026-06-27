@@ -224,9 +224,8 @@ class CompanionBase(ABC):
         self._custom_vars: dict[str, str] = {}
         self._sign_buffer: Optional[bytearray] = None
         self._flood_transport_key: Optional[bytes] = None
-        self._flood_scope_disabled: bool = False
-        # One-shot "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
-        # when set, the next flood ignores the default scope and floods unscoped.
+        # Sticky "force unscoped flood" flag (FW PR #2492 / FIRMWARE_VER_CODE 12+):
+        # when set, floods ignore the default scope until a scope override/reset.
         self._flood_unscoped: bool = False
         self._time_offset: float = 0.0
 
@@ -592,35 +591,25 @@ class CompanionBase(ABC):
     # -------------------------------------------------------------------------
 
     def set_flood_scope(self, transport_key: Optional[bytes] = None) -> None:
-        """Set, clear, or explicitly disable flood scoped routing.
+        """Set or clear the transient flood scope override.
 
         Also cancels any pending explicit-unscoped request (firmware sets
         ``send_unscoped = false`` whenever a scope override is set or reset).
-
-        ``meshcore_py`` sends mode 0 with a 16-byte all-zero key for an empty
-        flood scope. Treat that as persistently disabled scoping rather than a
-        valid transport key.
         """
         self._flood_unscoped = False
 
         if transport_key and len(transport_key) >= 16:
             key = bytes(transport_key[:16])
-            if key == ZERO_FLOOD_SCOPE_KEY:
-                self._flood_transport_key = None
-                self._flood_scope_disabled = True
-                return
-            self._flood_transport_key = key
-            self._flood_scope_disabled = False
+            self._flood_transport_key = None if key == ZERO_FLOOD_SCOPE_KEY else key
             return
 
         self._flood_transport_key = None
-        self._flood_scope_disabled = False
 
     def set_flood_unscoped(self) -> None:
-        """Force the next flood to be unscoped, bypassing the default scope.
+        """Force following floods to be unscoped, bypassing the default scope.
 
-        Mirrors firmware CMD_SET_FLOOD_SCOPE_KEY mode 1 (FW PR #2492): a one-shot
-        flag consumed by the next flood-routed packet in _apply_flood_scope.
+        Mirrors firmware CMD_SET_FLOOD_SCOPE_KEY mode 1 (FW PR #2492): a sticky
+        flag cleared by the next scope override/reset.
         """
         self._flood_unscoped = True
 
@@ -663,17 +652,15 @@ class CompanionBase(ABC):
             if not region_name.startswith("#"):
                 region_name = f"#{region_name}"
             self._flood_transport_key = get_auto_key_for(region_name)
-            self._flood_scope_disabled = False
+            self._flood_unscoped = False
         else:
             self._flood_transport_key = None
-            self._flood_scope_disabled = False
+            self._flood_unscoped = False
 
     def _resolve_flood_transport_key(self) -> Optional[bytes]:
-        """Resolve effective flood key: transient first, disabled next, then default."""
+        """Resolve effective flood key: transient override first, then default."""
         if self._flood_transport_key is not None:
             return self._flood_transport_key
-        if getattr(self, "_flood_scope_disabled", False):
-            return None
         default_scope = self.get_default_flood_scope()
         if default_scope is None:
             return None
@@ -693,9 +680,7 @@ class CompanionBase(ABC):
             return  # only scope flood packets, not direct
         if self._flood_unscoped:
             # App explicitly requested unscoped (FW #2492): leave as plain flood,
-            # ignoring any default scope. One-shot — consumed here, as firmware
-            # resets send_unscoped after each flood.
-            self._flood_unscoped = False
+            # ignoring any default scope until a scope override/reset.
             return
         effective_key = self._resolve_flood_transport_key()
         if effective_key is None:
