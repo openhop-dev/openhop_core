@@ -517,7 +517,19 @@ class SX1262Radio(LoRaRadio):
                             if not self._tx_lock.locked():
                                 try:
                                     self.lora.request(self.lora.RX_CONTINUOUS)
+                                    # Read before clearing to catch back-to-back packets that arrived during processing.
+                                    pending_irq = self.lora.getIrqStatus()
                                     self.lora.clearIrqStatus(0xFFFF)
+                                    terminal_irqs = (
+                                        self.lora.IRQ_RX_DONE
+                                        | self.lora.IRQ_CRC_ERR
+                                        | self.lora.IRQ_TIMEOUT
+                                        | self.lora.IRQ_HEADER_ERR
+                                    )
+                                    if pending_irq & terminal_irqs:
+                                        logger.debug(f"[RX] Back-to-back packet queued (IRQ 0x{pending_irq:04X})")
+                                        self._last_irq_status = pending_irq
+                                        self._rx_done_event.set()
                                     await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                     logger.debug(
                                         f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
@@ -541,6 +553,21 @@ class SX1262Radio(LoRaRadio):
 
                         # Sample noise floor during quiet periods
                         self._sample_noise_floor()
+
+                        # Watchdog: gpiod polling can miss an edge if IRQ goes HIGH then LOW within
+                        # the 20ms poll window. Recover by driving _handle_interrupt directly.
+                        if (
+                            self.use_gpiod_backend
+                            and not self._tx_lock.locked()
+                            and not self._is_receiving_packet
+                        ):
+                            try:
+                                pin_state = self._gpio_manager.read_pin(self.irq_pin_number)
+                                if pin_state:
+                                    logger.warning("[RX] IRQ pin stuck HIGH (gpiod polling gap) — recovering")
+                                    self._handle_interrupt()
+                            except Exception as e:
+                                logger.debug(f"[RX] IRQ watchdog read failed: {e}")
 
                         # Log every 500 checks (roughly every 5 seconds) to show RX task is alive
                         if rx_check_count % 500 == 0:
