@@ -422,9 +422,16 @@ class SX1262Radio(LoRaRadio):
                             # Drain back-to-back packets that arrive while we're still
                             # handling the previous one, instead of paying a settle
                             # sleep per packet in the burst.
-                            irqStat = self._last_irq_status
+                            terminal_irqs = (
+                                self.lora.IRQ_RX_DONE
+                                | self.lora.IRQ_CRC_ERR
+                                | self.lora.IRQ_TIMEOUT
+                                | self.lora.IRQ_HEADER_ERR
+                            )
+                            pending_irq = self._last_irq_status
 
-                            while True:
+                            while pending_irq & terminal_irqs:
+                                irqStat = pending_irq
                                 if irqStat & self.lora.IRQ_CRC_ERR:
                                     self.crc_error_count += 1
 
@@ -532,22 +539,14 @@ class SX1262Radio(LoRaRadio):
                                     logger.error(f"Failed to restore RX mode: {e}")
                                     break
 
-                                terminal_irqs = (
-                                    self.lora.IRQ_RX_DONE
-                                    | self.lora.IRQ_CRC_ERR
-                                    | self.lora.IRQ_TIMEOUT
-                                    | self.lora.IRQ_HEADER_ERR
-                                )
                                 if pending_irq & terminal_irqs:
                                     logger.debug(f"[RX] Draining back-to-back packet (IRQ 0x{pending_irq:04X})")
-                                    irqStat = pending_irq
                                     continue
 
                                 await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                 logger.debug(
                                     f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
                                 )
-                                break
                         except Exception as e:
                             logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
