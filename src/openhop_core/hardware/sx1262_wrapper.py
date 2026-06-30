@@ -429,6 +429,7 @@ class SX1262Radio(LoRaRadio):
                                 | self.lora.IRQ_HEADER_ERR
                             )
                             pending_irq = self._last_irq_status
+                            irqStat = pending_irq
 
                             while pending_irq & terminal_irqs:
                                 irqStat = pending_irq
@@ -535,18 +536,14 @@ class SX1262Radio(LoRaRadio):
                                     # Read before clearing to catch a packet that arrived during processing.
                                     pending_irq = self.lora.getIrqStatus()
                                     self.lora.clearIrqStatus(0xFFFF)
+                                    if not (pending_irq & terminal_irqs):
+                                        await asyncio.sleep(self.RADIO_TIMING_DELAY)
+                                        logger.debug(
+                                            f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
+                                        )
                                 except Exception as e:
                                     logger.error(f"Failed to restore RX mode: {e}")
                                     break
-
-                                if pending_irq & terminal_irqs:
-                                    logger.debug(f"[RX] Draining back-to-back packet (IRQ 0x{pending_irq:04X})")
-                                    continue
-
-                                await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                                logger.debug(
-                                    f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
-                                )
                         except Exception as e:
                             logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
