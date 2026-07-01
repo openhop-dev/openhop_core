@@ -536,6 +536,8 @@ class SX1262Radio(LoRaRadio):
                                     # Read before clearing to catch a packet that arrived during processing.
                                     pending_irq = self.lora.getIrqStatus()
                                     self.lora.clearIrqStatus(0xFFFF)
+                                    # Re-read after clearing to catch anything that arrived in the read-clear gap.
+                                    pending_irq |= self.lora.getIrqStatus()
                                     if not (pending_irq & terminal_irqs):
                                         await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                         logger.debug(
