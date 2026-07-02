@@ -538,6 +538,9 @@ class SX1262Radio(LoRaRadio):
                                     self.lora.clearIrqStatus(0xFFFF)
                                     # Re-read after clearing to catch anything that arrived in the read-clear gap.
                                     pending_irq |= self.lora.getIrqStatus()
+                                    # Reset polling thread's edge baseline so last_state=HIGH
+                                    # from this IRQ cannot mask the next packet's rising edge.
+                                    self._gpio_manager.reset_edge_baseline(self.irq_pin_number)
                                     if not (pending_irq & terminal_irqs):
                                         await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                         logger.debug(
@@ -555,6 +558,11 @@ class SX1262Radio(LoRaRadio):
                     except asyncio.TimeoutError:
                         # No RX event within timeout - normal operation
                         rx_check_count += 1
+
+                        # Watchdog: if DIO1 is HIGH but no event arrived, the polling
+                        # thread missed the rising edge — recover immediately.
+                        if self._gpio_manager.read_pin(self.irq_pin_number):
+                            self._handle_interrupt()
 
                         # Sample noise floor during quiet periods
                         self._sample_noise_floor()

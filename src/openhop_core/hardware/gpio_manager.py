@@ -199,6 +199,9 @@ class GPIOPinManager:
         self._edge_stop_events: Dict[
             int, threading.Event
         ] = {}  # Stop events for edge threads
+        self._edge_baseline_resets: Dict[
+            int, threading.Event
+        ] = {}  # Signal polling thread to reset last_state to LOW
 
         logger.debug(
             f"GPIO Manager initialized with chip: {self._gpio_chip} using backend: {self._backend}"
@@ -485,6 +488,15 @@ class GPIOPinManager:
         self._edge_threads[pin_number] = thread
         logger.debug(f"Edge detection thread started for pin {pin_number}")
 
+    def reset_edge_baseline(self, pin_number: int) -> None:
+        """Tell the polling thread to reset last_state to LOW on its next tick.
+
+        Call this after clearIrqStatus() so the polling thread can detect the
+        next rising edge even if last_state was left HIGH from the previous one.
+        """
+        if pin_number in self._edge_baseline_resets:
+            self._edge_baseline_resets[pin_number].set()
+
     def _start_polling_detection(self, pin_number: int, interval: float = 0.02) -> None:
         """Start a polling thread to detect rising edges for GPIO lines.
 
@@ -492,6 +504,7 @@ class GPIOPinManager:
         """
         stop_event = threading.Event()
         self._edge_stop_events[pin_number] = stop_event
+        self._edge_baseline_resets[pin_number] = threading.Event()
 
         thread = threading.Thread(
             target=self._monitor_polling,
@@ -514,13 +527,19 @@ class GPIOPinManager:
             if not gpio:
                 return
 
-            # initialize last_state
+            reset_event = self._edge_baseline_resets.get(pin_number)
+
             try:
                 last_state = bool(gpio.read())
             except Exception:
                 last_state = False
 
             while not stop_event.is_set() and pin_number in self._pins:
+                # If the IRQ was cleared externally, reset baseline so the next
+                # rising edge is always detected regardless of last_state.
+                if reset_event and reset_event.is_set():
+                    last_state = False
+                    reset_event.clear()
                 try:
                     current = bool(self._pins[pin_number].read())
                     if current and not last_state:
