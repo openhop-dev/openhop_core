@@ -536,9 +536,8 @@ class SX1262Radio(LoRaRadio):
                                     pending_irq = self.lora.getIrqStatus()
                                     self.lora.clearIrqStatus(0xFFFF)
                                     if not (pending_irq & terminal_irqs):
-                                        # Reset polling thread's edge baseline so last_state=HIGH
-                                        # from this IRQ cannot mask the next packet's rising edge.
-                                        self._gpio_manager.reset_edge_baseline(self.irq_pin_number)
+                                        if self._gpio_manager._backend == "gpiod":
+                                            self._gpio_manager.reset_edge_baseline(self.irq_pin_number)
                                         await asyncio.sleep(self.RADIO_TIMING_DELAY)
                                         logger.debug(
                                             f"[RX] Restored RX continuous mode after IRQ 0x{irqStat:04X}"
