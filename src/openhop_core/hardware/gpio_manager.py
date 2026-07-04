@@ -649,9 +649,11 @@ class GPIOPinManager:
         if pin_number in self._edge_stop_events:
             del self._edge_stop_events[pin_number]
 
-        # Remove callback
+        # Remove callback and baseline reset event
         if pin_number in self._input_callbacks:
             del self._input_callbacks[pin_number]
+        if pin_number in self._edge_baseline_resets:
+            del self._edge_baseline_resets[pin_number]
 
         # Close GPIO pin
         if pin_number in self._pins:
@@ -680,8 +682,9 @@ class GPIOPinManager:
         self._edge_threads.clear()
         self._edge_stop_events.clear()
 
-        # Clear callbacks
+        # Clear callbacks and baseline reset events
         self._input_callbacks.clear()
+        self._edge_baseline_resets.clear()
 
         # Clean up all pins
         for pin_number in list(self._pins.keys()):
