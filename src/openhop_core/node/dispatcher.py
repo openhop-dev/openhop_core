@@ -718,9 +718,13 @@ class Dispatcher:
         """Apply dispatcher default path hash mode if set and packet is eligible."""
         if self.path_hash_mode is None:
             return
-        route_type = pkt.get_route_type()
-        if route_type not in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
-            return
+        # Route type deliberately does not gate the default: locally
+        # originated DIRECT sends (companion DMs, zero-hop server replies)
+        # need the node width just like flood origins, otherwise they leave
+        # with a 1-byte path hash and analyzers attribute the node as
+        # 1-byte. Forwarded packets carry hops (path_hash_count != 0) and
+        # pre-widthed packets carry the _path_hash_mode_applied marker, so
+        # both stay untouched.
         if pkt.get_path_hash_count() != 0:
             return
         if getattr(pkt, "_path_hash_mode_applied", False):
