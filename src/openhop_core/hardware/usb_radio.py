@@ -38,6 +38,7 @@ from typing import Callable, Optional
 
 import serial
 
+from ..async_primitives import LazyAsyncLock
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
     CMD_CAD_REQUEST,
@@ -169,7 +170,7 @@ class USBLoRaRadio(_RadioBase):
         self._custom_cad_symbol_num: Optional[int] = None
 
         # TX lock to serialize transmissions (matches SX1262Radio)
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock = LazyAsyncLock()
 
         # Stats
         self._tx_count = 0

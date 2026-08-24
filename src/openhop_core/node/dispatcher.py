@@ -8,6 +8,7 @@ import random
 import time
 from typing import Any, Awaitable, Callable, List, Optional
 
+from ..async_primitives import LazyAsyncLock
 from ..protocol import Packet
 from ..protocol.constants import (  # Payload types
     MAX_PATH_SIZE,
@@ -193,7 +194,7 @@ class Dispatcher:
         self.dedupe_enabled = dedupe_enabled
 
         # Simple TX lock to prevent concurrent transmissions
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock = LazyAsyncLock()
 
         # Use provided packet filter or create default
         if packet_filter is not None:

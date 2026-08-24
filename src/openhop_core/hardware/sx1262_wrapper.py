@@ -10,6 +10,7 @@ import random
 import time
 from typing import Optional, Union
 
+from ..async_primitives import LazyAsyncEvent, LazyAsyncLock
 from ..protocol.packet_utils import calculate_lora_airtime_ms, coding_rate_denominator
 from .base import LoRaRadio
 from .gpio_manager import GPIOPinManager
@@ -166,8 +167,8 @@ class SX1262Radio(LoRaRadio):
         self.last_snr: float = 0.0
         self.last_signal_rssi: int = -99
         self._initialized = False
-        self._rx_lock = asyncio.Lock()
-        self._tx_lock = asyncio.Lock()
+        self._rx_lock = LazyAsyncLock()
+        self._tx_lock = LazyAsyncLock()
 
         # GPIO management: prefer an explicitly provided manager (multi-CH341),
         # else a process-default external adapter manager, else a private
@@ -207,9 +208,9 @@ class SX1262Radio(LoRaRadio):
         self._rxled_pin_setup = False
         self._en_pins_setup = False
 
-        self._tx_done_event = asyncio.Event()
-        self._rx_done_event = asyncio.Event()
-        self._cad_event = asyncio.Event()
+        self._tx_done_event = LazyAsyncEvent()
+        self._rx_done_event = LazyAsyncEvent()
+        self._cad_event = LazyAsyncEvent()
         self._pending_rx_irq_status = 0
 
         # Store last IRQ status for background task
