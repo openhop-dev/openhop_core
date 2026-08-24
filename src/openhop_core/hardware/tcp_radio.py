@@ -39,6 +39,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from ..async_primitives import LazyAsyncLock
 from .protocol_constants import (
     CMD_AUTH,
     CMD_AUTH_OK,
@@ -171,7 +172,7 @@ class TCPLoRaRadio(_RadioBase):
         self._response_lock = threading.Lock()
 
         # TX lock
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock = LazyAsyncLock()
 
         # Stats
         self._tx_count = 0

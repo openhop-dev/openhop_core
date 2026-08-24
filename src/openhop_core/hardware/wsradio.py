@@ -6,6 +6,7 @@ import time
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from ..async_primitives import LazyAsyncLock
 from .base import LoRaRadio
 
 logger = logging.getLogger("WsRadio")
@@ -20,8 +21,8 @@ class WsRadio(LoRaRadio):
         self._connected = False
         self._last_tx_data = None  # Stores last transmitted packet
         self._last_tx_time = 0.0
-        self._connection_lock = asyncio.Lock()  # Prevent concurrent connection attempts
-        self._recv_lock = asyncio.Lock()  # Prevent concurrent recv calls
+        self._connection_lock = LazyAsyncLock()  # Prevent concurrent connection attempts
+        self._recv_lock = LazyAsyncLock()  # Prevent concurrent recv calls
         self._reconnect_delay = 1.0  # Start with 1 second
         self._max_reconnect_delay = 30.0  # Max 30 seconds
         self._timeout = timeout

@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Optional
 
+from ..async_primitives import LazyAsyncEvent
 from ..protocol.constants import (
     ADVERT_FLAG_IS_CHAT_NODE,
     ADVERT_FLAG_IS_REPEATER,
@@ -91,7 +92,7 @@ class ResponseWaiter:
     """Helper for awaiting async protocol/login responses."""
 
     def __init__(self) -> None:
-        self.event = asyncio.Event()
+        self.event = LazyAsyncEvent()
         self.data: dict = {"success": False, "text": None, "parsed": {}}
 
     def callback(
