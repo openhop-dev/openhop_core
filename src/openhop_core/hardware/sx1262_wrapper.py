@@ -1213,8 +1213,9 @@ class SX1262Radio(LoRaRadio):
         self._rx_activity_at = 0.0
         self._rx_header_at = 0.0
 
+        lbt_elapsed_ms = (time.monotonic() - lbt_started) * 1000
         logger.debug(
-            f"[LBT] Summary: outcome={outcome} elapsed={(time.monotonic() - lbt_started) * 1000:.0f}ms "
+            f"[LBT] Summary: outcome={outcome} elapsed={lbt_elapsed_ms:.0f}ms "
             f"latch_defers={latch_defers} cad_checks={cad_checks} "
             f"backoff_total={sum(lbt_backoff_delays):.0f}ms"
         )
@@ -1298,7 +1299,9 @@ class SX1262Radio(LoRaRadio):
             busy_timeout += 1
 
         if self.lora.busyCheck():
-            logger.error("[TX] Radio stayed busy after TX command - transmission may not have started")
+            logger.error(
+                "[TX] Radio stayed busy after TX command - transmission may not have started"
+            )
             return False
 
         # Check initial interrupt status immediately after TX command
@@ -1850,13 +1853,19 @@ class SX1262Radio(LoRaRadio):
         return symbol_map[cad_symbol_num]
 
     def _max_reception_seconds(self) -> float:
-        """Worst-case max-size packet airtime + 50%, once a header is seen (MeshCore: _maxPayloadMillis)."""
+        """Return max packet airtime plus 50% after header detection.
+
+        This mirrors MeshCore's ``_maxPayloadMillis`` reception bound.
+        """
         final_timeout_ms, _ = self._calculate_tx_timeout(255)
         # _calculate_tx_timeout returns airtime + 1000 ms margin.
         return max(0.5, (final_timeout_ms - 1000) * 1.5 / 1000.0)
 
     def _max_preamble_seconds(self) -> float:
-        """Preamble-to-header-valid latency bound, recomputed live from SF/BW/CR (MeshCore: _preambleMillis)."""
+        """Return the live SF/BW/CR preamble-to-header latency bound.
+
+        This mirrors MeshCore's ``_preambleMillis`` reception bound.
+        """
         preamble_only_ms = calculate_lora_airtime_ms(
             0, self.spreading_factor, int(self.bandwidth), self.coding_rate, self.preamble_length
         )
