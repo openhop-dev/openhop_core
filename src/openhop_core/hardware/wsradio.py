@@ -20,8 +20,8 @@ class WsRadio(LoRaRadio):
         self._connected = False
         self._last_tx_data = None  # Stores last transmitted packet
         self._last_tx_time = 0.0
-        self._connection_lock = asyncio.Lock()  # Prevent concurrent connection attempts
-        self._recv_lock = asyncio.Lock()  # Prevent concurrent recv calls
+        self._connection_lock = None  # Created on the running loop when first used
+        self._recv_lock = None  # Created on the running loop when first used
         self._reconnect_delay = 1.0  # Start with 1 second
         self._max_reconnect_delay = 30.0  # Max 30 seconds
         self._timeout = timeout
@@ -35,6 +35,16 @@ class WsRadio(LoRaRadio):
                 f"sf={radio_config.spreading_factor}, cr={radio_config.coding_rate}, "
                 f"preamble={radio_config.preamble_length}"
             )
+
+    def _get_connection_lock(self) -> asyncio.Lock:
+        if self._connection_lock is None:
+            self._connection_lock = asyncio.Lock()
+        return self._connection_lock
+
+    def _get_recv_lock(self) -> asyncio.Lock:
+        if self._recv_lock is None:
+            self._recv_lock = asyncio.Lock()
+        return self._recv_lock
 
     async def _send_radio_config(self):
         """Send radio configuration to the WebSocket radio."""
@@ -68,7 +78,7 @@ class WsRadio(LoRaRadio):
             logger.error(f"Failed to send radio config: {e}")
 
     async def _connect(self):
-        async with self._connection_lock:  # Prevent concurrent connection attempts
+        async with self._get_connection_lock():  # Prevent concurrent connection attempts
             if self._connected and self.ws is not None:
                 return  # Already connected
 
@@ -135,7 +145,7 @@ class WsRadio(LoRaRadio):
 
     async def wait_for_rx(self) -> bytes:
         await self._ensure()
-        async with self._recv_lock:  # Prevent concurrent recv calls
+        async with self._get_recv_lock():  # Prevent concurrent recv calls
             while True:
                 try:
                     if self.ws is None:

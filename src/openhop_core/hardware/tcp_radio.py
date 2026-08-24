@@ -146,7 +146,7 @@ class TCPLoRaRadio(_RadioBase):
         # Serialize command/response transactions. Multiple callers can wait
         # for the same response command (notably consecutive CAD updates), and
         # the response-event map supports only one waiter per command byte.
-        self._command_lock = asyncio.Lock()
+        self._command_lock: Optional[asyncio.Lock] = None
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); read by _reopen_socket
@@ -171,7 +171,7 @@ class TCPLoRaRadio(_RadioBase):
         self._response_lock = threading.Lock()
 
         # TX lock
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock: Optional[asyncio.Lock] = None
 
         # Stats
         self._tx_count = 0
@@ -186,6 +186,16 @@ class TCPLoRaRadio(_RadioBase):
             f"bw={bandwidth / 1000:.0f}kHz, power={tx_power}dBm, "
             f"syncword=0x{sync_word:04X}"
         )
+
+    def _get_tx_lock(self) -> asyncio.Lock:
+        if self._tx_lock is None:
+            self._tx_lock = asyncio.Lock()
+        return self._tx_lock
+
+    def _get_command_lock(self) -> asyncio.Lock:
+        if self._command_lock is None:
+            self._command_lock = asyncio.Lock()
+        return self._command_lock
 
     # ══════════════════════════════════════════════════════════
     # LoRaRadio interface
@@ -258,7 +268,7 @@ class TCPLoRaRadio(_RadioBase):
             logger.error("Radio not initialized")
             return None
 
-        async with self._tx_lock:
+        async with self._get_tx_lock():
             lbt_backoff_delays: list[float] = []
 
             if self.lbt_enabled:
@@ -442,7 +452,7 @@ class TCPLoRaRadio(_RadioBase):
     def get_noise_floor(self) -> Optional[float]:
         if not self._initialized:
             return None
-        if self._tx_lock.locked():
+        if self._tx_lock is not None and self._tx_lock.locked():
             return None
         return self._noise_floor
 
@@ -913,7 +923,7 @@ class TCPLoRaRadio(_RadioBase):
         expect_cmd: int,
         timeout: float = 5.0,
     ) -> Optional[bytes]:
-        async with self._command_lock:
+        async with self._get_command_lock():
             if self._sock is None:
                 return None
 

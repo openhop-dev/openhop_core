@@ -193,7 +193,7 @@ class Dispatcher:
         self.dedupe_enabled = dedupe_enabled
 
         # Simple TX lock to prevent concurrent transmissions
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock: Optional[asyncio.Lock] = None
 
         # Use provided packet filter or create default
         if packet_filter is not None:
@@ -220,6 +220,12 @@ class Dispatcher:
 
         # Hook up the radio's receive callback - all radios should support this
         self._arm_rx()
+
+    def _get_tx_lock(self) -> asyncio.Lock:
+        """Create the TX lock on the running event loop when first used."""
+        if self._tx_lock is None:
+            self._tx_lock = asyncio.Lock()
+        return self._tx_lock
 
     def _ensure_lifecycle_events(self) -> tuple:
         """Create stop/stopped events on the running loop if needed."""
@@ -1036,7 +1042,7 @@ class Dispatcher:
         # Airtime duty-cycle budget: only while client-repeat is on. When
         # disabled the send path is unchanged (a recorded deliberate deferral).
         if not self._client_repeat_enabled:
-            async with self._tx_lock:  # Wait our turn
+            async with self._get_tx_lock():  # Wait our turn
                 tx_ok, ack_event, ack_crc = await self._transmit_locked(
                     packet, wait_for_ack, expected_crc, radio_id=radio_id
                 )
@@ -1051,7 +1057,7 @@ class Dispatcher:
             # sleep under the lock -- fall out of the async with to wait again.
             while True:
                 await self._await_tx_budget(packet)
-                async with self._tx_lock:  # Wait our turn
+                async with self._get_tx_lock():  # Wait our turn
                     if not self._client_repeat_enabled or self._tx_budget_wait_s() <= 0.0:
                         tx_ok, ack_event, ack_crc = await self._transmit_locked(
                             packet, wait_for_ack, expected_crc, radio_id=radio_id
@@ -1525,7 +1531,7 @@ class Dispatcher:
     def get_filter_stats(self) -> dict:
         """Get current packet filter statistics."""
         stats = self.packet_filter.get_stats()
-        stats["tx_lock_locked"] = self._tx_lock.locked()
+        stats["tx_lock_locked"] = self._tx_lock is not None and self._tx_lock.locked()
         return stats
 
     def clear_packet_filter(self) -> None:

@@ -236,6 +236,11 @@ async def radio(mock_lora, mock_gpio):
     r._interrupt_setup = True
     r._gpio_manager = mock_gpio
     r._event_loop = asyncio.get_running_loop()
+    r._get_rx_lock()
+    r._get_tx_lock()
+    r._get_tx_done_event()
+    r._get_rx_done_event()
+    r._get_cad_event()
     yield r
 
 

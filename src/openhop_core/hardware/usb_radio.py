@@ -167,7 +167,7 @@ class USBLoRaRadio(_RadioBase):
         # CAD thresholds and symbol count back-to-back, and both commands wait
         # for CMD_CAD_PARAMS_RESP. Without serialization the second waiter
         # replaces the first entry in _response_events and one update times out.
-        self._command_lock = asyncio.Lock()
+        self._command_lock: Optional[asyncio.Lock] = None
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); kept in attributes from
@@ -178,7 +178,7 @@ class USBLoRaRadio(_RadioBase):
         self._custom_cad_symbol_num: Optional[int] = None
 
         # TX lock to serialize transmissions (matches SX1262Radio)
-        self._tx_lock = asyncio.Lock()
+        self._tx_lock: Optional[asyncio.Lock] = None
 
         # Stats
         self._tx_count = 0
@@ -191,6 +191,16 @@ class USBLoRaRadio(_RadioBase):
             f"sf={spreading_factor}, bw={bandwidth / 1000:.0f}kHz, "
             f"power={tx_power}dBm, syncword=0x{sync_word:04X}"
         )
+
+    def _get_tx_lock(self) -> asyncio.Lock:
+        if self._tx_lock is None:
+            self._tx_lock = asyncio.Lock()
+        return self._tx_lock
+
+    def _get_command_lock(self) -> asyncio.Lock:
+        if self._command_lock is None:
+            self._command_lock = asyncio.Lock()
+        return self._command_lock
 
     # ══════════════════════════════════════════════════════════
     # LoRaRadio interface implementation
@@ -265,7 +275,7 @@ class USBLoRaRadio(_RadioBase):
             logger.error("Radio not initialized")
             return None
 
-        async with self._tx_lock:
+        async with self._get_tx_lock():
             lbt_backoff_delays: list[float] = []
 
             # ── Listen Before Talk (CAD) ─────────────────────
@@ -483,7 +493,7 @@ class USBLoRaRadio(_RadioBase):
         """
         if not self._initialized:
             return None
-        if self._tx_lock.locked():
+        if self._tx_lock is not None and self._tx_lock.locked():
             return None
         return self._noise_floor
 
@@ -1064,7 +1074,7 @@ class USBLoRaRadio(_RadioBase):
         timeout: float = 5.0,
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
-        async with self._command_lock:
+        async with self._get_command_lock():
             if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
                 return None
 

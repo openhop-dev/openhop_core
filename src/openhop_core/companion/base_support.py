@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Optional
@@ -91,7 +92,7 @@ class ResponseWaiter:
     """Helper for awaiting async protocol/login responses."""
 
     def __init__(self) -> None:
-        self.event = asyncio.Event()
+        self.event = threading.Event()
         self.data: dict = {"success": False, "text": None, "parsed": {}}
 
     def callback(
@@ -106,11 +107,10 @@ class ResponseWaiter:
         self.event.set()
 
     async def wait(self, timeout: float = 10.0) -> dict:
-        try:
-            await asyncio.wait_for(self.event.wait(), timeout=timeout)
+        completed = await asyncio.to_thread(self.event.wait, timeout)
+        if completed:
             return self.data
-        except asyncio.TimeoutError:
-            return {**self.data, "timeout": True}
+        return {**self.data, "timeout": True}
 
 
 class _SeenCache:

@@ -428,7 +428,7 @@ async def test_lock_free_while_throttled_waiting():
     task = asyncio.create_task(d.send_packet(_flood_txt(), wait_for_ack=False))
     await asyncio.sleep(0.02)  # let it reach the budget sleep
     assert radio.send_count == 0
-    assert not d._tx_lock.locked()  # not holding the lock while sleeping
+    assert d._tx_lock is None or not d._tx_lock.locked()  # lock-free while sleeping
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -462,7 +462,7 @@ async def test_toggle_off_releases_waiter_ungated(monkeypatch):
     for _ in range(5):
         await real_sleep(0)
     assert radio.send_count == 0  # parked in the budget wait
-    assert not d._tx_lock.locked()
+    assert d._tx_lock is None or not d._tx_lock.locked()
 
     d.set_client_repeat_enabled(False)  # disable does not reset the bucket
     release.set()  # let the current sleep return; the loop re-reads the flag
