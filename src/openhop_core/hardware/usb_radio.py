@@ -168,7 +168,7 @@ class USBLoRaRadio(_RadioBase):
         # CAD thresholds and symbol count back-to-back, and both commands wait
         # for CMD_CAD_PARAMS_RESP. Without serialization the second waiter
         # replaces the first entry in _response_events and one update times out.
-        self._command_lock = asyncio.Lock()
+        self._command_lock = LazyAsyncLock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); kept in attributes from

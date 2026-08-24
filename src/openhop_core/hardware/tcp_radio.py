@@ -147,7 +147,7 @@ class TCPLoRaRadio(_RadioBase):
         # Serialize command/response transactions. Multiple callers can wait
         # for the same response command (notably consecutive CAD updates), and
         # the response-event map supports only one waiter per command byte.
-        self._command_lock = asyncio.Lock()
+        self._command_lock = LazyAsyncLock()
 
         # Custom CAD thresholds. Set lazily by set_custom_cad_thresholds()
         # or perform_cad(det_peak=..., det_min=...); read by _reopen_socket
