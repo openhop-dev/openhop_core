@@ -529,12 +529,14 @@ class PacketBuilder:
 
         aes_key = secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, secret, plaintext)
-        payload = PacketBuilder._hash_bytes(dest.get_public_key(), local_identity) + cipher
+        dest_pubkey = dest.get_public_key()
+        payload = PacketBuilder._hash_bytes(dest_pubkey, local_identity) + cipher
 
         header = PacketBuilder._create_header(ptype, route_type)
         pkt = PacketBuilder._create_packet(header, payload)
         pkt.path_len = 0
         pkt.path = bytearray()
+        pkt._dest_pubkey = bytes(dest_pubkey)
         return pkt
 
     @staticmethod
@@ -563,7 +565,8 @@ class PacketBuilder:
         """
         header = PacketBuilder._create_header(PAYLOAD_TYPE_ANON_REQ, route_type)
 
-        dest_hash = PacketBuilder._hash_byte(dest.get_public_key())
+        dest_pubkey = dest.get_public_key()
+        dest_hash = PacketBuilder._hash_byte(dest_pubkey)
         aes_key = shared_secret[:16]
         cipher = PacketBuilder._encrypt_payload(aes_key, shared_secret, plaintext)
         payload = bytearray([dest_hash]) + local_identity.get_public_key() + cipher
@@ -571,6 +574,7 @@ class PacketBuilder:
         pkt = PacketBuilder._create_packet(header, payload)
         pkt.path_len = 0
         pkt.path = bytearray()
+        pkt._dest_pubkey = bytes(dest_pubkey)
         return pkt
 
     @staticmethod
@@ -621,6 +625,7 @@ class PacketBuilder:
         packet = PacketBuilder._create_packet(header, payload)
         packet.path_len = 0
         packet.path = bytearray()
+        packet._dest_pubkey = contact_pubkey
 
         if route_type == "direct" and len(out_path) > 0:
             path_bytes = out_path[:MAX_PATH_SIZE]
@@ -1105,6 +1110,7 @@ class PacketBuilder:
 
         pkt.payload = bytearray(payload)
         pkt.payload_len = len(payload)
+        pkt._dest_pubkey = bytes.fromhex(contact.public_key)
 
         # Enhanced debug logging with packet details
         route_type_names = {
@@ -1188,6 +1194,7 @@ class PacketBuilder:
 
         header = PacketBuilder._create_header(PAYLOAD_TYPE_REQ, route_type)
         packet = PacketBuilder._create_packet(header, payload)
+        packet._dest_pubkey = bytes.fromhex(contact.public_key)
 
         if route_type == "direct" and len(out_path) > 0:
             path_bytes = out_path[:MAX_PATH_SIZE]

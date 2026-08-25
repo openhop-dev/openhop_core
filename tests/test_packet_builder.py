@@ -8,6 +8,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
     PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
 )
@@ -745,3 +746,65 @@ def test_create_group_datagram_truncation_keeps_utf8_valid():
     content = _decrypt_group_content(pkt, secret)
     assert len(content) <= MAX_TEXT_LEN
     assert content.decode("utf-8") == "A: " + "é" * ((MAX_TEXT_LEN - 3) // 2)
+
+
+def test_addressed_builders_retain_the_destination_key():
+    """Addressed packets keep the full destination key in memory.
+
+    The wire format keeps only a 1-3 byte prefix of it, so a host that needs to
+    know *which* key a packet is addressed to cannot recover it from the packet
+    afterwards.
+    """
+    sender = LocalIdentity()
+    recipient = LocalIdentity()
+    contact = _make_contact(recipient)
+    dest = Identity(recipient.get_public_key())
+    secret = dest.calc_shared_secret(sender.get_private_key())
+    expected = recipient.get_public_key()
+
+    text_packet, _ = PacketBuilder.create_text_message(
+        contact=contact, local_identity=sender, message="hello"
+    )
+    req_packet, _ = PacketBuilder.create_protocol_request(contact, sender, 0x01)
+    anon_packet, _ = PacketBuilder.create_anon_request(contact, sender, b"\x01")
+
+    for name, packet in (
+        ("create_datagram", PacketBuilder.create_datagram(0, dest, sender, secret, b"x")),
+        ("create_text_message", text_packet),
+        ("create_protocol_request", req_packet),
+        ("create_anon_req", PacketBuilder.create_anon_req(dest, sender, secret, b"x")),
+        ("create_anon_request", anon_packet),
+        ("create_login_packet", PacketBuilder.create_login_packet(contact, sender, "pw")),
+    ):
+        assert packet._dest_pubkey == expected, name
+
+
+def test_broadcast_builders_leave_the_destination_key_unset():
+    """Payloads with no single addressee must not claim one.
+
+    An advert is self-signed and group payloads use a channel key, so there is
+    no destination key to retain.
+    """
+    import hashlib
+
+    sender = LocalIdentity()
+    channel_secret = bytes(range(16))
+
+    advert = PacketBuilder.create_self_advert(sender, "node")
+    group = PacketBuilder.create_group_data_packet(
+        PAYLOAD_TYPE_GRP_DATA,
+        channel_hash=hashlib.sha256(channel_secret).digest()[0],
+        channel_secret=channel_secret,
+        plaintext=b"\x34\x12\x02\xaa\xbb",
+        secret=channel_secret,
+    )
+    trace = PacketBuilder.create_trace(tag=1, auth_code=2, flags=0, path=[])
+    ack = PacketBuilder.create_ack_from_bytes(b"\x01\x02\x03\x04")
+
+    for name, packet in (
+        ("create_self_advert", advert),
+        ("create_group_data_packet", group),
+        ("create_trace", trace),
+        ("create_ack_from_bytes", ack),
+    ):
+        assert packet._dest_pubkey is None, name

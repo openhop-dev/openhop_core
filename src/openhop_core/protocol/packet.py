@@ -119,6 +119,7 @@ class Packet:
         "_flood_scope_applied",
         "_injected_for_tx",
         "_injected_origin_hash",
+        "_dest_pubkey",
         "_recv_region_captured",
         "_recv_region_key",
     )
@@ -154,6 +155,13 @@ class Packet:
         # the repeater inject path so the companion fan-out can withhold the packet
         # from its own sender -- a node never hears its own transmission.
         self._injected_origin_hash: Optional[str] = None
+        # Full public key this packet is addressed to, in memory only — never
+        # serialised. The wire format keeps a 1-3 byte prefix of it (see
+        # PacketBuilder._hash_bytes), so once a packet is built the addressee can
+        # no longer be told apart from any other key sharing that prefix. Set by
+        # the addressed PacketBuilder helpers at the point the key is truncated;
+        # None for broadcast payloads, which have no single addressee.
+        self._dest_pubkey: Optional[bytes] = None
         # Region captured from this packet on receive. Only set True when
         # a RegionMap was actually consulted; the matched region key (or None =>
         # reply plain) is read by region_map.apply_reply_scope when a handler
