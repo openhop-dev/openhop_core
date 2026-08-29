@@ -121,6 +121,7 @@ class Packet:
         "_injected_origin_hash",
         "_recv_region_captured",
         "_recv_region_key",
+        "_recv_region_unscoped",
     )
 
     def __init__(self):
@@ -161,6 +162,12 @@ class Packet:
         # member, because replies are sent from background tasks that would race.
         self._recv_region_captured: bool = False
         self._recv_region_key: Optional[bytes] = None
+        # True when the request arrived as an un-scoped FLOOD that the wildcard
+        # Region allows, i.e. the sender deliberately chose un-scoped and a
+        # reply should mirror that rather than take the node default. Distinct
+        # from "_recv_region_key is None", which also covers direct requests and
+        # unresolved transport codes -- those take the default instead.
+        self._recv_region_unscoped: bool = False
 
     def get_route_type(self) -> int:
         """

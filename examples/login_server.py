@@ -302,6 +302,9 @@ async def run_login_server(
         local_identity=identity,
         log_fn=lambda msg: print(msg),
         authenticate_callback=acl.authenticate_client,  # Delegate authentication to ACL
+        # Lets a DIRECT login be answered along the path we already hold for the
+        # client, instead of flooding the reply (firmware REPLY_ROUTE_DIRECT_OUT_PATH).
+        get_client_fn=acl.get_client,
     )
 
     # Set up packet sending callback

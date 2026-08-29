@@ -680,6 +680,10 @@ class Dispatcher:
         plain flood, e.g. explicit-unscoped mode or default-scoped adverts) —
         and replies whose region the reply helper already decided — are marked
         ``_flood_scope_applied`` and skipped here.
+
+        A reply whose scope ``region_map.apply_reply_scope`` could not determine
+        is deliberately left unmarked and resolves here, which is what firmware
+        does for that case too.
         """
         # Checked FIRST: a companion/reply decision is authoritative and must
         # never be re-scoped, even when the node has an override/default set.
