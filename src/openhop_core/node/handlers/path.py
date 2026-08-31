@@ -68,7 +68,15 @@ class PathHandler:
             if self._ack_handler:
                 ack_crc = await self._ack_handler.process_path_ack_variants(pkt)
                 if ack_crc is not None:
-                    # ACK was found, notify dispatcher
+                    # A successfully MAC-verified/decrypted PATH proves the packet
+                    # belongs to this identity, so it is authenticated regardless
+                    # of whether anything is awaiting the embedded CRC — firmware
+                    # Mesh::onRecvPacket sets `found` (and marks do-not-retransmit)
+                    # on MACThenDecrypt success alone; whether the CRC confirms a
+                    # particular send is processAck's separate, app-level decision.
+                    # HandlerResult.authenticated carries the consume/no-forward
+                    # decision to both the dispatcher and the companion bridge.
+                    authenticated = True
                     await self._ack_handler._notify_ack_received(ack_crc)
 
             # Optional PATH packet analysis if analyzer is available

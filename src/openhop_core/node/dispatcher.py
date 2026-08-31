@@ -21,7 +21,7 @@ from ..protocol.packet_utils import PathUtils, calculate_lora_airtime_ms, flood_
 from ..protocol.region_map import RegionMap, capture_recv_region
 from ..protocol.transport_keys import scope_packet
 from ..protocol.utils import PAYLOAD_TYPES, ROUTE_TYPES
-from ..util.callbacks import invoke_maybe_awaitable
+from ..util.callbacks import AckReceivedCallback, invoke_maybe_awaitable
 
 # Import handler classes
 from .handlers import (
@@ -102,7 +102,7 @@ class Dispatcher:
         self.packet_sent_callback: Optional[Callable[[Packet], Awaitable[None] | None]] = None
 
         # Optional listener for ACK received (e.g. companion send_confirmed)
-        self._ack_received_listener: Optional[Callable[[int], Awaitable[None] | None]] = None
+        self._ack_received_listener: Optional[AckReceivedCallback] = None
 
         # Optional callback for PAYLOAD_TYPE_RAW_CUSTOM (companion raw_data_received)
         self.raw_data_received_callback: Optional[Callable[[Packet], Awaitable[None]]] = None
@@ -435,9 +435,14 @@ class Dispatcher:
 
     def set_ack_received_listener(
         self,
-        callback: Optional[Callable[[int], Awaitable[None] | None]],
+        callback: Optional[AckReceivedCallback],
     ) -> None:
-        """Set optional listener for ACK CRCs (e.g. companion send_confirmed)."""
+        """Set optional listener for received ACK CRCs (e.g. a companion's send_confirmed).
+
+        See :data:`AckReceivedCallback`: the listener returns whether the CRC matched one of
+        this node's own pending sends (truthy = consumed, drives do-not-retransmit; False/None =
+        not mine). A ``None``-returning listener keeps the older notify-only behaviour.
+        """
         self._ack_received_listener = callback
 
     def set_raw_packet_callback(self, callback: Callable[..., Awaitable[None] | None]) -> None:
@@ -1363,8 +1368,14 @@ class Dispatcher:
     # All ACK processing logic is delegated to the AckHandler.
     # ------------------------------------------------------------------
 
-    async def _register_ack_received(self, crc: int) -> None:
-        """Record that an ACK with the given CRC was received."""
+    async def _register_ack_received(self, crc: int) -> bool:
+        """Record that an ACK with the given CRC was received.
+
+        Returns whether an application listener reported consuming the CRC
+        (matched a send it tracks app-side), so the ACK handler can mark the
+        packet do-not-retransmit (firmware onAckRecv). A dispatcher-level
+        waiter is reported separately by the handler via ``_waiting_acks``.
+        """
         ts = asyncio.get_running_loop().time()
         self._recent_acks[crc] = ts
 
@@ -1374,7 +1385,8 @@ class Dispatcher:
             evt.set()
 
         if self._ack_received_listener:
-            await self._invoke_ack_listener(crc)
+            return bool(await self._invoke_ack_listener(crc))
+        return False
 
     async def run_forever(self) -> None:
         """Run the dispatcher maintenance loop until :meth:`stop` is awaited.
@@ -1457,12 +1469,16 @@ class Dispatcher:
     async def _invoke_callback(self, cb, pkt: Packet) -> None:
         await invoke_maybe_awaitable(cb, pkt)
 
-    async def _invoke_ack_listener(self, crc: int) -> None:
-        """Invoke ack-received listener (sync or async)."""
+    async def _invoke_ack_listener(self, crc: int) -> Optional[bool]:
+        """Invoke the ack-received listener (sync or async) and return its result.
+
+        Per :data:`AckReceivedCallback`, the listener reports whether the CRC matched one of this
+        node's own pending sends; the caller propagates that to the do-not-retransmit decision.
+        """
         cb = self._ack_received_listener
         if cb is None:
-            return
-        await invoke_maybe_awaitable(cb, crc)
+            return None
+        return bool(await invoke_maybe_awaitable(cb, crc))
 
     async def _invoke_enhanced_raw_callback(
         self, callback, pkt: Packet, data: bytes, analysis: dict

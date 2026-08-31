@@ -344,3 +344,207 @@ async def test_path_handler_updates_matched_contact_sends_reciprocal_and_resolve
         shared_secret[:16], shared_secret, bytes(reciprocal.payload[2:])
     )
     assert reciprocal_inner[:3] == bytes([PathUtils.encode_path_len(1, 1), 0xC3, 0xFF])
+
+
+@pytest.mark.asyncio
+async def test_path_embedded_ack_notifies_listener_without_dispatcher_waiters():
+    """Companion flow: the app (not the dispatcher) tracks expected ACK CRCs.
+
+    Firmware Mesh::onRecvPacket decrypts every PATH addressed to this node and
+    hands its extra (the embedded ACK for a flood text message) to processAck —
+    with no dispatcher-level waiting-ack precondition. The PATH-embedded ACK
+    must therefore reach the ack-received listener even when _waiting_acks is
+    empty, or a companion client never sees delivery confirmation for a flood DM.
+    """
+    contacts = ContactStore()
+    contacts.load_from([Contact(public_key=SENDER_IDENTITY.get_public_key(), name="peer")])
+    ack_crc = 0x12345678
+    dispatcher = SimpleNamespace(
+        local_identity=LOCAL_IDENTITY,
+        contact_book=contacts,
+        _waiting_acks={},  # companion: nothing waits at dispatcher level
+    )
+    handler = AckHandler(lambda _message: None, dispatcher)
+
+    notified = []
+
+    async def listener(crc):
+        notified.append(crc)
+
+    handler.set_ack_received_callback(listener)
+
+    packet = _path_return(
+        LOCAL_IDENTITY,
+        SENDER_IDENTITY,
+        path=[],
+        extra_type=PAYLOAD_TYPE_ACK,
+        extra=ack_crc.to_bytes(4, "little"),
+    )
+    found = await handler.process_path_ack_variants(packet)
+    assert found == ack_crc
+    await handler._notify_ack_received(found)
+    assert notified == [ack_crc]
+
+
+class _CompanionMockRadio:
+    """Minimal radio for a real CompanionRadio: set_rx_callback + async send."""
+
+    def __init__(self):
+        self.rx_callback = None
+        self.sent: list[bytes] = []
+
+    def set_rx_callback(self, callback):
+        self.rx_callback = callback
+
+    async def send(self, data: bytes) -> bool:
+        self.sent.append(data)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_companion_tracked_ack_end_to_end_confirms_and_suppresses():
+    """The real CompanionRadio wiring, end to end: an ACK whose CRC sits in the
+    companion's app-side pending table must clear that entry, fire
+    send_confirmed, and be marked do-not-retransmit — through the dispatcher's
+    registered ACK handler, exactly as a received radio packet would travel.
+    This is the central behavioural change (firmware onAckRecv processAck
+    match): the listener's consumed result must survive the full
+    CompanionRadio._on_ack_received -> dispatcher -> AckHandler chain.
+    """
+    from openhop_core.companion import CompanionRadio
+
+    ack_crc = 0x0BADF00D
+    comp = CompanionRadio(_CompanionMockRadio(), LocalIdentity())
+    comp._track_pending_ack(ack_crc)
+
+    confirmed: list[int] = []
+    comp.on_send_confirmed(lambda crc, trip_ms: confirmed.append(crc))
+
+    packet = Packet()
+    packet.header = 1 << 2  # PAYLOAD_TYPE_ACK, route flood
+    packet.path_len = 0
+    packet.path = bytearray()
+    packet.payload = bytearray(ack_crc.to_bytes(4, "little"))
+    packet.payload_len = 4
+
+    handler = comp.node.dispatcher._get_handler(PAYLOAD_TYPE_ACK)
+    await handler(packet)
+
+    assert ack_crc not in comp._pending_ack_crcs, "pending entry must be cleared"
+    assert confirmed == [ack_crc], "send_confirmed must fire for the tracked CRC"
+    assert (
+        packet.is_marked_do_not_retransmit() is True
+    ), "companion-consumed ACK must be suppressed from client-repeat forwarding"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_waiter_stays_marked_when_listener_raises():
+    """Regression (review): marking a dispatcher-awaited ACK must not depend on
+    the listener call succeeding. The pre-change code marked BEFORE notifying;
+    that guarantee holds — a raising listener still leaves the packet marked
+    (the exception propagates to the caller as before).
+    """
+    ack_crc = 0x12345678
+    dispatcher = SimpleNamespace(
+        local_identity=LOCAL_IDENTITY,
+        contact_book=ContactStore(),
+        _waiting_acks={ack_crc: object()},  # a dispatcher-level waiter exists
+    )
+    handler = AckHandler(lambda _m: None, dispatcher)
+
+    async def raising_listener(crc):
+        raise RuntimeError("listener blew up")
+
+    handler.set_ack_received_callback(raising_listener)
+    packet = Packet()
+    packet.header = 1 << 2  # PAYLOAD_TYPE_ACK, route flood
+    packet.path_len = 0
+    packet.path = bytearray()
+    packet.payload = bytearray(ack_crc.to_bytes(4, "little"))
+    packet.payload_len = 4
+    with pytest.raises(RuntimeError):
+        await handler(packet)
+    assert (
+        packet.is_marked_do_not_retransmit() is True
+    ), "a dispatcher-awaited ACK must stay marked even when the listener fails"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listener_consumes", [True, False])
+async def test_decrypted_path_ack_is_authenticated_regardless_of_consumption(listener_consumes):
+    """Firmware parity for PATH packets (Mesh::onRecvPacket): a successful
+    MAC-then-decrypt alone proves the PATH belongs to this identity, so the
+    handler returns authenticated — whether or not the embedded CRC matched a
+    pending send (that match is processAck's separate, app-level decision).
+    HandlerResult.authenticated then drives do-not-retransmit in the dispatcher
+    and the forwarding decision in the companion bridge.
+    """
+    contacts = ContactStore()
+    contacts.add(Contact(public_key=SENDER_IDENTITY.get_public_key(), name="peer"))
+    ack_crc = 0x12345678
+    dispatcher = Dispatcher(_CallbackRadio())
+    dispatcher.local_identity = LOCAL_IDENTITY
+    dispatcher.set_contact_book(contacts)
+    notified: list[int] = []
+
+    def listener(crc):
+        notified.append(crc)
+        return listener_consumes
+
+    dispatcher.set_ack_received_listener(listener)
+
+    ack_handler = AckHandler(lambda _m: None, dispatcher)
+    ack_handler.set_ack_received_callback(dispatcher._register_ack_received)
+
+    packet = _path_return(
+        LOCAL_IDENTITY,
+        SENDER_IDENTITY,
+        path=[],
+        extra_type=PAYLOAD_TYPE_ACK,
+        extra=ack_crc.to_bytes(4, "little"),
+    )
+    result = await PathHandler(lambda _m: None, ack_handler=ack_handler)(packet)
+    assert result.authenticated is True, (
+        "a MAC-verified PATH is authenticated independent of CRC consumption"
+    )
+    assert notified == [ack_crc], "the embedded CRC must still reach the listener"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    "result, expect_marked",
+    [(True, True), (False, False), (None, False)],
+)
+async def test_ack_received_listener_consumed_contract(is_async, result, expect_marked):
+    """Contract for AckReceivedCallback: a truthy return means the ACK matched one of this node's
+    pending sends (mark do-not-retransmit); False/None means not mine (leave it). Both sync and
+    async listeners honour it, and a None-returning listener stays backward-compatible."""
+    ack_crc = 0x0BADF00D
+    dispatcher = Dispatcher(_CallbackRadio())
+    dispatcher.local_identity = LOCAL_IDENTITY
+    dispatcher.set_contact_book(ContactStore())
+
+    if is_async:
+
+        async def listener(crc):
+            return result
+
+    else:
+
+        def listener(crc):
+            return result
+
+    dispatcher.set_ack_received_listener(listener)
+
+    handler = AckHandler(lambda _m: None, dispatcher)
+    handler.set_ack_received_callback(dispatcher._register_ack_received)
+
+    packet = Packet()
+    packet.header = 1 << 2  # PAYLOAD_TYPE_ACK, route flood
+    packet.path_len = 0
+    packet.path = bytearray()
+    packet.payload = bytearray(ack_crc.to_bytes(4, "little"))
+    packet.payload_len = 4
+    await handler(packet)
+    assert packet.is_marked_do_not_retransmit() is expect_marked

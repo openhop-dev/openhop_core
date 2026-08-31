@@ -445,9 +445,13 @@ class CompanionRadio(CompanionBase):
         rssi = getattr(pkt, "rssi", getattr(pkt, "_rssi", 0))
         await self._fire_callbacks("rx_log_data", snr, rssi, data)
 
-    async def _on_ack_received(self, crc: int) -> None:
-        """Called by dispatcher when an ACK CRC is received; fire send_confirmed if pending."""
-        await self._try_confirm_send(crc)
+    async def _on_ack_received(self, crc: int) -> bool:
+        """Called by dispatcher when an ACK CRC is received; fire send_confirmed if pending.
+
+        Returns whether the CRC matched a pending app-side send, so the ACK
+        handler can mark the packet do-not-retransmit (firmware onAckRecv).
+        """
+        return await self._try_confirm_send(crc)
 
     async def _on_raw_custom_received(self, pkt: Packet) -> None:
         """Dispatcher RAW_CUSTOM handler: fire raw_data_received(payload, snr, rssi)."""
