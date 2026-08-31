@@ -16,7 +16,12 @@ import time
 from typing import Callable, Optional
 
 from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
-from ...protocol.constants import PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_RESPONSE, acl_is_admin
+from ...protocol.constants import (
+    MAX_PATH_SIZE,
+    PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_RESPONSE,
+    acl_is_admin,
+)
 from ...protocol.region_map import apply_reply_scope
 from .base import BaseHandler
 from .result import HandlerResult
@@ -66,6 +71,8 @@ class LoginServerHandler(BaseHandler):
         log_fn: Callable[[str], None],
         authenticate_callback: Callable[[Identity, bytes, str, int], tuple[bool, int]],
         is_room_server: bool = False,
+        get_out_path: Optional[Callable[[Identity], Optional[tuple[bytes, int]]]] = None,
+        clear_out_path: Optional[Callable[[Identity], None]] = None,
     ):
         """
         Initialize login server handler.
@@ -80,16 +87,51 @@ class LoginServerHandler(BaseHandler):
                                    (see PERM_ACL_* in protocol.constants).
             is_room_server: True if this identity is a room server (expects sync_since field),
                            False if repeater (no sync_since field)
+            get_out_path: Optional ACL lookup ``identity -> (path_bytes, path_len_encoded)``
+                          or ``None`` when no stored path. Used for DIRECT login replies
+                          (firmware #3106 / ``chooseReplyRoute`` ``DIRECT_OUT_PATH``).
+                          Login ANON_REQ does not carry a supplied reply path.
+            clear_out_path: Optional ACL callback invoked on a successful flood login
+                            (firmware ``handleLoginReq`` sets ``OUT_PATH_UNKNOWN``).
         """
         self.local_identity = local_identity
         self.log = log_fn
         self.authenticate = authenticate_callback
         self.is_room_server = is_room_server
+        self.get_out_path = get_out_path
+        self.clear_out_path = clear_out_path
         self._send_packet_callback: Optional[Callable[[Packet, int], None]] = None
 
     def set_send_packet_callback(self, callback: Callable[[Packet, int], None]):
         """Set callback for sending response packets."""
         self._send_packet_callback = callback
+
+    def _lookup_out_path(self, client_identity: Identity) -> Optional[tuple[bytes, int]]:
+        """Return a stored ACL out_path if the app provided a usable one."""
+        if self.get_out_path is None:
+            return None
+        try:
+            result = self.get_out_path(client_identity)
+            if not result:
+                return None
+            path_bytes, raw_path_len = result
+            path_len_encoded = int(raw_path_len)
+            if path_len_encoded < 0 or not PathUtils.is_valid_path_len(path_len_encoded):
+                return None
+            path_bytes = bytes(path_bytes or b"")
+            expected = PathUtils.get_path_byte_len(path_len_encoded)
+            if len(path_bytes) < expected:
+                self.log(
+                    f"[LoginServer] Stored out_path is {len(path_bytes)}B but path_len "
+                    f"0x{path_len_encoded:02X} declares {expected}B; flooding instead"
+                )
+                return None
+            return (path_bytes[:expected], path_len_encoded)
+        except Exception as e:
+            # An application-owned ACL entry must never suppress the reply. If
+            # its path cannot be normalized, use the firmware's FLOOD fallback.
+            self.log(f"[LoginServer] Unusable stored out_path ({e}); flooding instead")
+            return None
 
     async def __call__(self, packet: Packet) -> HandlerResult:
         """Handle ANON_REQ login packet from client.
@@ -274,12 +316,18 @@ class LoginServerHandler(BaseHandler):
             struct.pack_into("<I", reply_data, 8, random.randint(0, 0xFFFFFFFF))  # random blob
             reply_data[12] = FIRMWARE_VER_LEVEL  # firmware version
 
-            # Create response packet
-            # Match C++ simple_repeater behavior:
-            # - Flood login: send PATH packet with response as extra data
-            #   (tells sender the path TO here so they can sendDirect)
-            # - Direct login: send regular RESPONSE datagram via flood
+            # Firmware chooseReplyRoute (repeater + room-server #3106):
+            # - Flood login → PATH return (and clear stored out_path).
+            # - Direct + stored ACL out_path → sendDirect along that path.
+            # - Direct + no path → flood RESPONSE. Login ANON_REQ does not
+            #   carry a supplied reply path (DIRECT_SUPPLIED is N/A).
             if is_flood:
+                if self.clear_out_path is not None:
+                    try:
+                        self.clear_out_path(client_identity)
+                    except Exception as e:
+                        self.log(f"[LoginServer] clear_out_path failed: {e}")
+
                 client_hash = client_identity.get_public_key()[0]
                 server_hash = self.local_identity.get_public_key()[0]
                 path_list = (
@@ -310,34 +358,49 @@ class LoginServerHandler(BaseHandler):
                 )
                 packet_type_name = "PATH"
             else:
-                # Direct login: send regular RESPONSE datagram via flood
-                # (like C++ simple_repeater when reply_path_len < 0)
-                response_pkt = PacketBuilder.create_datagram(
-                    ptype=PAYLOAD_TYPE_RESPONSE,
-                    dest=client_identity,
-                    local_identity=self.local_identity,
-                    secret=shared_secret,
-                    plaintext=bytes(reply_data),
-                    route_type="flood",
-                )
-                packet_type_name = "RESPONSE(flood)"
-                self.log("[LoginServer] Creating RESPONSE datagram (direct login, flood reply)")
+                stored = self._lookup_out_path(client_identity)
+                if stored is not None:
+                    path_bytes, path_len_encoded = stored
+                    response_pkt = PacketBuilder.create_datagram(
+                        ptype=PAYLOAD_TYPE_RESPONSE,
+                        dest=client_identity,
+                        local_identity=self.local_identity,
+                        secret=shared_secret,
+                        plaintext=bytes(reply_data),
+                        route_type="direct",
+                    )
+                    response_pkt.set_path(path_bytes[:MAX_PATH_SIZE], path_len_encoded)
+                    packet_type_name = "RESPONSE(direct)"
+                    self.log(
+                        "[LoginServer] Creating RESPONSE datagram "
+                        "(direct login, stored out_path)"
+                    )
+                else:
+                    response_pkt = PacketBuilder.create_datagram(
+                        ptype=PAYLOAD_TYPE_RESPONSE,
+                        dest=client_identity,
+                        local_identity=self.local_identity,
+                        secret=shared_secret,
+                        plaintext=bytes(reply_data),
+                        route_type="flood",
+                    )
+                    packet_type_name = "RESPONSE(flood)"
+                    self.log(
+                        "[LoginServer] Creating RESPONSE datagram " "(direct login, flood reply)"
+                    )
 
-            # Accumulate the reply's path at the *request's* hash width, not this
-            # node's own preference. Firmware sends both branches through
-            # sendFloodReply(..., packet->getPathHashSize()) (simple_repeater
-            # onAnonDataRecv); the node's path_hash_mode governs only packets it
-            # originates itself (sendFloodScoped(default_scope, ..., _prefs
-            # .path_hash_mode + 1)). Marked applied so the dispatcher's node
-            # default cannot stamp over the mirror, the same way apply_reply_scope
-            # protects the region decision below.
-            in_path_len = getattr(original_packet, "path_len", 0) if original_packet else 0
-            in_hash_size = (
-                PathUtils.get_path_hash_size(in_path_len)
-                if PathUtils.is_valid_path_len(in_path_len)
-                else 1
-            )
-            response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
+            if response_pkt.is_route_flood():
+                # Accumulate the flood reply at the *request's* hash width.
+                # Firmware sendFloodReply(..., packet->getPathHashSize()).
+                # The direct/out_path branch keeps the stored path_len.
+                in_path_len = getattr(original_packet, "path_len", 0) if original_packet else 0
+                in_hash_size = (
+                    PathUtils.get_path_hash_size(in_path_len)
+                    if PathUtils.is_valid_path_len(in_path_len)
+                    else 1
+                )
+                response_pkt.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
+                apply_reply_scope(response_pkt, original_packet)
 
             # Debug: Log packet details
             self.log(
@@ -347,12 +410,6 @@ class LoginServerHandler(BaseHandler):
                 f"path_len={response_pkt.path_len}, "
                 f"payload[0:2]={bytes(response_pkt.payload[:2]).hex()}"
             )
-
-            # Scope the flood reply (PATH-return for a flood login, or the flood
-            # RESPONSE datagram for a direct login) to the region the request
-            # arrived under. Both branches build a flood reply; a direct request
-            # captures no region and stays plain.
-            apply_reply_scope(response_pkt, original_packet)
 
             # Send with delay (matches C++ SERVER_RESPONSE_DELAY)
             delay_ms = 300

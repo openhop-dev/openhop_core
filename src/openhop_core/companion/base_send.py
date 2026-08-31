@@ -612,7 +612,7 @@ class _SendOpsMixin:
             logger.error("Error sending raw data direct: %s", e)
             return SentResult(success=False)
 
-    async def send_raw_packet(self, priority: int, packet_bytes: bytes) -> bool:
+    async def send_raw_packet(self, priority: int, packet_bytes: bytes) -> SentResult:
         """Inject a fully-formed on-air packet for transmission (CMD_SEND_RAW_PACKET).
 
         Mirrors firmware ``MyMesh.cpp`` ``CMD_SEND_RAW_PACKET``: parse the raw
@@ -626,28 +626,28 @@ class _SendOpsMixin:
         currently ignored: the bridge's low-level send path
         (:meth:`_send_packet`) does not expose a prioritized TX queue.
 
-        Returns True if the packet parsed and was handed off for transmission,
-        False on parse failure or send error (the frame_server handler maps
-        False to ``ERR_CODE_TABLE_FULL``).
+        Returns a :class:`SentResult`. Parse failure is ``error="illegal_arg"``
+        (firmware ``releasePacket`` + ``ERR_CODE_ILLEGAL_ARG``); TX/queue full
+        is ``error="send_failed"`` (firmware ``ERR_CODE_TABLE_FULL``).
         """
         try:
             pkt = Packet()
             if not pkt.read_from(bytes(packet_bytes)):
-                return False
+                return SentResult(success=False, error="illegal_arg")
         except Exception as e:
             logger.warning("send_raw_packet: failed to parse packet: %s", e)
-            return False
+            return SentResult(success=False, error="illegal_arg")
         try:
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=False)
-            else:
-                self.stats.record_tx_error()
-            return success
+                return SentResult(success=True)
+            self.stats.record_tx_error()
+            return SentResult(success=False, error="send_failed")
         except Exception as e:
             logger.error("Error sending raw packet: %s", e)
             self.stats.record_tx_error()
-            return False
+            return SentResult(success=False, error="send_failed")
 
     async def send_trace_path(
         self,

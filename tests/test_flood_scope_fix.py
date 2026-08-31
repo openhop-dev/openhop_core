@@ -39,6 +39,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_REQ,
+    PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -46,6 +47,7 @@ from openhop_core.protocol.constants import (
     TXT_TYPE_PLAIN,
 )
 from openhop_core.protocol.region_map import (
+    REGION_DENY_FLOOD,
     RegionEntry,
     RegionMap,
     capture_recv_region,
@@ -452,7 +454,7 @@ class TestRepeaterReplyCarriesRegion:
 
     @pytest.mark.asyncio
     async def test_unknown_region_reply_stays_plain(self):
-        """(10) A request scoped to a region absent from the map => plain reply."""
+        """(10) Unresolved region and no default => plain reply (REPLY_SCOPE_NONE)."""
         region_map, _a_key, _b_key = self._region_map()
         server, client = LocalIdentity(), LocalIdentity()
         handler, sent = _login_handler(server)
@@ -467,6 +469,78 @@ class TestRepeaterReplyCarriesRegion:
         reply = sent[0]
         assert reply.get_route_type() == ROUTE_TYPE_FLOOD
         assert reply.transport_codes == [0, 0]
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_region_uses_default_scope(self):
+        """Unresolved TRANSPORT_FLOOD + default region → REPLY_SCOPE_DEFAULT."""
+        region_map, _a_key, _b_key = self._region_map()
+        default_key = get_auto_key_for("#default-region")
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server)
+
+        unknown_key = get_auto_key_for("#not-in-map")
+        req = _build_login_req(server, client, region_key=unknown_key)
+        capture_recv_region(region_map, req, default_key=default_key)
+
+        await handler(req)
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_direct_login_flood_fallback_uses_default_scope(self):
+        """Direct login with no out_path + default → flood RESPONSE scoped DEFAULT."""
+        region_map, _a_key, _b_key = self._region_map()
+        default_key = get_auto_key_for("#default-region")
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server)
+
+        req = _build_login_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req, default_key=default_key)
+
+        await handler(req)
+        reply = sent[0]
+        assert reply.get_payload_type() == PAYLOAD_TYPE_RESPONSE
+        assert reply.is_route_flood()
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_plain_flood_stays_plain_even_with_default(self):
+        """Unscoped flood mirrors NONE even when a default region exists."""
+        region_map, _a_key, _b_key = self._region_map()
+        default_key = get_auto_key_for("#default-region")
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server)
+
+        req = _build_login_req(server, client, region_key=None)
+        capture_recv_region(region_map, req, default_key=default_key)
+
+        await handler(req)
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+        assert reply._flood_scope_applied is True
+
+    @pytest.mark.asyncio
+    async def test_plain_flood_uses_default_when_wildcard_denies_flood(self):
+        """A denied wildcard makes request scope unknown, so DEFAULT wins."""
+        region_map, _a_key, _b_key = self._region_map()
+        region_map.wildcard.flags |= REGION_DENY_FLOOD
+        default_key = get_auto_key_for("#default-region")
+        server, client = LocalIdentity(), LocalIdentity()
+        handler, sent = _login_handler(server)
+
+        req = _build_login_req(server, client, region_key=None)
+        capture_recv_region(region_map, req, default_key=default_key)
+
+        await handler(req)
+        reply = sent[0]
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
         assert reply._flood_scope_applied is True
 
     @pytest.mark.asyncio
@@ -513,12 +587,11 @@ class TestRepeaterReqReplyScope:
           else                                          sendFloodReply(reply, ...);  // (b)
         }
 
-    ``sendFloodReply`` scopes to ``recv_pkt_region`` — which is NULL for a DIRECT
-    request — so branch (b) is a plain, unscoped flood. Branch (b) used to be the
-    one reply builder that never marked its decision, so the dispatcher's node
-    default/override stamped a region onto it that firmware would never use. It
-    is the reply that carries a status/telemetry/neighbours response whenever the
-    ACL holds no out_path for the client.
+    ``sendFloodReply`` uses ``chooseReplyScope``: a DIRECT request has
+    ``recv_pkt_region`` NULL, so the flood RESPONSE is DEFAULT-scoped when
+    the node has a default region, else plain. On a node with no RegionMap
+    the mark is not applied and the reply falls through to the dispatcher
+    default (BaseChatMesh ``sendFloodScoped``).
     """
 
     def _req_handler(self, server: LocalIdentity, client_info):
@@ -568,12 +641,8 @@ class TestRepeaterReqReplyScope:
         return pkt
 
     @pytest.mark.asyncio
-    async def test_direct_req_without_out_path_replies_plain_flood(self):
-        """Branch (b): the node default must not reach this reply.
-
-        A DIRECT request captures no region (firmware ``recv_pkt_region`` is
-        NULL), so the flood RESPONSE stays plain and is marked applied.
-        """
+    async def test_direct_req_without_out_path_or_default_replies_plain_flood(self):
+        """DIRECT + no out_path + no default → REPLY_SCOPE_NONE (plain, marked)."""
         region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
         server, client = LocalIdentity(), LocalIdentity()
         handler = self._req_handler(server, self._client_info(client))  # no out_path
@@ -590,12 +659,39 @@ class TestRepeaterReqReplyScope:
         assert reply.get_route_type() == ROUTE_TYPE_FLOOD
         assert reply._flood_scope_applied is True
 
-        # The gate has to actually hold at TX time against a configured default.
+        # Marked applied: a later dispatcher default cannot override NONE.
         dispatcher = Dispatcher(MockRadio())
         dispatcher.default_flood_transport_key = get_auto_key_for("#region-a")
         dispatcher._apply_flood_scope(reply)
         assert reply.get_route_type() == ROUTE_TYPE_FLOOD
         assert reply.transport_codes == [0, 0]
+
+    @pytest.mark.asyncio
+    async def test_direct_req_without_out_path_uses_default_scope(self):
+        """DIRECT + no out_path + default region → REPLY_SCOPE_DEFAULT.
+
+        Firmware chooseReplyScope(false, false, true). Unscoped would be
+        dropped at hop 0 when flood.max.unscoped=0.
+        """
+        default_key = get_auto_key_for("#region-a")
+        region_map = RegionMap([RegionEntry(id=1, name="#region-a")])
+        server, client = LocalIdentity(), LocalIdentity()
+        handler = self._req_handler(server, self._client_info(client))
+
+        req = self._build_req(server, client, route_type=ROUTE_TYPE_DIRECT)
+        capture_recv_region(region_map, req, default_key=default_key)
+
+        result = await handler(req)
+        reply = result.response
+        assert reply is not None
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
+        assert reply._flood_scope_applied is True
+
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.default_flood_transport_key = get_auto_key_for("#other")
+        dispatcher._apply_flood_scope(reply)
+        assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
     @pytest.mark.asyncio
     async def test_flood_req_path_return_carries_request_region(self):
@@ -686,6 +782,7 @@ class TestRegionCaptureBothEntrypoints:
         region_map, b_key = self._region_map()
         dispatcher = Dispatcher(MockRadio())
         dispatcher.region_map = region_map
+        dispatcher.default_flood_transport_key = get_auto_key_for("#default-region")
 
         seen: list[Packet] = []
 
@@ -700,6 +797,7 @@ class TestRegionCaptureBothEntrypoints:
         assert len(seen) == 1
         assert seen[0]._recv_region_captured is True
         assert seen[0]._recv_region_key == b_key
+        assert seen[0]._recv_default_scope_key == get_auto_key_for("#default-region")
 
     @pytest.mark.asyncio
     async def test_capture_via_bridge_entrypoint(self):

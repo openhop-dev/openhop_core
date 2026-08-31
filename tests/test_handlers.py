@@ -2043,9 +2043,11 @@ class TestLoginServerHandler:
     """
     Tests for the server-side login handler.
 
-    Validates that behavior matches C++ MeshCore/examples/simple_repeater:
+    Validates that behavior matches C++ MeshCore/examples/simple_repeater
+    (1.17.1 #3106 / chooseReplyRoute):
     - Flood login → PATH packet response (login reply as extra data)
-    - Direct login → RESPONSE datagram flooded back
+    - Direct login + no stored out_path → RESPONSE datagram flooded back
+    - Direct login + stored ACL out_path → RESPONSE datagram sent DIRECT
     - Failed auth → no response sent
     - Response payload is 13 bytes with correct structure
     """
@@ -2176,7 +2178,7 @@ class TestLoginServerHandler:
 
     @pytest.mark.asyncio
     async def test_direct_login_sends_response_datagram(self):
-        """Direct login: RESPONSE datagram via flood (C++ sendFlood/createDatagram)."""
+        """Direct login with no stored out_path: RESPONSE datagram via flood."""
         pkt = self._build_login_packet(password="admin123", route_type="direct")
         await self.handler(pkt)
 
@@ -2188,8 +2190,76 @@ class TestLoginServerHandler:
         # Must be PAYLOAD_TYPE_RESPONSE — regular datagram, NOT a PATH packet
         assert response_pkt.get_payload_type() == PAYLOAD_TYPE_RESPONSE
 
-        # C++ sends the datagram via flood when reply_path_len < 0
+        # Firmware chooseReplyRoute: direct + no out_path → REPLY_ROUTE_FLOOD
         assert response_pkt.is_route_flood()
+
+    @pytest.mark.asyncio
+    async def test_direct_login_with_stored_out_path_sends_direct(self):
+        """Direct login + stored ACL out_path → sendDirect (firmware #3106)."""
+        path = bytes([0x11, 0x22])
+        path_len = PathUtils.encode_path_len(1, 2)
+        self.handler.get_out_path = lambda _ident: (path, path_len)
+
+        pkt = self._build_login_packet(password="admin123", route_type="direct")
+        await self.handler(pkt)
+
+        assert len(self.sent_packets) == 1
+        response_pkt, delay_ms = self.sent_packets[0]
+        assert delay_ms == 300
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_RESPONSE
+        assert response_pkt.is_route_direct()
+        assert bytes(response_pkt.path) == path
+        assert response_pkt.path_len == path_len
+
+    @pytest.mark.asyncio
+    async def test_direct_login_trims_stored_out_path_to_declared_length(self):
+        """Trailing storage bytes are not copied into the serialized route."""
+        path_len = PathUtils.encode_path_len(1, 2)
+        self.handler.get_out_path = lambda _ident: (b"\x11\x22\x33", path_len)
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.is_route_direct()
+        assert bytes(response_pkt.path) == b"\x11\x22"
+        response_pkt.write_to()
+
+    @pytest.mark.asyncio
+    async def test_direct_login_with_short_stored_out_path_falls_back_to_flood(self):
+        """A corrupt ACL path must not suppress an otherwise valid login reply."""
+        path_len = PathUtils.encode_path_len(2, 2)
+        self.handler.get_out_path = lambda _ident: (b"\x11\x22", path_len)
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.is_route_flood()
+        response_pkt.write_to()
+
+    @pytest.mark.asyncio
+    async def test_direct_login_zero_hop_out_path_sends_direct(self):
+        """out_path_len == 0 is a known neighbour, not OUT_PATH_UNKNOWN."""
+        self.handler.get_out_path = lambda _ident: (b"", 0)
+
+        pkt = self._build_login_packet(password="admin123", route_type="direct")
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.is_route_direct()
+        assert response_pkt.path_len == 0
+
+    @pytest.mark.asyncio
+    async def test_flood_login_clears_stored_out_path(self):
+        """Flood login asks the app to forget out_path (firmware OUT_PATH_UNKNOWN)."""
+        cleared = []
+        self.handler.clear_out_path = lambda ident: cleared.append(ident.get_public_key())
+
+        pkt = self._build_login_packet(password="admin123", route_type="flood")
+        await self.handler(pkt)
+
+        assert len(cleared) == 1
+        assert cleared[0] == self.client_identity_local.get_public_key()
+        assert self.sent_packets[0][0].get_payload_type() == PAYLOAD_TYPE_PATH
 
     @pytest.mark.asyncio
     async def test_flood_login_response_decryptable_with_login_reply(self):
@@ -2402,12 +2472,12 @@ class TestLoginServerHandler:
 
     @pytest.mark.asyncio
     async def test_direct_login_flood_reply_accumulates_at_request_hash_width(self):
-        """The direct-login flood RESPONSE mirrors the width too.
+        """The no-out_path direct-login flood RESPONSE mirrors the width too.
 
-        Firmware runs this branch through the same sendFloodReply(...,
-        packet->getPathHashSize()) call (simple_repeater onAnonDataRecv, the
-        ``reply_path_len < 0`` case). A direct request that reached us has had
-        its hops consumed but still carries the width in path_len bits 6-7.
+        Firmware chooseReplyRoute FLOOD (no stored out_path) still goes through
+        sendFloodReply(..., packet->getPathHashSize()). A direct request that
+        reached us has had its hops consumed but still carries the width in
+        path_len bits 6-7.
         """
         pkt = self._build_login_packet(password="admin123", route_type="direct")
         pkt.path_len = PathUtils.encode_path_len(3, 0)  # 3-byte hashes, hops consumed

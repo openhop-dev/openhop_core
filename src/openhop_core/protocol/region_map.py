@@ -13,6 +13,11 @@ from .transport_keys import calc_transport_code, get_auto_key_for, scope_packet
 REGION_DENY_FLOOD = 0x01
 REGION_DENY_DIRECT = 0x02  # reserved for future use
 
+# Firmware helpers/RoutingPolicy.h ReplyScope
+REPLY_SCOPE_REQUEST = "request"
+REPLY_SCOPE_DEFAULT = "default"
+REPLY_SCOPE_NONE = "none"
+
 
 @dataclass
 class RegionEntry:
@@ -24,12 +29,20 @@ class RegionEntry:
     name: str = ""
     private_keys: Optional[List[bytes]] = None
 
+    def is_wildcard(self) -> bool:
+        """Return whether this is firmware's root/wildcard region."""
+        return self.id == 0
+
 
 class RegionMap:
     """In-memory region registry with packet→region matching."""
 
     def __init__(self, regions: Optional[Iterable[RegionEntry]] = None) -> None:
         self._regions: list[RegionEntry] = list(regions or [])
+        # Firmware keeps the wildcard outside its ordinary region array. A
+        # plain FLOOD arrived under this region only when it allows flooding;
+        # when denied, reply scope is unknowable and falls back to DEFAULT.
+        self.wildcard = RegionEntry(id=0, parent=0, flags=0, name="*")
 
     # ------------------------------------------------------------------
     # Basic CRUD
@@ -133,7 +146,31 @@ class RegionMap:
         return None
 
 
-def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
+def choose_reply_scope(
+    request_scope_known: bool,
+    request_was_unscoped_flood: bool,
+    default_scope_known: bool,
+) -> str:
+    """Which transport scope a flooded reply should use.
+
+    Mirrors firmware ``RoutingPolicy.h`` ``chooseReplyScope``:
+    known request region → REQUEST; unscoped flood → NONE (mirror the
+    requester); otherwise DEFAULT if the node has a default region, else NONE.
+    """
+    if request_scope_known:
+        return REPLY_SCOPE_REQUEST
+    if request_was_unscoped_flood:
+        return REPLY_SCOPE_NONE
+    if default_scope_known:
+        return REPLY_SCOPE_DEFAULT
+    return REPLY_SCOPE_NONE
+
+
+def capture_recv_region(
+    region_map: Optional[RegionMap],
+    pkt: Packet,
+    default_key: Optional[bytes] = None,
+) -> None:
     """Record the region a received packet arrived under, onto the packet.
 
     Shared by both RX entrypoints (``Dispatcher._process_received_packet`` and
@@ -142,42 +179,78 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
 
     - ``TRANSPORT_FLOOD``: match against ``REGION_DENY_FLOOD``-honouring regions
       and record that region's (single) key.
-    - ``FLOOD`` (wildcard) or direct: record None => a reply is sent plain,
-      never the node default.
+    - ``FLOOD``: record whether the wildcard permits it. An allowed wildcard
+      mirrors the request as unscoped; a denied wildcard falls back to DEFAULT.
+    - Direct or unresolved transport scope: fall back to ``default_key``.
 
     A ``None`` region_map (standalone companion) is a no-op: ``_recv_region_captured``
     stays False, so a reply falls through to the dispatcher default.
     """
     if region_map is None:
         return
+    if default_key is None and getattr(pkt, "_recv_region_captured", False):
+        # The host dispatcher may already have captured a valid default before
+        # handing this same Packet to a CompanionBridge. Do not erase that
+        # snapshot merely because the bridge has no duplicate key configured.
+        default_key = getattr(pkt, "_recv_default_scope_key", None)
     pkt._recv_region_captured = True
+    pkt._recv_default_scope_key = default_key
+    pkt._recv_region_unscoped = False
     if pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD:
         entry = region_map.find_match(pkt, mask=REGION_DENY_FLOOD)
-        pkt._recv_region_key = region_map.first_key_for(entry)
+        if entry is not None and entry.is_wildcard():
+            pkt._recv_region_key = None
+            pkt._recv_region_unscoped = True
+        else:
+            pkt._recv_region_key = region_map.first_key_for(entry)
+    elif pkt.get_route_type() == ROUTE_TYPE_FLOOD:
+        pkt._recv_region_key = None
+        pkt._recv_region_unscoped = not (region_map.wildcard.flags & REGION_DENY_FLOOD)
     else:
         pkt._recv_region_key = None
 
 
-def apply_reply_scope(reply_pkt: Packet, request_pkt: Optional[Packet]) -> None:
-    """Scope a freshly-built flood reply to the region its request arrived under.
+def apply_reply_scope(
+    reply_pkt: Packet,
+    request_pkt: Optional[Packet],
+    default_key: Optional[bytes] = None,
+) -> None:
+    """Scope a freshly-built flood reply per firmware ``chooseReplyScope``.
 
-    A repeater/room-server reply carries the request's region (or plain when
-    the request was unscoped/direct), re-hashing the transport code over the
-    reply's own payload — never the request's code, never the node default.
+    Re-hashes the transport code over the reply's own payload — never the
+    request's code.
 
     - Not captured (standalone companion, ``region_map`` None): return without
       marking, so the reply falls through to the dispatcher default.
-    - Captured with a key and the reply is a plain FLOOD: scope it
-      (=> TRANSPORT_FLOOD).
-    - Captured with no key (plain-flood/direct request, or unknown region):
-      leave the reply plain.
+    - Captured + known request region: REQUEST (scope with that key).
+    - Captured + unscoped flood: NONE (plain, marked so a node default cannot
+      override the requester's choice).
+    - Captured + direct / unresolved region: DEFAULT if a default key is
+      available (argument or snapshotted at capture), else NONE (plain).
 
     In every captured case the reply is marked ``_flood_scope_applied`` so the
     dispatcher's node-default scope cannot override this decision.
     """
     if not getattr(request_pkt, "_recv_region_captured", False):
         return
-    key = getattr(request_pkt, "_recv_region_key", None)
-    if key is not None and reply_pkt.get_route_type() == ROUTE_TYPE_FLOOD:
-        scope_packet(reply_pkt, key)
+    req_key = getattr(request_pkt, "_recv_region_key", None)
+    if default_key is None:
+        default_key = getattr(request_pkt, "_recv_default_scope_key", None)
+    scope = choose_reply_scope(
+        req_key is not None,
+        bool(getattr(request_pkt, "_recv_region_unscoped", False)),
+        default_key is not None,
+    )
+    if (
+        scope == REPLY_SCOPE_REQUEST
+        and req_key is not None
+        and reply_pkt.get_route_type() == ROUTE_TYPE_FLOOD
+    ):
+        scope_packet(reply_pkt, req_key)
+    elif (
+        scope == REPLY_SCOPE_DEFAULT
+        and default_key is not None
+        and reply_pkt.get_route_type() == ROUTE_TYPE_FLOOD
+    ):
+        scope_packet(reply_pkt, default_key)
     reply_pkt._flood_scope_applied = True

@@ -15,6 +15,7 @@ from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, 
 from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_ANON_REQ,
     PAYLOAD_TYPE_PATH,
     PAYLOAD_TYPE_RAW_CUSTOM,
     PAYLOAD_TYPE_RESPONSE,
@@ -83,6 +84,28 @@ class TestCompanionBridgeInit:
             authenticate_callback=auth_cb,
         )
         assert bridge._handlers is not None
+
+    def test_login_handler_reads_and_clears_contact_out_path(self):
+        """Production bridge wiring exposes its contact route to login replies."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector())
+        peer = LocalIdentity()
+        path_len = PathUtils.encode_path_len(1, 2)
+        contact = Contact(
+            public_key=peer.get_public_key(),
+            out_path_len=path_len,
+            out_path=b"\x11\x22",
+        )
+        assert bridge.contacts.add(contact) is True
+
+        handler = bridge._handlers[PAYLOAD_TYPE_ANON_REQ]
+        peer_identity = Identity(peer.get_public_key())
+        assert handler.get_out_path(peer_identity) == (b"\x11\x22", path_len)
+
+        handler.clear_out_path(peer_identity)
+        updated = bridge.contacts.get_by_key(peer.get_public_key())
+        assert updated is not None
+        assert updated.out_path_len == -1
+        assert updated.out_path == b""
 
     def test_set_other_params_propagates_multi_acks(self):
         """set_other_params pushes the multi_acks pref into the text handler."""
@@ -499,22 +522,23 @@ class TestCompanionBridgeSendAndShare:
         raw_bytes = source.write_to()
         result = await bridge.send_raw_packet(0, raw_bytes)
         await bridge.stop()
-        assert result is True
+        assert result.success is True
         assert len(injector.calls) == 1
         pkt, wait_for_ack = injector.calls[0]
         # The injected packet round-trips the original wire bytes.
         assert pkt.write_to() == raw_bytes
         assert wait_for_ack is False
 
-    async def test_send_raw_packet_unparseable_returns_false(self):
-        """send_raw_packet returns False (no injection) when bytes don't parse."""
+    async def test_send_raw_packet_unparseable_returns_illegal_arg(self):
+        """Parse failure is illegal_arg (not send_failed / table-full)."""
         injector = MockPacketInjector()
         bridge = CompanionBridge(LocalIdentity(), injector)
         await bridge.start()
         # Header byte only: read_from has no path_len/payload to parse -> failure.
         result = await bridge.send_raw_packet(0, b"\x00")
         await bridge.stop()
-        assert result is False
+        assert result.success is False
+        assert result.error == "illegal_arg"
         assert injector.calls == []
 
 
