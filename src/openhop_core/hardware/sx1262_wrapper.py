@@ -250,7 +250,7 @@ class SX1262Radio(LoRaRadio):
         self._floor_sample_sum = 0.0
         self._noise_floor_samples: list[float] = []
         self._last_packet_activity = 0.0
-        self._is_receiving_packet = False
+        self._processing_rx_packet = False
         self._last_sample_check = 0.0
         self.NUM_NOISE_FLOOR_SAMPLES = 20
         self.NOISE_FLOOR_UPDATE_INTERVAL = 5.0
@@ -391,7 +391,10 @@ class SX1262Radio(LoRaRadio):
                 self.lora.IRQ_RX_DONE | self.lora.IRQ_CRC_ERR | self.lora.IRQ_HEADER_ERR
             )
             if irqStat & rx_packet_irq_mask:
-                self._pending_rx_irq_status |= irqStat & rx_packet_irq_mask
+                if self._header_failed(irqStat):
+                    logger.debug(f"[RX] Discarded corrupt-header packet (0x{irqStat:04X})")
+                else:
+                    self._pending_rx_irq_status |= irqStat & rx_packet_irq_mask
 
             if irqStat != 0:
                 self.lora.clearIrqStatus(0xFFFF)
@@ -492,6 +495,10 @@ class SX1262Radio(LoRaRadio):
             if not self._tx_lock.locked():
                 self._rx_done_event.set()
 
+    def _header_failed(self, irq: int) -> bool:
+        """Header CRC failed with no valid header in the same read."""
+        return bool(irq & self.lora.IRQ_HEADER_ERR) and not (irq & self.lora.IRQ_HEADER_VALID)
+
     async def _drain_pending_rx_irq_before_buffer_reuse(self) -> None:
         """Drain latched packet-bearing RX IRQ state before CAD/TX buffer reuse."""
         if not self._pending_rx_irq_status:
@@ -508,6 +515,10 @@ class SX1262Radio(LoRaRadio):
                     self.crc_error_count += 1
                 elif pending_irq & self.lora.IRQ_RX_DONE:
                     payloadLengthRx, rxStartBufferPointer = self.lora.getRxBufferStatus()
+                    packet_rssi_dbm, snr_db, signal_rssi_dbm = self.lora.getSignalMetrics()
+                    self.last_rssi = int(packet_rssi_dbm)
+                    self.last_snr = snr_db
+                    self.last_signal_rssi = int(signal_rssi_dbm)
                     if payloadLengthRx > 0:
                         buffer = self.lora.readBuffer(rxStartBufferPointer, payloadLengthRx)
                         callback_packet_data = bytes(buffer)
@@ -517,8 +528,6 @@ class SX1262Radio(LoRaRadio):
                             f"({len(callback_packet_data)} bytes)"
                         )
 
-                if pending_irq & self.lora.IRQ_HEADER_ERR:
-                    logger.debug("[RX] Drained pending HEADER_ERR before TX/CAD")
             finally:
                 # Clear only after the latched IRQ state has been consumed.
                 self._pending_rx_irq_status = 0
@@ -573,7 +582,7 @@ class SX1262Radio(LoRaRadio):
                         _trace("[RX] RX_DONE event triggered!")
 
                         # Mark that we're processing a packet (prevents noise floor sampling)
-                        self._is_receiving_packet = True
+                        self._processing_rx_packet = True
                         self._last_packet_activity = time.time()
 
                         callback_packet_data = None
@@ -642,6 +651,10 @@ class SX1262Radio(LoRaRadio):
                                             self.crc_error_count,
                                             diag_err,
                                         )
+                                elif self._header_failed(irqStat):
+                                    logger.debug(
+                                        f"[RX] Skipped corrupt-header packet " f"(0x{irqStat:04X})"
+                                    )
                                 elif irqStat & self.lora.IRQ_RX_DONE:
                                     (
                                         payloadLengthRx,
@@ -725,7 +738,7 @@ class SX1262Radio(LoRaRadio):
                             logger.error(f"[IRQ RX] Error processing received packet: {e}")
                         finally:
                             # Clear packet processing flag
-                            self._is_receiving_packet = False
+                            self._processing_rx_packet = False
 
                     except asyncio.TimeoutError:
                         # No RX event within timeout - normal operation
@@ -1590,22 +1603,12 @@ class SX1262Radio(LoRaRadio):
         if self._tx_lock.locked():
             return
 
-        # Don't sample if packet processing is active or RX terminal IRQs are pending.
-        if self._is_receiving_packet:
+        # Don't sample if we're receiving or processing a packet.
+        if self.is_receiving_packet():  # still arriving
             return
-        if self._pending_rx_irq_status:
+        if self._pending_rx_irq_status:  # arrived, waiting to be handled
             return
-
-        # Skip during in-flight RX activity indicated by hardware IRQ flags.
-        rx_activity_mask = (
-            self.lora.IRQ_PREAMBLE_DETECTED
-            | self.lora.IRQ_HEADER_VALID
-            | self.lora.IRQ_RX_DONE
-            | self.lora.IRQ_CRC_ERR
-            | self.lora.IRQ_HEADER_ERR
-        )
-        irq_status = self.lora.getIrqStatus()
-        if irq_status & rx_activity_mask:
+        if self._processing_rx_packet:  # being handled now
             return
 
         # Give 500ms quiet time after any packet activity

@@ -215,6 +215,22 @@ async def test_lbt_standby_only_after_channel_clear(radio):
     assert radio.perform_cad.await_count == 1
 
 
+async def test_drain_updates_signal_metrics(radio):
+    """A packet delivered via drain must report its own RSSI/SNR, not
+    whatever was cached from the last packet the normal path handled."""
+    radio.set_rx_callback(lambda _: None)
+    radio.lora.getRxBufferStatus.return_value = (4, 0x80)
+    radio.lora.readBuffer.return_value = list(b"test")
+    radio.lora.getSignalMetrics.return_value = (-77.0, 6.5, -79.0)
+    radio._pending_rx_irq_status = IRQ_RX_DONE
+
+    await radio._drain_pending_rx_irq_before_buffer_reuse()
+
+    assert radio.last_rssi == -77
+    assert radio.last_snr == 6.5
+    assert radio.last_signal_rssi == -79
+
+
 # ─── LBT: time budget, not attempt count ─────────────────────────────
 
 
