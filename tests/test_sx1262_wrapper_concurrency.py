@@ -32,7 +32,7 @@ import contextlib
 import random
 import threading
 import time
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
@@ -978,6 +978,16 @@ class TestRxBackgroundTask:
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             await self._run_task_with(radio, irq_flags=IRQ_CRC_ERR)
         assert "CRC error" in caplog.text
+
+    async def test_crc_error_logs_none_noise_floor_without_crashing(self, radio, caplog):
+        import logging
+
+        radio.get_noise_floor = Mock(return_value=None)
+        with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
+            await self._run_task_with(radio, irq_flags=IRQ_CRC_ERR)
+
+        assert "CRC error" in caplog.text
+        assert "NoiseFloor=n/adBm" in caplog.text
 
 
 # ===========================================================================

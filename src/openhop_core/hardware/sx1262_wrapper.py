@@ -621,6 +621,11 @@ class SX1262Radio(LoRaRadio):
                                         ) = self.lora.getRxBufferStatus()
                                         device_errors = self.lora.getDeviceErrors()
                                         noise_floor = self.get_noise_floor()
+                                        noise_floor_text = (
+                                            f"{noise_floor:.1f}"
+                                            if noise_floor is not None
+                                            else "n/a"
+                                        )
                                         raw_packet_hex = ""
                                         if payloadLengthRx > 0 and payloadLengthRx < 256:
                                             try:
@@ -635,7 +640,7 @@ class SX1262Radio(LoRaRadio):
                                         logger.warning(
                                             "[RX] CRC error #%d - RSSI=%ddBm, "
                                             "SNR=%.1fdB, SignalRSSI=%ddBm, "
-                                            "Length=%d, NoiseFloor=%.1fdBm, "
+                                            "Length=%d, NoiseFloor=%sdBm, "
                                             "DeviceErrors=0x%04X, IRQ=0x%04X, "
                                             "RawData=%s",
                                             self.crc_error_count,
@@ -643,7 +648,7 @@ class SX1262Radio(LoRaRadio):
                                             snr_db,
                                             int(signal_rssi_dbm),
                                             payloadLengthRx,
-                                            noise_floor,
+                                            noise_floor_text,
                                             device_errors,
                                             irqStat,
                                             raw_packet_hex,
@@ -671,8 +676,10 @@ class SX1262Radio(LoRaRadio):
                                     self.last_signal_rssi = int(signal_rssi_dbm)
 
                                     logger.debug(
-                                        f"[RX] Packet received: length={payloadLengthRx}, "
-                                        f"RSSI={self.last_rssi}dBm, SNR={self.last_snr}dB"
+                                        "[RX] Packet received: length=%d, RSSI=%ddBm, SNR=%.1fdB",
+                                        payloadLengthRx,
+                                        self.last_rssi,
+                                        self.last_snr,
                                     )
 
                                     # Trigger RX LED
@@ -683,11 +690,12 @@ class SX1262Radio(LoRaRadio):
                                             rxStartBufferPointer, payloadLengthRx
                                         )
                                         callback_packet_data = bytes(buffer)
-                                        _trace(
-                                            f"[RX] Packet data: "
-                                            f"{callback_packet_data.hex()[:32]}... "
-                                            f"({len(callback_packet_data)} bytes)"
-                                        )
+                                        if logger.isEnabledFor(TRACE_LEVEL):
+                                            _trace(
+                                                f"[RX] Packet data: "
+                                                f"{callback_packet_data.hex()[:32]}... "
+                                                f"({len(callback_packet_data)} bytes)"
+                                            )
                                     else:
                                         logger.warning("[RX] Empty packet received")
                                 elif irqStat & self.lora.IRQ_TIMEOUT:
@@ -706,17 +714,18 @@ class SX1262Radio(LoRaRadio):
                                         "[RX] Header valid - packet header received, payload coming"
                                     )
                                 else:
-                                    logger.debug(f"[RX] Other interrupt: 0x{irqStat:04X}")
+                                    logger.debug("[RX] Other interrupt: 0x%04X", irqStat)
 
                                 if not self._tx_lock.locked():
                                     try:
                                         self.lora.request(self.lora.RX_CONTINUOUS)
                                         self.lora.clearIrqStatus(0xFFFF)
                                         await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                                        _trace(
-                                            f"[RX] Restored RX continuous mode "
-                                            f"after IRQ 0x{irqStat:04X}"
-                                        )
+                                        if logger.isEnabledFor(TRACE_LEVEL):
+                                            _trace(
+                                                f"[RX] Restored RX continuous mode "
+                                                f"after IRQ 0x{irqStat:04X}"
+                                            )
                                     except Exception as e:
                                         logger.error(f"Failed to restore RX mode: {e}")
                                 else:
@@ -751,8 +760,9 @@ class SX1262Radio(LoRaRadio):
                         # Log every 500 checks (roughly every 5 seconds) to show RX task is alive
                         if rx_check_count % 500 == 0:
                             logger.debug(
-                                f"[RX Task] Status check #{rx_check_count}, "
-                                f"noise_floor={self._noise_floor:.1f}dBm"
+                                "[RX Task] Status check #%d, noise_floor=%.1fdBm",
+                                rx_check_count,
+                                self._noise_floor,
                             )
 
                 else:
