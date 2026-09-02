@@ -388,31 +388,31 @@ class TestInterruptHandlerDispatch:
 class TestIrqSuppressionDuringTx:
     """Terminal RX interrupts must be ignored while _tx_lock is held."""
 
-    async def test_rx_done_suppressed_while_tx_locked(self, radio):
+    @pytest.mark.parametrize(
+        "irq", [IRQ_RX_DONE, IRQ_CRC_ERR, IRQ_TIMEOUT, IRQ_HEADER_ERR]
+    )
+    async def test_terminal_irq_delivered_while_only_tx_lock_held(self, radio, irq):
+        """Holding _tx_lock must not suppress the RX wake: the event has no
+        counter, so a skipped set() is deleted rather than deferred."""
         async with radio._tx_lock:
             radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_RX_DONE)
-            assert not radio._rx_done_event.is_set(), (
-                "RX_DONE must NOT wake background task during active TX"
+            _inject_irq(radio, irq)
+            assert radio._rx_done_event.is_set(), (
+                f"terminal IRQ 0x{irq:04X} must wake the RX task while only _tx_lock is held"
             )
 
-    async def test_crc_err_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
+    @pytest.mark.parametrize(
+        "irq", [IRQ_RX_DONE, IRQ_CRC_ERR, IRQ_TIMEOUT, IRQ_HEADER_ERR]
+    )
+    async def test_terminal_irq_suppressed_while_tx_buffer_busy(self, radio, irq):
+        """The wake is gated only while the shared buffer is being reused."""
+        radio._tx_buffer_busy = True
+        try:
             radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_CRC_ERR)
+            _inject_irq(radio, irq)
             assert not radio._rx_done_event.is_set()
-
-    async def test_timeout_irq_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_TIMEOUT)
-            assert not radio._rx_done_event.is_set()
-
-    async def test_header_err_suppressed_while_tx_locked(self, radio):
-        async with radio._tx_lock:
-            radio._rx_done_event.clear()
-            _inject_irq(radio, IRQ_HEADER_ERR)
-            assert not radio._rx_done_event.is_set()
+        finally:
+            radio._tx_buffer_busy = False
 
     async def test_tx_done_event_fires_even_while_tx_locked(self, radio):
         """TX_DONE must still propagate so the sender coroutine can unblock."""
@@ -689,9 +689,19 @@ class TestTransmissionLifecycle:
         await radio._restore_rx_mode()
         mock_lora.request.assert_called_with(mock_lora.RX_CONTINUOUS)
 
-    async def test_restore_rx_mode_clears_irq_multiple_times(self, radio, mock_lora):
+    async def test_restore_rx_mode_follows_datasheet_order(self, radio, mock_lora):
+        """Datasheet 14.3: standby, SetDioIrqParams, SetRx - and the RF switch
+        connected before the chip starts listening."""
+        calls = []
+        mock_lora.setStandby.side_effect = lambda *a, **k: calls.append("standby")
+        mock_lora.setDioIrqParams.side_effect = lambda *a, **k: calls.append("irq_params")
+        mock_lora.request.side_effect = lambda *a, **k: calls.append("set_rx")
+        radio._control_tx_rx_pins = lambda tx_mode: calls.append("rf_switch")
+
         await radio._restore_rx_mode()
-        assert mock_lora.clearIrqStatus.call_count >= 2
+
+        assert calls.index("rf_switch") < calls.index("set_rx")
+        assert calls.index("standby") < calls.index("irq_params") < calls.index("set_rx")
 
     async def test_restore_rx_mode_exception_swallowed(self, radio, mock_lora):
         mock_lora.clearIrqStatus.side_effect = RuntimeError("SPI failure")
@@ -1333,15 +1343,15 @@ class TestEventOrdering:
 
         await radio._tx_lock.acquire()
         try:
-            # IRQ arrives while TX lock is held: hardware IRQ is cleared and
-            # background RX task is not woken, so software latch must preserve it.
+            # IRQ arrives while TX lock is held: the wake now fires regardless,
+            # and the software latch still preserves the packet for buffer reuse.
             mock_lora.getIrqStatus.return_value = mock_lora.IRQ_RX_DONE
             radio._handle_interrupt()
         finally:
             radio._tx_lock.release()
 
         assert radio._pending_rx_irq_status & mock_lora.IRQ_RX_DONE
-        assert not radio._rx_done_event.is_set()
+        assert radio._rx_done_event.is_set()
 
         mock_lora.getRxBufferStatus.return_value = (4, 0x80)
         mock_lora.readBuffer.return_value = list(b"test")

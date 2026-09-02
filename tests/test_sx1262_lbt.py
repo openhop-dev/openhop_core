@@ -156,6 +156,7 @@ async def test_lbt_defers_to_in_progress_reception_without_cad(radio):
     """While a reception is latched, the LBT loop must wait on the passive
     check alone: running CAD would drop to standby and abort the reception it
     is probing for. The CAD scan happens only once the latch clears."""
+    radio._max_preamble_seconds = lambda: 10.0  # keep expiry out of the picture
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
     radio._restore_rx_for_cad_backoff = AsyncMock()
@@ -183,6 +184,7 @@ async def test_lbt_does_not_touch_the_radio_while_a_reception_is_latched(radio):
     IRQ left to clear it, the latch would then block TX until it goes stale.
     Only a CAD scan leaves standby behind, so only a scan needs the re-arm.
     """
+    radio._max_preamble_seconds = lambda: 10.0  # keep expiry out of the picture
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
     radio._restore_rx_for_cad_backoff = AsyncMock()
@@ -300,6 +302,7 @@ async def test_lbt_summary_reports_cad_clear(radio, caplog):
 
 
 async def test_lbt_summary_counts_latch_defers_separately_from_cad(radio, caplog):
+    radio._max_preamble_seconds = lambda: 10.0  # keep expiry out of the picture
     _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
     radio.perform_cad = AsyncMock(return_value=False)
     radio._restore_rx_for_cad_backoff = AsyncMock()
