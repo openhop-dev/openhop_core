@@ -2261,6 +2261,103 @@ class TestLoginServerHandler:
         assert cleared[0] == self.client_identity_local.get_public_key()
         assert self.sent_packets[0][0].get_payload_type() == PAYLOAD_TYPE_PATH
 
+    # ------------------------------------------------------------------
+    # ACL callback guards.
+    #
+    # ``get_out_path`` / ``clear_out_path`` are supplied by the application, so
+    # unlike firmware's fixed ClientInfo they can return any shape or raise.
+    # A bad ACL entry may cost the direct route or the path clear; it must
+    # never cost the login reply, which is the invariant the flood fallback
+    # exists to state. Each of these fails if its guard is removed.
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_a_raising_get_out_path_never_costs_the_reply(self):
+        """An ACL that raises falls back to flooding, as if it had no path."""
+
+        def _boom(_ident):
+            raise RuntimeError("ACL exploded")
+
+        self.handler.get_out_path = _boom
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        assert len(self.sent_packets) == 1
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.get_payload_type() == PAYLOAD_TYPE_RESPONSE
+        assert response_pkt.is_route_flood()
+        response_pkt.write_to()
+
+    @pytest.mark.asyncio
+    async def test_a_hex_string_out_path_never_costs_the_reply(self):
+        """``contact_store`` persists paths as hex strings, so an app wiring the
+        stored value straight through hands this a str. ``bytes(str)`` raises,
+        which pre-guard unwound past the reply entirely."""
+        path_len = PathUtils.encode_path_len(1, 2)
+        self.handler.get_out_path = lambda _ident: ("1122", path_len)
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        assert len(self.sent_packets) == 1
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.is_route_flood()
+        response_pkt.write_to()
+
+    @pytest.mark.asyncio
+    async def test_a_non_integer_out_path_len_never_costs_the_reply(self):
+        """``int(raw_path_len)`` is just as able to raise as the buffer is."""
+        self.handler.get_out_path = lambda _ident: (b"\x11\x22", object())
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        assert len(self.sent_packets) == 1
+        assert self.sent_packets[0][0].is_route_flood()
+
+    @pytest.mark.asyncio
+    async def test_an_unencodable_out_path_len_falls_back_to_flood(self):
+        """A length that does not decode is not a route.
+
+        0xC1 is the case that isolates the ``is_valid_path_len`` gate from the
+        buffer-length check that follows it: hash_size 4 is reserved, so the
+        byte is invalid, but it declares 1 hop x 4 bytes and a 4-byte buffer
+        satisfies the length test. Without the gate this would put a reserved
+        path_len encoding on the air. A length like 0xFF is rejected by either
+        check and so proves neither.
+        """
+        self.handler.get_out_path = lambda _ident: (b"\x11\x22\x33\x44", 0xC1)
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        assert len(self.sent_packets) == 1
+        assert self.sent_packets[0][0].is_route_flood()
+
+    @pytest.mark.asyncio
+    async def test_a_raising_clear_out_path_never_costs_the_path_return(self):
+        """The clear is best-effort housekeeping for the *next* request. It must
+        not take down the PATH return this flood login is owed."""
+
+        def _boom(_ident):
+            raise RuntimeError("ACL exploded")
+
+        self.handler.clear_out_path = _boom
+
+        await self.handler(self._build_login_packet(route_type="flood"))
+
+        assert len(self.sent_packets) == 1
+        assert self.sent_packets[0][0].get_payload_type() == PAYLOAD_TYPE_PATH
+
+    @pytest.mark.asyncio
+    async def test_get_out_path_is_asked_by_full_public_key(self):
+        """Firmware looks the client up by full pub_key, not the 1-byte hash a
+        dest-hash collision would share. The callback gets the Identity."""
+        seen = []
+        self.handler.get_out_path = lambda ident: seen.append(ident) or None
+
+        await self.handler(self._build_login_packet(route_type="direct"))
+
+        assert len(seen) == 1
+        assert seen[0].get_public_key() == self.client_identity_local.get_public_key()
+
     @pytest.mark.asyncio
     async def test_flood_login_response_decryptable_with_login_reply(self):
         """PATH response from flood login contains the 13-byte login reply as extra data."""
