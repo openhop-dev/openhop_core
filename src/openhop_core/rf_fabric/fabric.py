@@ -29,6 +29,7 @@ class RFFabric:
         self._ingress_callback: Optional[Callable[[RFIngress], Any]] = None
         self._legacy_rx_callback: Optional[LegacyRxCallback] = None
         self._tx_selector: Optional[TxSelector] = None
+        self._origin_tx: str = "default"
         self._armed = False
         # Latest delivered reception metrics (for FabricRadio get_last_*).
         self._last_rssi: int = 0
@@ -122,6 +123,27 @@ class RFFabric:
     def set_tx_selector(self, selector: Optional[TxSelector]) -> None:
         """Optional policy: ``selector(data) -> radio_id | None`` for default TX."""
         self._tx_selector = selector
+
+    @property
+    def origin_tx(self) -> str:
+        """Egress policy for locally originated packets: "default" or "all"."""
+        return self._origin_tx
+
+    def set_origin_tx(self, mode: str) -> None:
+        """Set the egress policy for locally originated packets.
+
+        - "default": origins TX on the default/selector radio (current
+          behaviour, and the default).
+        - "all": origins fan out to every registered radio via
+          :meth:`send_all`. Bridge topologies need this: ``tx_mode=bridge``
+          only steers *forwards* (RX radio -> the other radio); an origin
+          packet has no RX side, so without fan-out it leaves on a single
+          radio and never crosses the link.
+        """
+        mode_l = (mode or "default").strip().lower()
+        if mode_l not in ("default", "all"):
+            raise ValueError(f"Unknown origin_tx mode={mode!r}. Supported: default, all")
+        self._origin_tx = mode_l
 
     # ------------------------------------------------------------------
     # Callbacks / arming
@@ -281,6 +303,43 @@ class RFFabric:
             return {"ok": True, "radio_id": rid}
         # Unknown non-dict success payload: leave unchanged.
         return result
+
+    async def send_all(self, data: bytes) -> Any:
+        """Transmit ``data`` on every registered radio, sequentially.
+
+        Radios TX in registration order and each ``send()`` is awaited to
+        completion before the next starts, so transmissions are serialised —
+        a driver that returns on TX-done naturally staggers the next radio by
+        its own airtime. Register the real RF radio first so a slow or hung
+        link radio never delays RF egress.
+
+        Per-radio failures are logged and skipped; the call fails (returns
+        ``None``) only when every radio failed. On success returns the first
+        successful radio's metadata dict with ``radio_id`` set to ``"all"``
+        and the successful ids listed under ``radio_ids`` (non-dict legacy
+        results are wrapped).
+        """
+        if not self._radios:
+            raise RuntimeError("RFFabric has no registered radio")
+        first_meta: Optional[dict] = None
+        ok_ids = []
+        for rid in list(self._radios.keys()):
+            try:
+                result = await self.send(data, radio_id=rid)
+            except Exception as exc:
+                logger.warning("send_all: TX failed on radio_id=%s: %s", rid, exc)
+                continue
+            if result is None or result is False:
+                logger.warning("send_all: no TX confirmation from radio_id=%s", rid)
+                continue
+            ok_ids.append(rid)
+            if first_meta is None:
+                first_meta = dict(result) if isinstance(result, dict) else {"ok": True}
+        if first_meta is None:
+            return None
+        first_meta["radio_id"] = "all"
+        first_meta["radio_ids"] = ok_ids
+        return first_meta
 
     def get_last_rssi(self) -> int:
         if self._last_rx_radio_id and self._last_rx_radio_id in self._radios:

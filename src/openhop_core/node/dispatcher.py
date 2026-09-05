@@ -1140,6 +1140,29 @@ class Dispatcher:
                 continue
         return None
 
+    def _origin_fanout_fabric(self, packet: Packet, radio_id: Optional[str]) -> Optional[Any]:
+        """Return the fabric when this TX should fan out to every radio.
+
+        Fan-out applies only to locally originated packets — forwards carry
+        ``_rx_radio_id`` stamped on RX — and only when the caller did not
+        request an explicit ``radio_id``, the fabric opted in with
+        ``origin_tx="all"``, and more than one radio is registered.
+        """
+        if radio_id is not None:
+            return None
+        if getattr(packet, "_rx_radio_id", None) is not None:
+            return None
+        fabric = getattr(self.radio, "fabric", None)
+        if fabric is None and hasattr(self.radio, "send_all"):
+            fabric = self.radio  # RFFabric (or compatible) used directly
+        if fabric is None or not hasattr(fabric, "send_all"):
+            return None
+        if getattr(fabric, "origin_tx", "default") != "all":
+            return None
+        if len(getattr(fabric, "radios", {})) < 2:
+            return None
+        return fabric
+
     async def _transmit_locked(
         self,
         packet: Packet,
@@ -1172,19 +1195,31 @@ class Dispatcher:
         self.state = DispatcherState.TRANSMIT
         raw = packet.write_to()
         tx_metadata = None
+        # Locally originated packets optionally egress on every fabric radio
+        # (fabric.origin_tx="all"): tx_mode=bridge only steers *forwards*
+        # (RX radio -> the other radio), so without fan-out an origin leaves
+        # on the default radio only and never crosses the link — a companion
+        # behind a bridge could be reached but never speak.
+        fanout_fabric = self._origin_fanout_fabric(packet, radio_id)
         # Resolve which fabric/radio endpoint will TX for log clarity (multi-radio).
-        tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id)
+        if fanout_fabric is not None:
+            tx_radio_id = "all"
+        else:
+            tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id)
         try:
-            # Prefer fabric/radio multi-radio send(data, radio_id=...) when
-            # available; fall back to the legacy single-arg send(raw).
-            send_fn = self.radio.send
-            if radio_id is not None:
-                try:
-                    tx_metadata = await send_fn(raw, radio_id=radio_id)
-                except TypeError:
-                    tx_metadata = await send_fn(raw)
+            if fanout_fabric is not None:
+                tx_metadata = await fanout_fabric.send_all(raw)
             else:
-                tx_metadata = await send_fn(raw)
+                # Prefer fabric/radio multi-radio send(data, radio_id=...) when
+                # available; fall back to the legacy single-arg send(raw).
+                send_fn = self.radio.send
+                if radio_id is not None:
+                    try:
+                        tx_metadata = await send_fn(raw, radio_id=radio_id)
+                    except TypeError:
+                        tx_metadata = await send_fn(raw)
+                else:
+                    tx_metadata = await send_fn(raw)
         except Exception as e:
             radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
             self._log(f"Radio transmit error{radio_label}: {e}")
