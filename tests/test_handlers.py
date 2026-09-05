@@ -2249,6 +2249,30 @@ class TestLoginServerHandler:
         assert response_pkt.path_len == 0
 
     @pytest.mark.asyncio
+    async def test_zero_hop_out_path_keeps_its_declared_width(self):
+        """A direct reply is a ``sendDirect``, which firmware never routes
+        through ``sendFloodReply`` -- so it must not be re-stamped with the
+        request's path-hash width, nor handed to the reply-scope helper.
+
+        Only zero hops can show this: ``apply_path_hash_mode`` returns early
+        once ``get_path_hash_count()`` is non-zero, so a multi-hop stored route
+        is untouched either way. Here the request carries 2-byte hashes and the
+        stored route is a direct neighbour, so dropping the ``is_route_flood()``
+        guard rewrites the reply's ``path_len`` from 0 to ``encode_path_len(2,
+        0)`` -- a width the stored route never had.
+        """
+        self.handler.get_out_path = lambda _ident: (b"", 0)
+
+        pkt = self._build_login_packet(route_type="direct", path=b"\xaa\xbb")
+        pkt.path_len = PathUtils.encode_path_len(2, 1)  # 1 hop, 2-byte hashes
+
+        await self.handler(pkt)
+
+        response_pkt, _ = self.sent_packets[0]
+        assert response_pkt.is_route_direct()
+        assert response_pkt.path_len == 0
+
+    @pytest.mark.asyncio
     async def test_flood_login_clears_stored_out_path(self):
         """Flood login asks the app to forget out_path (firmware OUT_PATH_UNKNOWN)."""
         cleared = []
