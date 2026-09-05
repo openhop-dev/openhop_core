@@ -1051,12 +1051,20 @@ class PacketBuilder:
             local_identity.get_public_key()[:4] if txt_type == TXT_TYPE_SIGNED_PLAIN else b""
         )
 
-        # Body is packed as a C string (text + NUL). When attempt > 3 the firmware
-        # hides the full attempt byte after that terminator so retries whose low
-        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely — for plain
-        # messages only; sendCommandData omits it.
+        # The body ends at the text: firmware writes the C-string terminator into
+        # its scratch buffer (``memcpy(&temp[5], text, text_len + 1)``) but hands
+        # ``createDatagram`` only ``5 + text_len``, so the NUL is never on the
+        # wire. It does not need to be — the receiver null-terminates past the
+        # decrypted length itself (``data[len] = 0``), and AES zero-padding
+        # supplies a terminator for every length that is not already a whole
+        # number of blocks.
+        #
+        # The one exception is a plain retry above attempt 3: composeMsgPacket
+        # then appends the terminator *and* the full attempt byte, so retries
+        # whose low two bits repeat (4 → 0, 5 → 1, …) still hash uniquely.
+        # sendCommandData -- the CLI path -- has no such tail.
         extended = attempt_full > 3 and not is_cli
-        tail = b"\x00" + bytes([attempt_full]) if extended else b"\x00"
+        tail = b"\x00" + bytes([attempt_full]) if extended else b""
         plaintext = PacketBuilder._pack_timestamp_data(
             timestamp, flags_byte, signed_sender_prefix, message, tail
         )

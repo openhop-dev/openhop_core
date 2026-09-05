@@ -361,7 +361,8 @@ def test_create_text_message_extended_attempt_hidden_in_tail():
     assert dec4[tail_start] == 0x00  # C-string terminator
     assert dec4[tail_start + 1] == 4  # hidden full attempt byte
 
-    # attempt <= 3 carries no hidden attempt byte (only the terminator + padding).
+    # attempt <= 3 carries no tail at all -- what follows the text is AES
+    # zero-padding, which happens to look the same here.
     pkt0, crc0 = PacketBuilder.create_text_message(
         contact, local, text, 0, "direct", None, 0, timestamp=ts
     )
@@ -381,6 +382,72 @@ def test_create_text_message_extended_attempt_hidden_in_tail():
     # The same length is still fine for attempt <= 3.
     ok_pkt, _ = PacketBuilder.create_text_message(contact, local, long_text, 1, "direct", None, 0)
     assert ok_pkt is not None
+
+
+@pytest.mark.parametrize(
+    "text_len,attempt,txt_type,expected_plaintext",
+    [
+        (11, 0, 0, 16),  # 5 + 11 == one whole block: the NUL would cost a second
+        (11, 0, 1, 16),
+        (27, 0, 0, 32),  # 5 + 27 == two whole blocks
+        (10, 0, 0, 15),  # not on a boundary: padding hides the difference
+        (11, 5, 0, 18),  # plain retry > 3 keeps its NUL + attempt tail
+        (11, 5, 1, 16),  # CLI has no tail at any attempt
+    ],
+)
+def test_create_text_message_body_length_matches_firmware(
+    text_len, attempt, txt_type, expected_plaintext
+):
+    """[fails pre-fix] The body ends at the text, as firmware's length does.
+
+    composeMsgPacket and sendCommandData both memcpy `text_len + 1` bytes into
+    their scratch buffer but hand createDatagram only `5 + text_len`, so the
+    C-string terminator never reaches the wire. openhop appended it anyway.
+    Usually invisible -- AES zero-padding covers it -- but when `5 + text_len`
+    is a whole number of cipher blocks the extra byte buys a whole extra block,
+    and the packet is 16 bytes longer than the one firmware would have sent.
+    """
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+
+    pkt, _crc = PacketBuilder.create_text_message(
+        contact, local, "x" * text_len, attempt, "direct", None, txt_type, timestamp=1000
+    )
+    # payload = dest_hash(1) + src_hash(1) + MAC(2) + ciphertext, zero-padded to
+    # a 16-byte block.
+    ciphertext_len = len(pkt.payload) - 4
+    assert ciphertext_len == ((expected_plaintext + 15) // 16) * 16
+
+
+def test_create_text_message_round_trips_on_a_block_boundary():
+    """A body that exactly fills its blocks carries no NUL, and still decodes.
+
+    This is the length the terminator used to hide: with no padding left over
+    there is no zero byte after the text, so the receiver has to fall back on
+    the decrypted length the way firmware does (`data[len] = 0`).
+    """
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+    secret = Identity(local.get_public_key()).calc_shared_secret(other.get_private_key())
+
+    text = "x" * 11  # 5 + 11 == 16
+    pkt, _crc = PacketBuilder.create_text_message(
+        contact, local, text, 0, "direct", None, 0, timestamp=1000
+    )
+    dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+    assert len(dec) == 16
+    assert bytes(dec[5:]).decode() == text
+    assert b"\x00" not in bytes(dec[5:])
 
 
 @pytest.mark.parametrize("cli_type", [1, 3])
