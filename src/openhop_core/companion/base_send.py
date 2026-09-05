@@ -732,6 +732,7 @@ class _SendOpsMixin:
                 pkt, packet_tag = self._build_retry_packet(build_packet, proxy, log_label)
                 if response_tag_registered is not None and packet_tag is not None:
                     response_tag_registered(packet_tag)
+                self._apply_flood_scope(pkt)
                 self._apply_path_hash_mode(pkt)
                 timeout_s = self._response_timeout_s(pkt, proxy)
                 if deadline is not None:
@@ -779,6 +780,7 @@ class _SendOpsMixin:
             pkt, packet_tag = build_packet()
             if response_tag_registered is not None and packet_tag is not None:
                 response_tag_registered(packet_tag)
+            self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
             estimated_timeout_s = self._response_timeout_s(pkt, proxy)
             wait_timeout_s = estimated_timeout_s
@@ -1010,6 +1012,7 @@ class _SendOpsMixin:
         pkt = PacketBuilder.create_login_packet(
             contact=proxy, local_identity=self._identity, password=password
         )
+        self._apply_flood_scope(pkt)
         self._apply_path_hash_mode(pkt)
         timeout_s = self._response_timeout_s(pkt, proxy)
         logger.debug(
@@ -1215,6 +1218,7 @@ class _SendOpsMixin:
                 pkt, packet_tag = self._build_retry_packet(build_packet, proxy, log_label)
             if response_tag_registered is not None and packet_tag is not None:
                 response_tag_registered(packet_tag)
+            self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
             timeout_s = self._response_timeout_s(pkt, proxy)
             if deadline is not None:
@@ -1270,13 +1274,14 @@ class _SendOpsMixin:
         rather than discarding it. ``build_packet`` is synchronous, so no other
         task can observe the mask, and it is restored on every exit path.
 
-        The retry carries the node's normal flood scope. Masking ``out_path_len``
-        is all firmware does: ``sendRequest`` then takes its
+        The packet comes back un-scoped; the caller runs it through
+        ``_apply_flood_scope`` like any other flood send. Masking ``out_path_len``
+        is all firmware does too: ``sendRequest`` then takes its
         ``sendFloodScoped(recipient, pkt)`` branch, which resolves the region the
-        same way as any other companion flood (send_unscoped, else the transient
-        send_scope, else the persisted default). Sending the retry un-scoped
-        instead would strand it at hop 0 on a mesh whose repeaters run
-        ``flood.max.unscoped = 0`` — precisely the meshes that scope their
+        same way as every other companion flood (send_unscoped, else the
+        transient send_scope, else the persisted default). Marking the retry
+        plain-flood instead would strand it at hop 0 on a mesh whose repeaters
+        run ``flood.max.unscoped = 0`` — precisely the meshes that scope their
         traffic — so the recovery attempt would fail exactly where the first
         attempt already had.
         """
@@ -1590,6 +1595,7 @@ class _SendOpsMixin:
                 message_type=msg_type,
                 txt_type=txt_type,
             )
+            self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
             await self._send_packet(pkt, wait_for_ack=False)
             try:

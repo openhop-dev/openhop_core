@@ -665,6 +665,82 @@ class TestRepeaterReqReplyScope:
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
 
+class TestBridgeRequestsCarryTheirOwnScope:
+    """A virtual companion's requests take *its* scope, not its host repeater's.
+
+    ``CompanionBridge`` shares the repeater's dispatcher and, unlike
+    ``CompanionRadio``, cannot mirror its scope onto it -- the dispatcher belongs
+    to the repeater. So anything the bridge leaves for the send-time resolver
+    comes out stamped with the repeater's region instead of the one the app set
+    over the frame protocol. Firmware has no such split: sendLogin, sendAnonReq,
+    sendRequest and sendCommandData all go through
+    ``MyMesh::sendFloodScoped(const ContactInfo&)``, which reads the companion's
+    own send_unscoped / send_scope / default_scope_key.
+    """
+
+    async def _bridge_over_a_scoped_repeater(self):
+        """A bridge whose injector runs packets through a repeater's resolver."""
+        sink = MockRadio()  # only its .sent list is used, as the injector's sink
+        dispatcher = Dispatcher(MockRadio())
+        dispatcher.flood_transport_key = get_auto_key_for("#repeater-region")
+
+        async def _injector(pkt, wait_for_ack=False, expected_crc=None):
+            # Mirrors the real path: PacketRouter.inject_packet eventually lands
+            # in Dispatcher.send_packet, which calls _apply_flood_scope.
+            dispatcher._apply_flood_scope(pkt)
+            sink.sent.append(bytes(pkt.write_to()))
+            return True
+
+        bridge = CompanionBridge(LocalIdentity(), _injector, node_name="bridge")
+        peer = LocalIdentity()
+        key = peer.get_public_key()
+        bridge.contacts.add(Contact(public_key=key, name="rpt"))  # out_path_len=-1
+        await bridge.start()
+        bridge_key = get_auto_key_for("#bridge-region")
+        bridge.set_flood_scope(bridge_key)
+        return bridge, sink, key, bridge_key
+
+    def _assert_bridge_scoped(self, pkt: Packet, bridge_key: bytes, label: str):
+        assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD, f"{label} not scoped"
+        assert pkt.transport_codes[0] == calc_transport_code(
+            bridge_key, pkt
+        ), f"{label} carries the repeater's region, not the bridge's"
+
+    @pytest.mark.asyncio
+    async def test_bridge_requests_use_the_bridge_scope(self):
+        """[fails pre-fix] Login/status/telemetry/CLI take the bridge's own region."""
+        bridge, sink, key, bridge_key = await self._bridge_over_a_scoped_repeater()
+        try:
+            for label, coro in (
+                ("login", bridge.send_login(key, "pw")),
+                ("status", bridge.send_status_request(key)),
+                ("telemetry", bridge.send_telemetry_request(key)),
+                ("cli", bridge.send_repeater_command(key, "ver")),
+            ):
+                pkt = await _drain_first_tx(bridge, sink, coro)
+                self._assert_bridge_scoped(pkt, bridge_key, label)
+        finally:
+            await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_bridge_unscoped_request_is_not_given_the_repeater_region(self):
+        """[fails pre-fix] An app that asked for un-scoped gets un-scoped.
+
+        ``set_flood_unscoped`` is firmware's send_unscoped (FW #2492): the very
+        first branch of sendFloodScoped, ahead of both the override and the
+        default. Leaving the packet for the repeater's resolver instead silently
+        overrides the app's explicit choice.
+        """
+        bridge, sink, key, _bridge_key = await self._bridge_over_a_scoped_repeater()
+        try:
+            bridge.set_flood_unscoped()
+            pkt = await _drain_first_tx(bridge, sink, bridge.send_login(key, "pw"))
+            assert pkt.get_route_type() == ROUTE_TYPE_FLOOD
+            assert pkt.transport_codes == [0, 0]
+        finally:
+            await bridge.stop()
+
+
 class TestRegionCaptureBothEntrypoints:
     def _region_map(self):
         return RegionMap([RegionEntry(id=2, name="#region-b")]), get_auto_key_for("#region-b")

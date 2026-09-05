@@ -994,10 +994,19 @@ class _Proxy:
 
 
 class _RetrySender(_SendOpsMixin):
-    """Carrier for the retry loops with radio/timing stubbed out."""
+    """Carrier for the retry loops with radio/timing stubbed out.
+
+    ``_apply_flood_scope`` records rather than resolves: the region a request
+    ends up with is the companion resolver's business, but *whether* the loop
+    hands every attempt to it is this file's.
+    """
 
     def __init__(self):
         self.sent = []
+        self.scoped = []
+
+    def _apply_flood_scope(self, pkt):
+        self.scoped.append(pkt)
 
     def _apply_path_hash_mode(self, pkt):
         return None
@@ -1151,6 +1160,9 @@ async def test_request_retry_loop_floods_every_attempt_after_the_first():
     assert not sender.sent[0].is_route_flood(), "first attempt keeps the stored route"
     assert all(p.is_route_flood() for p in sender.sent[1:]), "every retry floods"
     assert proxy.out_path_len == OUT_PATH_LEN
+    # Firmware sends every one of these through sendFloodScoped(recipient, pkt),
+    # so every attempt -- retries included -- must reach the scope resolver.
+    assert sender.scoped == sender.sent
 
 
 @pytest.mark.asyncio
@@ -1174,3 +1186,4 @@ async def test_started_request_retry_loop_floods_every_retry():
     assert sender.sent, "the continuation must retry"
     assert all(p.is_route_flood() for p in sender.sent), "every retry floods"
     assert proxy.out_path_len == OUT_PATH_LEN
+    assert sender.scoped == sender.sent
