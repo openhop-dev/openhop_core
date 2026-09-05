@@ -1084,12 +1084,27 @@ class PacketBuilder:
             contact, local_identity, plaintext
         )
 
-        # Calculate CRC using centralized packing
+        # Calculate CRC using centralized packing.
+        #
+        # Which key salts the hash depends on the type, because the receiver
+        # salts it differently. For plain text both sides use the *sender's*
+        # key: composeMsgPacket hashes with `self_id.pub_key` and the receiver
+        # answers with `from.id.pub_key` (BaseChatMesh::onPeerDataRecv). Signed
+        # text inverts that -- the receiver hashes with its own key
+        # (`self_id.pub_key` on the receiving side), so a sender predicting the
+        # ACK has to use the *recipient's* key, exactly as firmware's room
+        # server does when it pushes a post
+        # (simple_room_server::pushPostToClient: `client->id.pub_key`).
         crc_input = PacketBuilder._pack_timestamp_data(
             timestamp, flags_byte, signed_sender_prefix, message
         )
+        ack_key = (
+            bytes.fromhex(contact.public_key)
+            if txt_type == TXT_TYPE_SIGNED_PLAIN
+            else local_identity.get_public_key()
+        )
         ack_crc = int.from_bytes(
-            CryptoUtils.sha256(crc_input + local_identity.get_public_key())[:4],
+            CryptoUtils.sha256(crc_input + ack_key)[:4],
             "little",
         )
 

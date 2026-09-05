@@ -1,6 +1,9 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from openhop_core import LocalIdentity
+from openhop_core.node.handlers.text import TextMessageHandler
 from openhop_core.protocol import CryptoUtils
 from openhop_core.protocol.constants import (
     MAX_PACKET_PAYLOAD,
@@ -448,6 +451,42 @@ def test_create_text_message_round_trips_on_a_block_boundary():
     assert len(dec) == 16
     assert bytes(dec[5:]).decode() == text
     assert b"\x00" not in bytes(dec[5:])
+
+
+@pytest.mark.parametrize("txt_type", [0, 2])
+def test_create_text_message_expected_ack_matches_the_receiver(txt_type):
+    """[fails pre-fix for SIGNED_PLAIN] The sender predicts the ACK the receiver sends.
+
+    Which key salts the hash flips with the type. Plain text uses the sender's
+    on both sides -- composeMsgPacket hashes with `self_id.pub_key` and the
+    receiver answers with `from.id.pub_key`. Signed text inverts it: the
+    receiver hashes with its *own* key, so the sender has to predict with the
+    recipient's, as simple_room_server::pushPostToClient does
+    (`client->id.pub_key`). openHop used the sender's key for both, so a signed
+    send waited on an ACK that could never arrive.
+    """
+    sender = LocalIdentity()
+    receiver = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": receiver.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+
+    pkt, expected = PacketBuilder.create_text_message(
+        contact, sender, "hello", 0, "direct", None, txt_type, timestamp=1000
+    )
+
+    # What the receiving handler will actually answer with.
+    secret = Identity(sender.get_public_key()).calc_shared_secret(receiver.get_private_key())
+    dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+    handler = TextMessageHandler(receiver, MagicMock(contacts=[]), lambda *_: None, AsyncMock())
+    body = bytes(dec[9:]) if txt_type == 2 else bytes(dec[5:])
+    computed = handler._calc_ack_hash(
+        txt_type, dec, body, sender.get_public_key(), 1000, dec[4]
+    )
+
+    assert int.from_bytes(computed[:4], "little") == expected
 
 
 def test_create_text_message_body_ends_at_an_embedded_nul():
