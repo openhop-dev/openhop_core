@@ -984,6 +984,84 @@ class TestTextMessageHandler:
         assert int.from_bytes(ack.payload[:4], "little") == crc
 
     @pytest.mark.asyncio
+    async def test_ack_policy_can_veto_the_delivery_ack(self):
+        """[fails pre-fix] A server owner decides what earns an ACK.
+
+        This handler's own rule is BaseChatMesh's, which is right for a chat
+        node. A repeater ACKs only PLAIN from an admin and a room server only
+        PLAIN from a non-guest -- both decide *before* answering, so nothing
+        they refuse is acknowledged. Without a veto here the owner's gates run
+        after the ACK has already gone out, and a sender sees delivery
+        confirmed for a message that was then thrown away.
+
+        The message is still delivered: only the ACK is withheld.
+        """
+        seen = []
+
+        def _policy(pubkey, txt_type, sender_timestamp):
+            seen.append((pubkey, txt_type, sender_timestamp))
+            return False
+
+        self.handler._should_ack = _policy
+        packet, sender = self._typed_dm(TXT_TYPE_PLAIN, flood=False, text="hi")
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 0
+        assert seen == [(sender.get_public_key(), TXT_TYPE_PLAIN, 0x5EEDBEEF)]
+        assert self.event_service.publish_sync.called
+
+    @pytest.mark.asyncio
+    async def test_ack_policy_that_raises_withholds_the_ack(self):
+        """A broken policy must not be read as consent.
+
+        An ACK asserts that this node accepted the message. Falling back to
+        sending one when the owner's rule could not be evaluated asserts
+        something nobody checked, so the failure closes.
+        """
+
+        def _boom(pubkey, txt_type, sender_timestamp):
+            raise RuntimeError("policy exploded")
+
+        self.handler._should_ack = _boom
+        packet, _sender = self._typed_dm(TXT_TYPE_PLAIN, flood=False, text="hi")
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_ack_policy_that_allows_leaves_acking_unchanged(self):
+        """A permissive policy is indistinguishable from having none."""
+        self.handler._should_ack = lambda *_: True
+        packet, _sender = self._typed_dm(TXT_TYPE_PLAIN, flood=False, text="hi")
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.send_packet_fn.call_count == 1
+        assert self.send_packet_fn.call_args_list[0].args[0].get_payload_type() == PAYLOAD_TYPE_ACK
+
+    @pytest.mark.asyncio
+    async def test_ack_policy_is_not_consulted_for_a_cli_type(self):
+        """CLI types never earned an ACK, so there is nothing to veto.
+
+        Consulting the policy anyway would invite an owner to write a rule that
+        looks like it grants one.
+        """
+        calls = []
+        self.handler._should_ack = lambda *a: calls.append(a) or True
+        packet, _sender = self._typed_dm(TXT_TYPE_CLI_DATA, flood=False, text="ver")
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert calls == []
+        assert self.send_packet_fn.call_count == 0
+
+    @pytest.mark.asyncio
     async def test_unsupported_txt_type_is_dropped_whole(self):
         """[fails pre-fix] A type with no firmware branch reaches neither app nor air.
 

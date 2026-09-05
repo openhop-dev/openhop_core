@@ -43,12 +43,29 @@ class TextMessageHandler(BaseHandler):
         send_packet_fn,
         event_service=None,
         radio_config=None,
+        should_ack_fn=None,
     ):
         self.local_identity = local_identity
         self.contacts = contacts
         self.log = log_fn
         self.send_packet = send_packet_fn
         self.event_service = event_service  # Event service for broadcasting
+        # Optional veto on the delivery ACK, for an owner that is a *server*
+        # rather than a chat node. This handler's own rule is BaseChatMesh's --
+        # ACK plain and signed text, never a CLI type -- which is right for a
+        # companion. A repeater or room server accepts far less: firmware's
+        # simple_repeater ACKs only PLAIN from an admin, and simple_room_server
+        # only PLAIN from a non-guest, deciding *before* it answers so nothing
+        # it refuses is ever acknowledged. Those owners pass a predicate here.
+        #
+        #     should_ack_fn(sender_pubkey, txt_type, sender_timestamp) -> bool
+        #
+        # It must not mutate state (in particular it must not advance a replay
+        # watermark): it is a second read of the same message the owner will
+        # judge again on delivery. An exception is treated as "do not ACK" --
+        # an ACK asserts acceptance, and asserting that on a broken hook is the
+        # worse failure.
+        self._should_ack = should_ack_fn
         # Pending repeater-command responses keyed by the target contact's full
         # public key (32 bytes). A CLI_DATA reply is delivered to the waiter for
         # its authenticated sender only; every other message flows to normal
@@ -218,6 +235,20 @@ class TextMessageHandler(BaseHandler):
             (ack_packet, (base_delay_ms + MULTI_ACK_STAGGER_MS) / 1000.0),
         ]
 
+    def _ack_allowed(self, sender_pubkey: bytes, txt_type: int, sender_timestamp: int) -> bool:
+        """Ask the owner whether this message earns a delivery ACK.
+
+        No policy means the BaseChatMesh rule this handler already implements,
+        which is correct for a chat node. See ``should_ack_fn`` in ``__init__``.
+        """
+        if self._should_ack is None:
+            return True
+        try:
+            return bool(self._should_ack(sender_pubkey, txt_type, sender_timestamp))
+        except Exception as e:
+            self.log(f"ACK policy raised, withholding ACK: {e}")
+            return False
+
     async def _send_delayed_ack(self, pkt, delay_s, timestamp_int) -> None:
         """Send a single ACK packet after ``delay_s`` seconds (best-effort)."""
         await asyncio.sleep(delay_s)
@@ -362,6 +393,10 @@ class TextMessageHandler(BaseHandler):
         ack_hash = self._calc_ack_hash(
             txt_type, decrypted, message_body, sender_pubkey, timestamp_int, flags
         )
+
+        if ack_hash is not None and not self._ack_allowed(sender_pubkey, txt_type, timestamp_int):
+            self.log(f"ACK for txt_type={txt_type} vetoed by the owner's policy")
+            ack_hash = None
 
         if ack_hash is not None:
             scheduled = self._build_ack_responses(
