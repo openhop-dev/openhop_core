@@ -228,36 +228,57 @@ def apply_reply_scope(reply_pkt: Packet, request_pkt: Optional[Packet]) -> None:
     Re-hashes the transport code over the reply's own payload -- never copies
     the request's code.
 
-    - Not captured (standalone node, ``region_map`` None): return unmarked, so
-      the reply falls through to the ordinary send precedence.
-    - ``REPLY_SCOPE_REQUEST`` -- captured with a key: scope the reply with it and
-      mark the decision final.
-    - ``REPLY_SCOPE_NONE`` -- the request arrived as an un-scoped flood: mirror
-      that and mark it final, so a node default cannot scope a reply on a path
-      that demonstrably works un-scoped today.
-    - ``REPLY_SCOPE_DEFAULT`` -- the request's scope is unknowable (it arrived
-      DIRECT and so carried no transport codes, or its code matched no Region):
-      return unmarked and let the send layer resolve it.
+    Rows are :func:`choose_reply_scope`'s, which is the literal firmware
+    predicate (``RoutingPolicy.h``); this function decides the two the capture
+    can answer on its own and defers the other two:
 
-    Only the first two decisions set ``_flood_scope_applied``. That mark exists
-    to stop the node default reaching a reply whose scope *this* helper decided,
-    so the deferring case must not set it.
+    1. ``REPLY_SCOPE_REQUEST`` -- captured with a key: scope the reply with it
+       and mark the decision final.
+    2. ``REPLY_SCOPE_NONE``, un-scoped flood: mirror that and mark it final, so
+       a node default cannot scope a reply on a path that demonstrably works
+       un-scoped today.
+    3/4. ``REPLY_SCOPE_DEFAULT``, and the ``REPLY_SCOPE_NONE`` firmware reaches
+       for want of any default: these turn on whether a scope is configured,
+       which is the send layer's to know. Return unmarked and let it answer.
 
-    Why DEFAULT defers instead of scoping here. Firmware splits this case by
-    role: a repeater resolves it as ``sendFloodScoped(default_scope, ...)``
+    Not captured at all (standalone node, ``region_map`` None) also returns
+    unmarked, so the reply falls through to that same precedence.
+
+    Only rows 1 and 2 set ``_flood_scope_applied``. That mark stops the node
+    default reaching a reply whose scope *this* helper decided, so the deferring
+    rows must not set it.
+
+    Why rows 3 and 4 defer. Firmware splits them by role. A repeater resolves
+    DEFAULT as ``sendFloodScoped(default_scope, ...)``
     (``simple_repeater/MyMesh.cpp``), while a companion answers the same case
     with ``sendFloodScoped(recipient, ...)``, which is ``send_unscoped`` first,
     then ``send_scope``, else ``default_scope``
     (``companion_radio/MyMesh.cpp``). One helper here serves both roles, and
     ``Dispatcher._apply_flood_scope`` / ``CompanionBase._apply_flood_scope``
-    already implement exactly that precedence -- including firmware's final
-    ``REPLY_SCOPE_NONE``, since a node with no scope configured at all leaves the
-    packet a plain flood. Deciding here would duplicate that chain and, by
-    marking the packet, suppress it: an operator's explicit-unscoped flag and
-    transient override would both be silently overridden. It would also bind the
-    reply to the default as it stood at RX rather than at TX.
+    already implement that precedence -- including firmware's final NONE, since
+    a node with nothing configured leaves the packet a plain flood. Deciding
+    here would duplicate the chain and, by marking the packet, suppress it: an
+    operator's explicit-unscoped flag and transient override would both be
+    silently overridden. It would also bind the reply to the default as it
+    stood at RX rather than at TX.
 
-    Replying un-scoped in this case is the bug MeshCore PR #3106 fixed: a
+    Caller contract: the reply must reach the radio through one of those two
+    resolvers. Every send path in this tree does -- a handler reply travels
+    ``Dispatcher.send_packet``, and a ``CompanionBridge`` reply travels the
+    host's packet injector, which for the repeater ends at the same call. An
+    application that serializes a deferred reply straight to a radio would put
+    it on air plain.
+
+    Known divergence, deliberate: rows 3 and 4 reach a precedence that also
+    honours the transient override and the explicit-unscoped flag, because the
+    companion role requires it. Firmware's *repeater* has neither concept, so a
+    node holding a RegionMap and an override but no default would send the
+    reply scoped where firmware's repeater sends it plain. No topology here
+    reaches that state -- ``CompanionBridge`` never writes those dispatcher
+    fields, and a ``CompanionRadio`` owns its own dispatcher, where honouring
+    them is the correct companion behaviour.
+
+    Replying un-scoped in rows 3/4 is the bug MeshCore PR #3106 fixed: a
     repeater on the way back running ``flood.max.unscoped=0`` drops such a reply
     at hop 0. The fix is that a configured default now reaches it -- which it
     does through the send layer.
@@ -265,22 +286,14 @@ def apply_reply_scope(reply_pkt: Packet, request_pkt: Optional[Packet]) -> None:
     if not getattr(request_pkt, "_recv_region_captured", False):
         return
     req_key = getattr(request_pkt, "_recv_region_key", None)
-    scope = choose_reply_scope(
-        req_key is not None,
-        bool(getattr(request_pkt, "_recv_region_unscoped", False)),
-        # This third input is the send layer's to answer, and it resolves
-        # DEFAULT and the no-default NONE identically, from the configuration
-        # current at TX. Passing True asks for that deferred outcome; it is not
-        # a claim that a default is configured.
-        default_scope_known=True,
-    )
-    if scope == REPLY_SCOPE_REQUEST:
+    if req_key is not None:
+        # Row 1: REPLY_SCOPE_REQUEST.
         if reply_pkt.get_route_type() == ROUTE_TYPE_FLOOD:
             scope_packet(reply_pkt, req_key)
         reply_pkt._flood_scope_applied = True
         return
-    if scope == REPLY_SCOPE_NONE:
-        # Un-scoped flood request: leave the reply plain, decision final.
+    if getattr(request_pkt, "_recv_region_unscoped", False):
+        # Row 2: REPLY_SCOPE_NONE, mirroring the requester's un-scoped choice.
         reply_pkt._flood_scope_applied = True
         return
-    # REPLY_SCOPE_DEFAULT: leave unmarked for the send layer.
+    # Rows 3 and 4: left unmarked for the send layer.

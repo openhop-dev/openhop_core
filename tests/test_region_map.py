@@ -196,6 +196,30 @@ class TestApplyReplyScopeDefault:
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(override, reply)
 
+    def test_no_default_but_an_override_takes_the_override(self):
+        """Recorded divergence, not an accident.
+
+        Rows 3/4 reach a precedence that also honours the transient override,
+        because the companion role requires it: firmware's
+        ``sendFloodScoped(recipient, ...)`` prefers ``send_scope`` over
+        ``default_scope``. Firmware's *repeater* has no override concept, so
+        with no default configured its ``sendFloodReply`` would send this reply
+        plain. No topology here reaches that state -- CompanionBridge never
+        writes these dispatcher fields, and a CompanionRadio owns its own
+        dispatcher, where honouring the override is correct.
+        """
+        override = get_auto_key_for("#override-region")
+        req = Packet()
+        req.header = ROUTE_TYPE_DIRECT
+        capture_recv_region(RegionMap(), req)
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+        _resolve_at_tx(reply, default_key=None, override=override)
+
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(override, reply)
+
     def test_deferred_direct_request_with_no_scope_stays_plain(self):
         """Firmware's final ``REPLY_SCOPE_NONE``: nothing configured, so the
         reply goes out a plain flood."""
