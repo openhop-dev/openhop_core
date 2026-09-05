@@ -391,10 +391,12 @@ class ProtocolRequestHandler:
                 )
                 reply_packet.apply_path_hash_mode(in_hash_size - 1, mark_applied=True)
                 # No out_path, so this RESPONSE floods via sendFloodReply.
-                # chooseReplyScope: unscoped flood → plain; DIRECT / unresolved
-                # → DEFAULT when a default region is configured, else plain.
-                # On a node with no RegionMap this is inert and the reply falls
-                # through to the node default (BaseChatMesh sendFloodScoped).
+                # chooseReplyScope: an unscoped-flood request is mirrored plain
+                # and marked final here. A DIRECT or unresolved request is
+                # REPLY_SCOPE_DEFAULT, which is left to the send layer -- as is
+                # a node with no RegionMap at all, where this is simply inert.
+                # Either way the ordinary precedence supplies the key
+                # (BaseChatMesh sendFloodScoped).
                 apply_reply_scope(reply_packet, original_packet)
 
             self.log(f"RESPONSE built for 0x{client_hash:02X} via {route_type.upper()}")
