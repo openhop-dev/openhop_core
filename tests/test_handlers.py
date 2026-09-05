@@ -1034,7 +1034,12 @@ class TestTextMessageHandler:
 
     @pytest.mark.asyncio
     async def test_ack_policy_that_allows_leaves_acking_unchanged(self):
-        """A permissive policy is indistinguishable from having none."""
+        """A permissive policy is indistinguishable from having none.
+
+        Prerequisite rather than regression proof -- it passes with the veto
+        removed too. It is here so the veto cannot grow into a blanket
+        suppression that ignores what the policy actually returned.
+        """
         self.handler._should_ack = lambda *_: True
         packet, _sender = self._typed_dm(TXT_TYPE_PLAIN, flood=False, text="hi")
 
@@ -1049,7 +1054,8 @@ class TestTextMessageHandler:
         """CLI types never earned an ACK, so there is nothing to veto.
 
         Consulting the policy anyway would invite an owner to write a rule that
-        looks like it grants one.
+        looks like it grants one. Prerequisite rather than regression proof:
+        this passes with the veto removed, because the ACK was never owed.
         """
         calls = []
         self.handler._should_ack = lambda *a: calls.append(a) or True

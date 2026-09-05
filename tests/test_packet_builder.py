@@ -431,8 +431,10 @@ def test_create_text_message_round_trips_on_a_block_boundary():
     """A body that exactly fills its blocks carries no NUL, and still decodes.
 
     This is the length the terminator used to hide: with no padding left over
-    there is no zero byte after the text, so the receiver has to fall back on
-    the decrypted length the way firmware does (`data[len] = 0`).
+    there is no zero byte after the text. It decrypts here rather than through
+    the receive handler, so it proves the *bytes*; that the handler falls back
+    on the decrypted length is proven by
+    ``test_body_with_no_terminator_decodes_and_acks`` in test_handlers.py.
     """
     local = LocalIdentity()
     other = LocalIdentity()
