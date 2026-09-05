@@ -37,6 +37,8 @@ from .constants import (
     TELEM_PERM_BASE,
     TELEM_PERM_ENVIRONMENT,
     TELEM_PERM_LOCATION,
+    TXT_TYPE_CLI_COMMAND,
+    TXT_TYPE_CLI_DATA,
     TXT_TYPE_SIGNED_PLAIN,
 )
 from .identity import Identity, LocalIdentity
@@ -1025,6 +1027,12 @@ class PacketBuilder:
         flags_byte = (txt_type << 2) | (attempt_full & 0x03)
         timestamp = timestamp if timestamp is not None else PacketBuilder._get_timestamp()
 
+        # The CLI types take firmware's sendCommandData path, which -- unlike
+        # composeMsgPacket -- has no extended-attempt tail and so no shrunken
+        # text budget to go with it. A CLI message earns no delivery ACK, so
+        # there are no repeated attempt hashes for the tail to disambiguate.
+        is_cli = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
+
         # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
         # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
         # so a valid MeshCore peer can build the same packet. For attempt > 3 the
@@ -1033,7 +1041,7 @@ class PacketBuilder:
         text_len = len(message.encode("utf-8"))
         if text_len > MAX_TEXT_LEN:
             raise ValueError(f"text message too long: {text_len} bytes (max {MAX_TEXT_LEN})")
-        if attempt_full > 3 and text_len > MAX_TEXT_LEN - 2:
+        if not is_cli and attempt_full > 3 and text_len > MAX_TEXT_LEN - 2:
             raise ValueError(
                 f"text message too long for extended attempt: {text_len} bytes "
                 f"(max {MAX_TEXT_LEN - 2})"
@@ -1045,8 +1053,10 @@ class PacketBuilder:
 
         # Body is packed as a C string (text + NUL). When attempt > 3 the firmware
         # hides the full attempt byte after that terminator so retries whose low
-        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely.
-        tail = b"\x00" + bytes([attempt_full]) if attempt_full > 3 else b"\x00"
+        # two bits repeat (4 → 0, 5 → 1, …) still hash uniquely — for plain
+        # messages only; sendCommandData omits it.
+        extended = attempt_full > 3 and not is_cli
+        tail = b"\x00" + bytes([attempt_full]) if extended else b"\x00"
         plaintext = PacketBuilder._pack_timestamp_data(
             timestamp, flags_byte, signed_sender_prefix, message, tail
         )

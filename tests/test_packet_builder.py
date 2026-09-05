@@ -383,6 +383,44 @@ def test_create_text_message_extended_attempt_hidden_in_tail():
     assert ok_pkt is not None
 
 
+@pytest.mark.parametrize("cli_type", [1, 3])
+def test_create_text_message_cli_types_have_no_extended_attempt_tail(cli_type):
+    """[fails pre-fix] The CLI types take sendCommandData, which has no tail.
+
+    composeMsgPacket appends NUL + the full attempt byte for attempt > 3 so
+    retries whose low two bits repeat still hash uniquely; sendCommandData
+    builds `5 + text_len` and stops, because a CLI message earns no delivery ACK
+    and so has no repeated attempt hash to disambiguate. Emitting the tail
+    anyway puts a byte on the wire firmware never sends, and drags the
+    MAX_TEXT_LEN-2 budget along with it.
+    """
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+    secret = Identity(local.get_public_key()).calc_shared_secret(other.get_private_key())
+
+    text = "hi"
+    pkt, _crc = PacketBuilder.create_text_message(
+        contact, local, text, 4, "direct", None, cli_type, timestamp=1000
+    )
+    dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+    assert dec[4] == (cli_type << 2)  # 4 & 3 == 0, so only the type shows
+    tail_start = 5 + len(text.encode("utf-8"))
+    assert dec[tail_start] == 0x00  # C-string terminator
+    assert dec[tail_start + 1] == 0x00  # AES zero padding, not a hidden attempt
+
+    # ...and the shrunken budget goes with it: a length firmware accepts here.
+    long_text = "x" * (MAX_TEXT_LEN - 1)
+    ok_pkt, _ = PacketBuilder.create_text_message(
+        contact, local, long_text, 4, "direct", None, cli_type
+    )
+    assert ok_pkt is not None
+
+
 def test_create_text_message_truncated_path_path_len_consistency():
     """When contact has 64-byte path but out_path_len encodes more than 64 bytes
     (e.g. 33 hops × 2-byte = 66), do not use contact_path_len; use 1-byte
