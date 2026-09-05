@@ -915,8 +915,11 @@ class TestRepeaterCommandCorrelation:
     async def test_command_rejects_a_non_cli_txt_type_without_sending(self):
         """Only the two CLI types label a command; anything else never reaches the air.
 
-        A PLAIN command would be ACKed and delivered as chat rather than
-        executed, and the CLI_DATA reply this call waits for would never come.
+        PLAIN is the near miss worth guarding: a repeater does still run one
+        (its filter takes PLAIN for legacy CLI), but firmware routes PLAIN
+        through sendMessage, so it earns a delivery ACK and arms an ack wait
+        this helper never reads -- and a companion peer files it as chat rather
+        than running it. SIGNED_PLAIN and reserved values are simply not CLI.
         """
         radio, _identity, comp, peers = self._setup(["Rpt"])
         _rpt_identity, rpt_contact = peers[0]

@@ -1065,10 +1065,11 @@ def test_forced_flood_retry_takes_the_nodes_flood_scope():
     Masking ``out_path_len`` is the whole of firmware's trick: ``sendRequest``
     then takes its ``sendFloodScoped(recipient, pkt)`` branch, which resolves the
     region exactly as every other companion flood does. The retry must therefore
-    reach the send-time resolver un-marked, so the node's override (or, failing
-    that, its default) lands on it. Marking it plain-flood instead strands the
-    retry at hop 0 on any mesh running ``flood.max.unscoped = 0`` -- which is
-    exactly the set of meshes that scope their traffic in the first place.
+    come back un-marked, so that whichever resolver sees it next -- the
+    companion's own, or the dispatcher's at TX -- is free to scope it. This test
+    drives the dispatcher half. Marking it plain-flood instead strands the retry
+    at hop 0 on any mesh running ``flood.max.unscoped = 0`` -- which is exactly
+    the set of meshes that scope their traffic in the first place.
     """
     from openhop_core.node.dispatcher import Dispatcher
     from openhop_core.protocol.constants import ROUTE_TYPE_TRANSPORT_FLOOD
