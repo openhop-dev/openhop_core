@@ -450,6 +450,38 @@ def test_create_text_message_round_trips_on_a_block_boundary():
     assert b"\x00" not in bytes(dec[5:])
 
 
+def test_create_text_message_body_ends_at_an_embedded_nul():
+    """[fails pre-fix] An embedded NUL ends the message, as strlen() does.
+
+    composeMsgPacket and sendCommandData both size the body with
+    `strlen(text)`, so bytes past an interior NUL are neither sent nor hashed.
+    Sending them anyway puts text on the wire no receiver will show -- ours
+    stops at the first NUL as well -- and, worse, hashes the expected ACK over
+    a span the receiver never reproduces, so send_confirmed can never fire.
+    """
+    local = LocalIdentity()
+    other = LocalIdentity()
+    contact = type(
+        "Contact",
+        (),
+        {"public_key": other.get_public_key().hex(), "out_path": [], "out_path_len": -1},
+    )()
+    secret = Identity(local.get_public_key()).calc_shared_secret(other.get_private_key())
+
+    pkt, crc = PacketBuilder.create_text_message(
+        contact, local, "a\x00b", 0, "direct", None, 0, timestamp=1000
+    )
+    dec = CryptoUtils.mac_then_decrypt(secret[:16], secret, bytes(pkt.payload[2:]))
+    assert bytes(dec[5:]).rstrip(b"\x00") == b"a"
+
+    # The ACK the sender waits for is the one the receiver will compute, which
+    # it derives from the visible text alone.
+    truncated, crc_truncated = PacketBuilder.create_text_message(
+        contact, local, "a", 0, "direct", None, 0, timestamp=1000
+    )
+    assert crc == crc_truncated
+
+
 @pytest.mark.parametrize("cli_type", [1, 3])
 def test_create_text_message_cli_types_have_no_extended_attempt_tail(cli_type):
     """[fails pre-fix] The CLI types take sendCommandData, which has no tail.

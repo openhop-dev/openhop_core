@@ -44,6 +44,7 @@ from openhop_core.protocol.constants import (
     TXT_TYPE_CLI_COMMAND,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
+    TXT_TYPE_SIGNED_PLAIN,
 )
 from openhop_core.protocol.packet_utils import PathUtils
 from openhop_core.protocol.utils import decode_appdata
@@ -900,7 +901,10 @@ class TestTextMessageHandler:
         assert self.event_service.publish_sync.called
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("txt_type", [TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND])
+    @pytest.mark.parametrize(
+        "txt_type",
+        [TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_SIGNED_PLAIN, TXT_TYPE_CLI_COMMAND],
+    )
     async def test_decrypted_carries_the_text_type(self, txt_type):
         """packet.decrypted publishes the type alongside the text.
 
@@ -916,6 +920,59 @@ class TestTextMessageHandler:
 
         assert packet.decrypted["txt_type"] == txt_type
         assert packet.decrypted["text"] == "ver"
+
+    @pytest.mark.asyncio
+    async def test_decrypted_is_published_even_when_a_waiter_consumes_the_reply(self):
+        """[fails pre-fix] The intercepted CLI_DATA path publishes it too.
+
+        A CLI_DATA that resolves a pending command waiter returns early, before
+        the normal delivery block. Leaving packet.decrypted unset there hands
+        anything downstream of the handler an empty dict instead of the shape
+        the rest of the codebase relies on.
+        """
+        packet, sender = self._typed_dm(TXT_TYPE_CLI_DATA, flood=False, text="fw v1")
+        self.handler.register_command_response(sender.get_public_key(), lambda *_: None)
+
+        result = await self.handler(packet)
+
+        assert result.authenticated is True
+        assert packet.decrypted == {"text": "fw v1", "txt_type": TXT_TYPE_CLI_DATA}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text_len", [0, 11, 27])
+    async def test_body_with_no_terminator_decodes_and_acks(self, text_len):
+        """A body that exactly fills its cipher blocks has no NUL to stop at.
+
+        `5 + text_len` at 11 and 27 is a whole number of blocks, so nothing is
+        padded and the text runs to the end of the plaintext -- the case the
+        sender's old trailing NUL used to paper over. The handler has to fall
+        back on the decrypted length the way firmware's `data[len] = 0` does,
+        for both the text it shows and the ACK hash it answers with. 0 is the
+        other edge: an empty body.
+        """
+        sender = LocalIdentity()
+
+        class _Receiver:
+            public_key = self.local_identity.get_public_key().hex()
+            out_path: list = []
+            out_path_len = -1
+
+        text = "x" * text_len
+        packet, crc = PacketBuilder.create_text_message(
+            _Receiver(), sender, text, attempt=0, message_type="direct", txt_type=TXT_TYPE_PLAIN
+        )
+        self.contacts.contacts = [
+            MockContact(public_key=sender.get_public_key().hex(), name="peer")
+        ]
+
+        await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert self.event_service.publish_sync.call_args.args[1]["message_text"] == text
+        assert self.send_packet_fn.call_count == 1
+        ack = self.send_packet_fn.call_args_list[0].args[0]
+        # The receiver's ACK must be the one the sender is waiting on.
+        assert int.from_bytes(ack.payload[:4], "little") == crc
 
     @pytest.mark.asyncio
     async def test_unsupported_txt_type_is_dropped_whole(self):

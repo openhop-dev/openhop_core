@@ -388,6 +388,15 @@ class TextMessageHandler(BaseHandler):
         decoded_msg = message_body[:visible_len].decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
+        # Publish the text and its type before any branch below can return, so
+        # every caller sees the same shape whether or not the message is
+        # intercepted. The type rides along because a downstream node dispatches
+        # on it and cannot recover it once the plaintext is gone: firmware's
+        # simple_repeater and simple_room_server both gate their CLI on
+        # {PLAIN, CLI_DATA, CLI_COMMAND}, and the room server tells a post from
+        # a command by type rather than by reading the text.
+        packet.decrypted = {"text": decoded_msg, "txt_type": txt_type}
+
         # Intercept as a repeater-command response only for CLI_DATA replies whose
         # authenticated sender has a pending command (firmware routes only
         # TXT_TYPE_CLI_DATA from a known contact to onCommandDataRecv; everything
@@ -467,11 +476,4 @@ class TextMessageHandler(BaseHandler):
             except Exception as broadcast_error:
                 self.log(f"Failed to publish new message event: {broadcast_error}")
 
-        # Set packet.decrypted for ACK processing. The text type rides along with
-        # the text because a downstream node dispatches on it and cannot recover
-        # it once the plaintext is gone: firmware's simple_repeater and
-        # simple_room_server both gate their CLI on
-        # {PLAIN, CLI_DATA, CLI_COMMAND}, and the room server tells a post from a
-        # command by type rather than by reading the text.
-        packet.decrypted = {"text": decoded_msg, "txt_type": txt_type}
         return HandlerResult.consumed()

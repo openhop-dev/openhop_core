@@ -944,8 +944,8 @@ async def test_cli_text_messages_arm_no_pending_ack(txt_type, expects_ack):
     expected_ack = 0 (MyMesh.cpp CMD_SEND_TXT_MSG) -- a peer answers a CLI
     command with a CLI_DATA reply, never an ACK. Arming the table for one would
     leave an entry that can only age out, and wait_for_ack would block for the
-    whole timeout waiting for something nobody sends. Covers both halves:
-    the local pending-ACK table and the token reported back to the app.
+    whole timeout waiting for something nobody sends. Covers both halves: the
+    local pending-ACK table and the token reported back to the app.
     """
     radio = MockRadio()
     comp = CompanionRadio(radio, LocalIdentity())
@@ -963,6 +963,34 @@ async def test_cli_text_messages_arm_no_pending_ack(txt_type, expects_ack):
     # for either CLI type, so an app told a nonzero one would arm a wait for an
     # ACK nobody sends -- a repeater answers a CLI command with a CLI_DATA reply.
     assert bool(result.expected_ack) is expects_ack
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("txt_type", [TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND])
+async def test_cli_send_ignores_wait_for_ack(txt_type):
+    """A CLI send returns as soon as the packet is away, even if asked to wait.
+
+    Firmware never arms an ack wait for these (expected_ack = 0), and a peer
+    answers a CLI command with a CLI_DATA reply rather than an ACK. Honouring
+    wait_for_ack here would block the caller for the full send timeout on
+    every CLI command. A plain DM deliberately still waits, which is why this
+    is a separate test from the pending-ACK one.
+    """
+    radio = MockRadio()
+    comp = CompanionRadio(radio, LocalIdentity())
+    peer = LocalIdentity()
+    comp.contacts.add(Contact(public_key=peer.get_public_key(), name="Rpt"))
+
+    result = await asyncio.wait_for(
+        comp.send_text_message(
+            peer.get_public_key(), "reboot", txt_type=txt_type, wait_for_ack=True
+        ),
+        timeout=5.0,
+    )
+
+    assert result.success is True
+    assert result.expected_ack == 0
+    assert len(radio.sent) == 1
 
 
 # ---------------------------------------------------------------------------

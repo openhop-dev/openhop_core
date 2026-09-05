@@ -1033,6 +1033,16 @@ class PacketBuilder:
         # there are no repeated attempt hashes for the tail to disambiguate.
         is_cli = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
 
+        # The body is a C string to firmware: composeMsgPacket and
+        # sendCommandData both size it with ``strlen(text)``, so an embedded NUL
+        # ends the message. Keeping the bytes past it would send text no
+        # receiver can display -- ours stops at the first NUL too -- and would
+        # hash an expected ACK over a span the receiver never reproduces, so
+        # send_confirmed could never fire.
+        nul = message.find("\x00")
+        if nul >= 0:
+            message = message[:nul]
+
         # Firmware BaseChatMesh::composeMsgPacket rejects text longer than
         # MAX_TEXT_LEN (measured in bytes). Match it on the UTF-8 encoded length
         # so a valid MeshCore peer can build the same packet. For attempt > 3 the

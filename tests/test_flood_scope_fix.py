@@ -723,6 +723,71 @@ class TestBridgeRequestsCarryTheirOwnScope:
             await bridge.stop()
 
     @pytest.mark.asyncio
+    async def test_bridge_frame_login_uses_the_bridge_scope(self):
+        """[fails pre-fix] The frame-server login path builds its own packet.
+
+        _start_frame_login_request does not go through _start_request, so it
+        needs the resolver call of its own; it is the login an app actually
+        drives over CMD_SEND_LOGIN.
+        """
+        bridge, sink, key, bridge_key = await self._bridge_over_a_scoped_repeater()
+        try:
+            pkt = await _drain_first_tx(bridge, sink, bridge._start_frame_login_request(key, "pw"))
+            self._assert_bridge_scoped(pkt, bridge_key, "frame login")
+        finally:
+            await bridge.stop()
+
+    @pytest.mark.asyncio
+    async def test_bridge_retry_is_scoped_with_the_bridge_key(self):
+        """[fails pre-fix] The forced-flood retry takes the bridge's region too.
+
+        The retry is the packet that most needs to land: the first attempt
+        already failed. It comes back from _build_retry_packet un-scoped by
+        design, so it is the caller's _apply_flood_scope that has to put the
+        bridge's region on it -- not the host repeater's, and not nothing.
+        """
+        bridge, sink, key, bridge_key = await self._bridge_over_a_scoped_repeater()
+        try:
+            # Give the contact a stored route, so the retry has a path to mask
+            # and genuinely exercises the forced-flood branch.
+            contact = bridge.contacts.get_by_key(key)
+            contact.out_path = bytes([0xAA])
+            contact.out_path_len = 1
+            bridge.contacts.update(contact)
+
+            # Shrink the adaptive per-attempt wait so the retry lands promptly;
+            # the routing and scoping under test are unaffected by its length.
+            bridge._response_timeout_s = lambda pkt, proxy: 0.05
+
+            # Attempt 1 goes DIRECT down the stored route; the retry floods.
+            task = asyncio.ensure_future(bridge.send_status_request(key, timeout=30.0))
+            try:
+                for _ in range(600):
+                    if len(sink.sent) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+            finally:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                for bt in list(getattr(bridge, "_background_tasks", ())):
+                    bt.cancel()
+                for bt in list(getattr(bridge, "_background_tasks", ())):
+                    with contextlib.suppress(BaseException):
+                        await bt
+
+            assert len(sink.sent) >= 2, "expected a first attempt and a retry"
+            first = Packet()
+            first.read_from(sink.sent[0])
+            assert first.get_route_type() == ROUTE_TYPE_DIRECT, "attempt 1 should take the route"
+
+            retry = Packet()
+            retry.read_from(sink.sent[1])
+            self._assert_bridge_scoped(retry, bridge_key, "retry")
+        finally:
+            await bridge.stop()
+
+    @pytest.mark.asyncio
     async def test_bridge_unscoped_request_is_not_given_the_repeater_region(self):
         """[fails pre-fix] An app that asked for un-scoped gets un-scoped.
 
