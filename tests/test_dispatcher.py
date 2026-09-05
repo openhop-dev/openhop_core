@@ -562,6 +562,34 @@ class TestDispatcherSendPacket:
         assert path_len_byte == 0x40
 
     @pytest.mark.asyncio
+    async def test_default_path_hash_mode_applied_to_direct_origin(self, dispatcher):
+        """Zero-hop DIRECT origins get the node default width too, not only floods.
+
+        A locally originated direct send (companion DM, a server reply built
+        without a request width to mirror) used to leave with a 1-byte path
+        hash regardless of the configured default. Analyzers attribute hash
+        width from observed origin packets, so a node configured for 2-byte
+        hashes was flagged as 1-byte on the map. The zero-hop guard and the
+        ``_path_hash_mode_applied`` marker already protect forwarded and
+        pre-widthed packets, so route type must not gate the default.
+        """
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
+
+        dispatcher.set_default_path_hash_mode(1)  # 2-byte hashes
+        pkt = Packet()
+        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"direct_payload")
+        pkt.payload_len = len(pkt.payload)
+
+        await dispatcher.send_packet(pkt)
+
+        raw = dispatcher.radio.tx_data
+        assert raw is not None
+        assert raw[1] == 0x40
+
+    @pytest.mark.asyncio
     async def test_path_hash_mode_not_overwritten_when_companion_applied(self, dispatcher):
         """Packet with _path_hash_mode_applied is not overwritten by dispatcher default."""
         from openhop_core.protocol.constants import PH_TYPE_SHIFT
