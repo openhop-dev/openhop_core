@@ -899,6 +899,26 @@ class TestTextMessageHandler:
         assert replies == []
         assert self.event_service.publish_sync.called
 
+    @pytest.mark.asyncio
+    async def test_unsupported_txt_type_is_dropped_whole(self):
+        """[fails pre-fix] A type with no firmware branch reaches neither app nor air.
+
+        BaseChatMesh::onPeerDataRecv runs off the end of its if/else-if chain
+        for anything outside {PLAIN, CLI_DATA, SIGNED_PLAIN, CLI_COMMAND} and
+        only logs "unsupported message type". The payload layout past the flags
+        byte is undefined for such a type, so decoding it as text would publish
+        AES padding as message content.
+        """
+        packet, _sender = self._typed_dm(0x2A, flood=True, text="future")
+
+        result = await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        # Consumed, not forwarded: it decrypted for us, so it is ours to drop.
+        assert result.authenticated is True
+        assert self.send_packet_fn.call_count == 0
+        self.event_service.publish_sync.assert_not_called()
+
 
 # Advert Handler Tests
 class TestAdvertHandler:

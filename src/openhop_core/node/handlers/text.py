@@ -4,6 +4,7 @@ from ...protocol import CryptoUtils, Identity, Packet, PacketBuilder, PathUtils
 from ...protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_TXT_MSG,
+    TXT_TYPE_CLI_COMMAND,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
@@ -21,6 +22,12 @@ TXT_ACK_DELAY_MS = 200
 # Stagger between a multi-ack and the normal ACK on a known direct route, mirroring the
 # firmware's `d += 300` in BaseChatMesh::sendAckTo.
 MULTI_ACK_STAGGER_MS = 300
+
+# The text types BaseChatMesh::onPeerDataRecv has a branch for. Anything else
+# hits its trailing `else` ("unsupported message type") and is dropped whole.
+SUPPORTED_TXT_TYPES = frozenset(
+    (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_SIGNED_PLAIN, TXT_TYPE_CLI_COMMAND)
+)
 
 
 class TextMessageHandler(BaseHandler):
@@ -292,6 +299,17 @@ class TextMessageHandler(BaseHandler):
         flags = decrypted[4]  # 5th byte contains flags
         txt_type = (flags >> 2) & 0x3F  # Upper 6 bits are txt_type
         message_body = decrypted[5:]  # Rest is the message content
+
+        if txt_type not in SUPPORTED_TXT_TYPES:
+            # Firmware BaseChatMesh::onPeerDataRecv runs off the end of its
+            # if/else-if chain here and only logs "unsupported message type":
+            # no ACK, no contact bookkeeping, nothing handed to the app. The
+            # payload layout past the flags byte is undefined for a type we do
+            # not know, so decoding it as text would surface AES padding (and,
+            # for a future type, framing bytes) as message content.
+            self.log(f"Unsupported TXT_MSG type {txt_type}; dropping")
+            return HandlerResult.consumed()
+
         sender_prefix = b""
         if txt_type == TXT_TYPE_SIGNED_PLAIN:
             # Signed plain text (e.g. room server posts): a 4-byte author
