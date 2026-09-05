@@ -33,6 +33,7 @@ from .constants import (
     TELEM_MODE_ALLOW_ALL,
     TELEM_MODE_ALLOW_FLAGS,
     TELEM_MODE_DENY,
+    TXT_TYPE_CLI_COMMAND,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
     TXT_TYPE_SIGNED_PLAIN,
@@ -87,6 +88,7 @@ __all__ = [
     "TXT_TYPE_PLAIN",
     "TXT_TYPE_CLI_DATA",
     "TXT_TYPE_SIGNED_PLAIN",
+    "TXT_TYPE_CLI_COMMAND",
     # Telemetry Modes
     "TELEM_MODE_DENY",
     "TELEM_MODE_ALLOW_FLAGS",

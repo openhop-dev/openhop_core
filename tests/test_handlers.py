@@ -41,6 +41,7 @@ from openhop_core.protocol.constants import (
     ROUTE_TYPE_TRANSPORT_FLOOD,
     SIGNATURE_SIZE,
     TIMESTAMP_SIZE,
+    TXT_TYPE_CLI_COMMAND,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
 )
@@ -809,6 +810,94 @@ class TestTextMessageHandler:
         assert (first.payload[0] & 0x0F) == PAYLOAD_TYPE_ACK
         assert int.from_bytes(first.payload[1:5], "little") == ack_crc
         assert int.from_bytes(second.payload[:4], "little") == ack_crc
+
+    # ------------------------------------------------------------------
+    # Text types -- firmware BaseChatMesh::onPeerDataRecv
+    # ------------------------------------------------------------------
+
+    def _typed_dm(self, txt_type: int, *, flood: bool, text: str = "ping"):
+        """A real encrypted DM addressed to us, carrying ``txt_type``.
+
+        Returns (packet, sender_identity); the sender is registered as a known
+        contact so the handler decrypts it.
+        """
+        sender = LocalIdentity()
+
+        class _Receiver:
+            public_key = self.local_identity.get_public_key().hex()
+            out_path: list = []
+            out_path_len = -1
+
+        packet, _ = PacketBuilder.create_text_message(
+            _Receiver(),
+            sender,
+            text,
+            attempt=0,
+            message_type="flood" if flood else "direct",
+            txt_type=txt_type,
+        )
+        contact = MockContact(public_key=sender.get_public_key().hex(), name="peer")
+        self.contacts.contacts = [contact]
+        return packet, sender
+
+    @pytest.mark.asyncio
+    async def test_flood_cli_data_sends_nothing_back(self):
+        """A flood CLI_DATA earns no ACK and no reciprocal path.
+
+        Firmware used to answer one with a bare createPathReturn, but that call
+        left BaseChatMesh::onPeerDataRecv when the CLI_DATA branch became the
+        reply-only path (afb969cc): it now just hands the text to
+        onCommandDataRecv. CLI_DATA is also on the no-delivery-ACK list, so the
+        whole branch is silent on the air.
+        """
+        packet, _sender = self._typed_dm(TXT_TYPE_CLI_DATA, flood=True)
+
+        result = await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert result.authenticated is True
+        assert self.send_packet_fn.call_count == 0
+        assert self.event_service.publish_sync.called
+
+    @pytest.mark.asyncio
+    async def test_flood_cli_command_is_delivered_and_sends_nothing_back(self):
+        """CLI_COMMAND reaches the app verbatim and, like CLI_DATA, is silent.
+
+        Firmware routes it to onCLICommandRecv, which runs the command only for
+        a sender flagged isRemoteCLIAllowed() and otherwise queues it for the
+        app. Core has no CLI to run, so the queue-for-the-app branch is all of
+        it -- and no ACK or path return either way.
+        """
+        packet, _sender = self._typed_dm(TXT_TYPE_CLI_COMMAND, flood=True, text="reboot")
+
+        result = await self.handler(packet)
+        await self._wait_for_sends(1)
+
+        assert result.authenticated is True
+        assert self.send_packet_fn.call_count == 0
+        self.event_service.publish_sync.assert_called_once()
+        _event, data = self.event_service.publish_sync.call_args.args
+        assert data["txt_type"] == TXT_TYPE_CLI_COMMAND
+        assert data["message_text"] == "reboot"
+
+    @pytest.mark.asyncio
+    async def test_cli_command_does_not_resolve_a_pending_command_waiter(self):
+        """Only a CLI_DATA *reply* completes a command we sent.
+
+        A CLI_COMMAND travels the other way -- it is someone asking us to run
+        something -- so letting it resolve the waiter would hand
+        send_repeater_command an inbound command as if it were the answer.
+        """
+        packet, sender = self._typed_dm(TXT_TYPE_CLI_COMMAND, flood=False, text="reboot")
+        replies = []
+        self.handler.register_command_response(
+            sender.get_public_key(), lambda text, contact: replies.append(text)
+        )
+
+        await self.handler(packet)
+
+        assert replies == []
+        assert self.event_service.publish_sync.called
 
 
 # Advert Handler Tests

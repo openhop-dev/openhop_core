@@ -1835,7 +1835,11 @@ async def test_cmd_send_txt_msg_threads_host_timestamp():
     from unittest.mock import AsyncMock
 
     from openhop_core.companion.companion_bridge import CompanionBridge
-    from openhop_core.companion.constants import TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN
+    from openhop_core.companion.constants import (
+        TXT_TYPE_CLI_COMMAND,
+        TXT_TYPE_CLI_DATA,
+        TXT_TYPE_PLAIN,
+    )
     from openhop_core.companion.models import Contact, SentResult
     from openhop_core.protocol import LocalIdentity
 
@@ -1860,11 +1864,15 @@ async def test_cmd_send_txt_msg_threads_host_timestamp():
     bridge.send_text_message.assert_awaited_once()
     assert bridge.send_text_message.call_args.kwargs["timestamp"] == host_ts
 
-    # CLI_DATA mints a fresh timestamp (timestamp=None), matching firmware's RTC override.
-    bridge.send_text_message.reset_mock()
-    data_cli = bytes([TXT_TYPE_CLI_DATA, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
-    await server._cmd_send_txt_msg(data_cli)
-    assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
+    # Both CLI types mint a fresh timestamp (timestamp=None): firmware overrides
+    # msg_timestamp with its own RTC for either before calling sendCommandData,
+    # so a host clock that lags cannot trip the receiver's replay guard.
+    for cli_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND):
+        bridge.send_text_message.reset_mock()
+        data_cli = bytes([cli_type, 0]) + struct.pack("<I", host_ts) + pubkey[:6] + b"cmd"
+        await server._cmd_send_txt_msg(data_cli)
+        assert bridge.send_text_message.call_args.kwargs["timestamp"] is None
+        assert bridge.send_text_message.call_args.kwargs["txt_type"] == cli_type
 
 
 @pytest.mark.asyncio
@@ -2493,16 +2501,16 @@ async def test_cmd_send_txt_msg_accepts_one_text_byte():
 
 @pytest.mark.asyncio
 async def test_cmd_send_txt_msg_rejects_reserved_txt_type_known_contact():
-    """Firmware (MyMesh.cpp CMD_SEND_TXT_MSG, ~L1087) only sends for
-    txt_type == TXT_TYPE_PLAIN or TXT_TYPE_CLI_DATA; anything else -- including
-    TXT_TYPE_SIGNED_PLAIN (not supported by this command) and fully
+    """Firmware (MyMesh.cpp CMD_SEND_TXT_MSG) only sends for txt_type ==
+    TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA or TXT_TYPE_CLI_COMMAND; anything else --
+    including TXT_TYPE_SIGNED_PLAIN (not supported by this command) and fully
     reserved/unknown byte values -- falls into the `else` branch. With a known
-    recipient, that branch's ternary (~L1119-1121) picks ERR_CODE_UNSUPPORTED_CMD,
-    and the send pipeline must not be touched."""
+    recipient, that branch's ternary picks ERR_CODE_UNSUPPORTED_CMD, and the
+    send pipeline must not be touched."""
     from openhop_core.companion.constants import TXT_TYPE_SIGNED_PLAIN
 
     contact = _contact()
-    for reserved_type in (TXT_TYPE_SIGNED_PLAIN, 3, 255):
+    for reserved_type in (TXT_TYPE_SIGNED_PLAIN, 4, 255):
         bridge = _txt_bridge(contact, SentResult(True))
         server, frames = _make_capture_server(bridge)
         data = bytes([reserved_type, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
@@ -2529,19 +2537,24 @@ async def test_cmd_send_txt_msg_reserved_txt_type_unknown_contact_is_not_found()
 
 @pytest.mark.asyncio
 async def test_cmd_send_txt_msg_supported_txt_types_still_sent():
-    """TXT_TYPE_PLAIN and TXT_TYPE_CLI_DATA -- the two types firmware supports
-    for CMD_SEND_TXT_MSG -- must still reach the send pipeline; the new
-    txt_type gate must not regress them."""
-    from openhop_core.companion.constants import TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN
+    """The three types firmware supports for CMD_SEND_TXT_MSG -- PLAIN, CLI_DATA
+    and CLI_COMMAND -- must all reach the send pipeline, with the txt_type
+    forwarded verbatim so it lands in the flags byte."""
+    from openhop_core.companion.constants import (
+        TXT_TYPE_CLI_COMMAND,
+        TXT_TYPE_CLI_DATA,
+        TXT_TYPE_PLAIN,
+    )
 
     contact = _contact()
-    for supported_type in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA):
+    for supported_type in (TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND):
         result = SentResult(success=True, is_flood=False, expected_ack=0, timeout_ms=1000)
         bridge = _txt_bridge(contact, result)
         server, frames = _make_capture_server(bridge)
         data = bytes([supported_type, 0]) + struct.pack("<I", 1) + contact.public_key[:6] + b"hi"
         await server._cmd_send_txt_msg(data)
         bridge.send_text_message.assert_awaited_once()
+        assert bridge.send_text_message.call_args.kwargs["txt_type"] == supported_type
         assert frames and frames[0][0] == RESP_CODE_SENT
 
 

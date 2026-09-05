@@ -39,6 +39,7 @@ from .constants import (
     PROTOCOL_CODE_BINARY_REQ,
     PROTOCOL_CODE_RAW_DATA,
     PUSH_CODE_TELEMETRY_RESPONSE,
+    TXT_TYPE_CLI_COMMAND,
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
 )
@@ -403,8 +404,11 @@ class _SendOpsMixin:
         When wait_for_ack is True (default), blocks until ACK or timeout.
         When wait_for_ack is False, returns as soon as the packet is handed off;
         ACK (if any) is still tracked and will trigger send_confirmed later.
-        For ``txt_type == TXT_TYPE_CLI_DATA``, delivery ACK is not used on MeshCore
-        repeaters; ``wait_for_ack`` is treated as False and pending ACK is not tracked.
+        For the CLI types (``TXT_TYPE_CLI_DATA`` and ``TXT_TYPE_CLI_COMMAND``),
+        delivery ACK is not used on MeshCore repeaters; ``wait_for_ack`` is
+        treated as False and pending ACK is not tracked. Firmware routes both to
+        ``sendCommandData`` with ``expected_ack = 0`` (MyMesh.cpp
+        CMD_SEND_TXT_MSG).
         """
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
@@ -430,8 +434,9 @@ class _SendOpsMixin:
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
-            effective_wait_ack = wait_for_ack and txt_type != TXT_TYPE_CLI_DATA
-            if txt_type != TXT_TYPE_CLI_DATA:
+            is_cli = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
+            effective_wait_ack = wait_for_ack and not is_cli
+            if not is_cli:
                 self._track_pending_ack(ack_crc)
             if effective_wait_ack:
                 success = await self._send_packet(pkt, wait_for_ack=True, expected_crc=ack_crc)
@@ -1527,9 +1532,29 @@ class _SendOpsMixin:
                 proto_handler.clear_response_callback(pub_key, request_tag)
 
     async def send_repeater_command(
-        self, pub_key: bytes, command: str, parameters: Optional[str] = None
+        self,
+        pub_key: bytes,
+        command: str,
+        parameters: Optional[str] = None,
+        txt_type: int = TXT_TYPE_CLI_DATA,
     ) -> dict:
-        """Send a text-based command to a repeater and wait for the response."""
+        """Send a text-based command to a repeater and wait for the response.
+
+        ``txt_type`` selects how the command is labelled on the wire.
+        ``TXT_TYPE_CLI_DATA`` is the default because it is the only form every
+        released firmware executes: before ``TXT_TYPE_CLI_COMMAND`` existed,
+        CLI_DATA meant "a CLI command" and the receiver ran it. Newer firmware
+        splits the two — a command is CLI_COMMAND, its reply is CLI_DATA — but
+        still accepts CLI_DATA as a command (``simple_repeater``
+        ``onPeerDataRecv`` takes PLAIN, CLI_DATA or CLI_COMMAND; the companion
+        ``BaseChatMesh`` runs only CLI_COMMAND). Pass ``TXT_TYPE_CLI_COMMAND``
+        to address a companion, which no longer executes CLI_DATA.
+
+        Either way the reply comes back as CLI_DATA, which is what the pending
+        command-response waiter matches on.
+        """
+        if txt_type not in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND):
+            return {"success": False, "reason": f"Unsupported CLI txt_type {txt_type}"}
         contact = self.contacts.get_by_key(pub_key)
         if not contact:
             return {"success": False, "reason": "Contact not found"}
@@ -1563,7 +1588,7 @@ class _SendOpsMixin:
                 message=full_command,
                 attempt=1,
                 message_type=msg_type,
-                txt_type=TXT_TYPE_CLI_DATA,
+                txt_type=txt_type,
             )
             self._apply_path_hash_mode(pkt)
             await self._send_packet(pkt, wait_for_ack=False)

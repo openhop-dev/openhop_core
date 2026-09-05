@@ -15,6 +15,7 @@ from ..protocol.constants import CIPHER_BLOCK_SIZE  # noqa: F401
 from ..protocol.constants import MAX_PACKET_PAYLOAD  # noqa: F401
 from ..protocol.constants import MAX_PATH_SIZE  # noqa: F401
 from ..protocol.constants import PUB_KEY_SIZE  # noqa: F401
+from ..protocol.constants import TXT_TYPE_CLI_COMMAND  # noqa: F401
 from ..protocol.constants import TXT_TYPE_CLI_DATA  # noqa: F401
 from ..protocol.constants import TXT_TYPE_PLAIN  # noqa: F401
 from ..protocol.constants import TXT_TYPE_SIGNED_PLAIN  # noqa: F401
@@ -34,9 +35,9 @@ ADV_TYPE_SENSOR = 4
 MAX_ANON_CONTACTS = 8
 
 # ---------------------------------------------------------------------------
-# Text Types: TXT_TYPE_PLAIN / _CLI_DATA / _SIGNED_PLAIN are defined in
-# protocol.constants (wire values shared with node.handlers.text) and
-# re-exported at the top of this module.
+# Text Types: TXT_TYPE_PLAIN / _CLI_DATA / _SIGNED_PLAIN / _CLI_COMMAND are
+# defined in protocol.constants (wire values shared with node.handlers.text)
+# and re-exported at the top of this module.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

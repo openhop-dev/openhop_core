@@ -46,7 +46,9 @@ class TextMessageHandler(BaseHandler):
         # public key (32 bytes). A CLI_DATA reply is delivered to the waiter for
         # its authenticated sender only; every other message flows to normal
         # delivery, mirroring firmware BaseChatMesh (only TXT_TYPE_CLI_DATA from a
-        # known contact is routed to onCommandDataRecv).
+        # known contact reaches onCommandDataRecv, which is the reply path).
+        # TXT_TYPE_CLI_COMMAND travels the other way — it is a command someone
+        # sent *to* us — so it never resolves one of these waiters.
         self._pending_command_responses = {}  # pubkey bytes -> callback
         self.radio_config = radio_config or {}  # Radio configuration for airtime calculations
         self.multi_acks = 0  # multi_acks pref (0=off); set via set_multi_acks()
@@ -374,6 +376,14 @@ class TextMessageHandler(BaseHandler):
         # else is delivered normally). Match on the full sender public key so a
         # dest-hash collision cannot cross-resolve. Plain DMs and CLI_DATA with no
         # pending command fall through to normal delivery.
+        #
+        # TXT_TYPE_CLI_COMMAND falls through too. Firmware hands it to
+        # onCLICommandRecv, which runs the command locally only when the sender
+        # is flagged isRemoteCLIAllowed() and otherwise queues it for the app
+        # (companion_radio/MyMesh.cpp). Core has no CLI of its own to run, so the
+        # queue-for-the-app branch is the whole of its behaviour: the command is
+        # published as a message carrying txt_type 3, and whoever is driving the
+        # node decides whether to answer it (with a CLI_DATA reply).
         if txt_type == TXT_TYPE_CLI_DATA:
             callback = self._pending_command_responses.get(sender_pubkey)
             if callback is not None:

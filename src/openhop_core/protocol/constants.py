@@ -166,7 +166,12 @@ ANON_REQ_TYPE_BASIC = 0x03  # repeater replies with clock + feature flags
 # TxtDataHelpers.h). Wire values shared by node.handlers.text and companion.
 # ---------------------------------------------------------------------------
 TXT_TYPE_PLAIN = 0  # plain text message
-TXT_TYPE_CLI_DATA = 1  # CLI command/response (no delivery ACK)
+TXT_TYPE_CLI_DATA = 1  # a CLI command -or- reply (no delivery ACK)
 # Signed plain text (e.g. room server posts): a 4-byte author pubkey prefix
 # precedes the text in the decrypted payload.
 TXT_TYPE_SIGNED_PLAIN = 2
+# A CLI command, explicitly (firmware 2c0ace25). Before it existed, CLI_DATA
+# carried both directions and the receiver executed whatever arrived; now a
+# command is CLI_COMMAND and only its reply is CLI_DATA. Receivers still accept
+# CLI_DATA as a command for older senders (simple_repeater onPeerDataRecv).
+TXT_TYPE_CLI_COMMAND = 3
