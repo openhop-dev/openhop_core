@@ -900,6 +900,24 @@ class TestTextMessageHandler:
         assert self.event_service.publish_sync.called
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("txt_type", [TXT_TYPE_PLAIN, TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND])
+    async def test_decrypted_carries_the_text_type(self, txt_type):
+        """packet.decrypted publishes the type alongside the text.
+
+        A downstream repeater or room server dispatches on it -- firmware's
+        simple_repeater and simple_room_server both gate their CLI on
+        {PLAIN, CLI_DATA, CLI_COMMAND}, and the room server tells a post from a
+        command by type, not by reading the text. Once this handler has decoded
+        the plaintext, the type is not recoverable from the packet.
+        """
+        packet, _sender = self._typed_dm(txt_type, flood=False, text="ver")
+
+        await self.handler(packet)
+
+        assert packet.decrypted["txt_type"] == txt_type
+        assert packet.decrypted["text"] == "ver"
+
+    @pytest.mark.asyncio
     async def test_unsupported_txt_type_is_dropped_whole(self):
         """[fails pre-fix] A type with no firmware branch reaches neither app nor air.
 
