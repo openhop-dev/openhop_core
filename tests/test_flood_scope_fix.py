@@ -50,6 +50,7 @@ from openhop_core.protocol.region_map import (
     REGION_DENY_FLOOD,
     RegionEntry,
     RegionMap,
+    apply_reply_scope,
     capture_recv_region,
 )
 from openhop_core.protocol.transport_keys import (
@@ -782,6 +783,60 @@ class TestRepeaterReqReplyScope:
         dispatcher._apply_flood_scope(reply)
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
+
+
+class TestFinalDecisionsSurviveBothResolvers:
+    """``_flood_scope_applied`` must outrank *both* send-layer resolvers.
+
+    The mark exists so a scope the reply helper decided is never re-decided.
+    ``Dispatcher._apply_flood_scope`` has always checked it first;
+    ``CompanionBase._apply_flood_scope`` set it without ever checking it, so a
+    reply deliberately left plain could still be scoped on the way out.
+    """
+
+    @staticmethod
+    def _unscoped_flood_reply():
+        """A reply to an un-scoped flood: chooseReplyScope NONE, marked final."""
+        req = _make_flood_packet()
+        capture_recv_region(RegionMap(), req)
+        assert req._recv_region_unscoped is True
+        reply = _make_flood_packet()
+        apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is True
+        return reply
+
+    def test_dispatcher_resolver_leaves_a_final_plain_reply_alone(self):
+        reply = self._unscoped_flood_reply()
+        _resolve_at_tx(reply, default_key=get_auto_key_for("#default-region"))
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_companion_resolver_leaves_a_final_plain_reply_alone(self):
+        """Firmware gives the requester's un-scoped choice precedence
+        (chooseReplyScope(false, true, ...) -> NONE, then a plain sendFlood),
+        so a configured companion scope must not reach this reply either."""
+        companion = _make_companion()
+        companion.set_flood_scope(get_auto_key_for("#override-region"))
+
+        reply = self._unscoped_flood_reply()
+        companion._apply_flood_scope(reply)
+
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_companion_resolver_still_scopes_its_own_fresh_packets(self):
+        """The guard must not disarm the companion's ordinary scoping: every
+        call site builds its packet immediately before resolving it."""
+        companion = _make_companion()
+        key = get_auto_key_for("#override-region")
+        companion.set_flood_scope(key)
+
+        pkt = _make_flood_packet()
+        assert pkt._flood_scope_applied is False
+        companion._apply_flood_scope(pkt)
+
+        assert pkt.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert pkt.transport_codes[0] == calc_transport_code(key, pkt)
 
 
 class TestRegionCaptureBothEntrypoints:

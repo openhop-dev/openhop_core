@@ -232,6 +232,26 @@ class TestCaptureRecvRegion:
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
+    def test_a_second_capture_keeps_the_first_region(self):
+        """Firmware captures ``recv_pkt_region`` once, in onRecvPacket.
+
+        A Packet here reaches two entrypoints -- the dispatcher, then a
+        CompanionBridge the host delegates it to -- with awaits and flood hold
+        time between them, and the repeater hot-reloads its RegionMap on a
+        transport-key change. A re-capture against the newer map would silently
+        replace a decision that was correct when the packet arrived, and the
+        reply would drop to DEFAULT instead of mirroring its request.
+        """
+        key_a = get_auto_key_for("#region-a")
+        req = _make_scoped_packet("region-a")
+
+        capture_recv_region(RegionMap([RegionEntry(id=1, name="#region-a")]), req)
+        assert req._recv_region_key == key_a
+
+        # The shared map is rebuilt and no longer serves region A.
+        capture_recv_region(RegionMap(), req)
+        assert req._recv_region_key == key_a
+
     def test_allowed_wildcard_flood_is_mirrored_as_unscoped(self):
         """An allowed wildcard means the requester chose un-scoped. That is a
         decision, so it is marked final and a node default cannot override it."""

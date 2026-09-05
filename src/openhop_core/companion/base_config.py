@@ -343,6 +343,14 @@ class _DeviceConfigMixin:
         request, or no key configured) so the dispatcher's node-level scope
         cannot override that decision.
         """
+        # Checked FIRST, as Dispatcher._apply_flood_scope does: a scope the
+        # reply helper already decided outranks this node's send state, and a
+        # reply deliberately left plain (chooseReplyScope NONE, mirroring an
+        # un-scoped request) must not be scoped here. Every call site below
+        # builds its packet immediately before calling this, so a fresh packet
+        # is never affected.
+        if getattr(pkt, "_flood_scope_applied", False):
+            return
         route_type = pkt.get_route_type()
         if route_type != ROUTE_TYPE_FLOOD:
             return  # only scope flood packets, not direct
