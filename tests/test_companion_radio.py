@@ -941,7 +941,8 @@ async def test_cli_text_messages_arm_no_pending_ack(txt_type, expects_ack):
     expected_ack = 0 (MyMesh.cpp CMD_SEND_TXT_MSG) -- a peer answers a CLI
     command with a CLI_DATA reply, never an ACK. Arming the table for one would
     leave an entry that can only age out, and wait_for_ack would block for the
-    whole timeout waiting for something nobody sends.
+    whole timeout waiting for something nobody sends. Covers both halves:
+    the local pending-ACK table and the token reported back to the app.
     """
     radio = MockRadio()
     comp = CompanionRadio(radio, LocalIdentity())
@@ -955,6 +956,10 @@ async def test_cli_text_messages_arm_no_pending_ack(txt_type, expects_ack):
     assert result.success is True
     assert len(radio.sent) == 1
     assert bool(comp._pending_ack_crcs) is expects_ack
+    # The SENT frame reports this token verbatim. Firmware sets expected_ack = 0
+    # for either CLI type, so an app told a nonzero one would arm a wait for an
+    # ACK nobody sends -- a repeater answers a CLI command with a CLI_DATA reply.
+    assert bool(result.expected_ack) is expects_ack
 
 
 # ---------------------------------------------------------------------------

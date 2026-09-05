@@ -435,6 +435,12 @@ class _SendOpsMixin:
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
             is_cli = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
+            # Firmware reports expected_ack = 0 for either CLI type (MyMesh.cpp
+            # CMD_SEND_TXT_MSG) and skips its expected_ack_table entry on a zero
+            # token. Reporting the CRC instead tells the app to wait for an ACK
+            # that a repeater never sends -- it answers a CLI command with a
+            # CLI_DATA reply.
+            reported_ack = 0 if is_cli else ack_crc
             effective_wait_ack = wait_for_ack and not is_cli
             if not is_cli:
                 self._track_pending_ack(ack_crc)
@@ -447,7 +453,7 @@ class _SendOpsMixin:
                 return SentResult(
                     success=success,
                     is_flood=is_flood,
-                    expected_ack=ack_crc,
+                    expected_ack=reported_ack,
                     timeout_ms=None,
                 )
             success = await self._send_packet(pkt, wait_for_ack=False)
@@ -458,7 +464,7 @@ class _SendOpsMixin:
             return SentResult(
                 success=success,
                 is_flood=is_flood,
-                expected_ack=ack_crc,
+                expected_ack=reported_ack,
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
             )
         except Exception as e:
