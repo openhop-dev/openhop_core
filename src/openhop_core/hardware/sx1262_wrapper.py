@@ -1643,6 +1643,15 @@ class SX1262Radio(LoRaRadio):
         # Return the properly sampled and averaged noise floor
         return self._noise_floor
 
+    def get_cached_noise_floor(self) -> Optional[float]:
+        """Nonblocking cached-measurement accessor (see LoRaRadio contract).
+
+        get_noise_floor() already reads only the background-sampled cache and
+        returns None until a real sample was accepted, so it satisfies the
+        contract directly.
+        """
+        return self.get_noise_floor()
+
     def set_frequency(self, frequency: int) -> bool:
         """Set operating frequency"""
 

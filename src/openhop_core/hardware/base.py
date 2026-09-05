@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 
 
 class LoRaRadio(ABC):
@@ -35,3 +36,15 @@ class LoRaRadio(ABC):
     def get_last_snr(self) -> float:
         """Return last received SNR in dB."""
         pass
+
+    def get_cached_noise_floor(self) -> Optional[float]:
+        """Return the last measured channel noise floor in dBm, or None.
+
+        Optional capability with a strict contract: an override MUST be
+        nonblocking and MUST return only an already-taken measurement — never
+        trigger modem I/O or return an initialisation placeholder. Backends
+        without such a cached value (including ones whose synchronous getter
+        would block on the modem) keep this default; callers treat None as
+        "no measurement available" and fall back to their existing behaviour.
+        """
+        return None

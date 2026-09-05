@@ -57,6 +57,7 @@ from openhop_core.companion.constants import (
     RESP_CODE_SIGN_START,
     RESP_CODE_SIGNATURE,
     RESP_CODE_STATS,
+    STATS_TYPE_RADIO,
     RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_PACKETS,
 )
@@ -2946,6 +2947,53 @@ async def test_cmd_get_stats_packets_layout_and_invalid_type():
     frames.clear()
     await server._cmd_get_stats(bytes([9]))
     assert frames == [bytes([RESP_CODE_ERR, ERR_CODE_ILLEGAL_ARG])]
+
+
+@pytest.mark.asyncio
+async def test_cmd_get_stats_radio_frame_encodes_cached_noise_floor():
+    """Protocol-level: a real CompanionRadio with a cached-noise-floor backend
+    produces a STATS_TYPE_RADIO frame whose packed noise-floor field carries the
+    measurement; without one the field keeps its firmware-compatible 0 fallback.
+    """
+    from openhop_core.companion import CompanionRadio
+    from openhop_core.protocol import LocalIdentity
+
+    class _StatsRadio:
+        def set_rx_callback(self, callback):
+            self.rx_callback = callback
+
+        async def send(self, data: bytes) -> bool:
+            return True
+
+        def get_last_rssi(self):
+            return -70
+
+        def get_last_snr(self):
+            return 5.0
+
+        def get_cached_noise_floor(self):
+            return -117.4
+
+    comp = CompanionRadio(_StatsRadio(), LocalIdentity())
+    server, frames = _make_capture_server(comp)
+    await server._cmd_get_stats(bytes([STATS_TYPE_RADIO]))
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_STATS
+    assert frame[1] == STATS_TYPE_RADIO
+    (noise_floor,) = struct.unpack("<h", frame[2:4])
+    assert noise_floor == -117  # int(-117.4): the measurement, not the 0 fallback
+
+    # No measurement yet -> the packed field stays at the existing 0 fallback.
+    class _NoMeasurementRadio(_StatsRadio):
+        def get_cached_noise_floor(self):
+            return None
+
+    comp2 = CompanionRadio(_NoMeasurementRadio(), LocalIdentity())
+    server2, frames2 = _make_capture_server(comp2)
+    await server2._cmd_get_stats(bytes([STATS_TYPE_RADIO]))
+    (frame2,) = frames2
+    (noise_floor2,) = struct.unpack("<h", frame2[2:4])
+    assert noise_floor2 == 0
 
 
 @pytest.mark.asyncio

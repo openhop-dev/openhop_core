@@ -490,6 +490,55 @@ class TestCompanionRadioStats:
         assert "direct_rx" in tot
         assert "tx_errors" in tot
 
+    def test_get_stats_radio_surfaces_rssi_and_snr(self):
+        # STATS_TYPE_RADIO (1) reports the radio's live RSSI/SNR.
+        comp = CompanionRadio(MockRadio(), LocalIdentity())
+        radio_stats = comp.get_stats(1)
+        assert radio_stats["last_rssi"] == -70
+        assert radio_stats["last_snr"] == 5
+
+    def test_get_stats_radio_surfaces_cached_noise_floor(self):
+        # A backend implementing the explicit LoRaRadio.get_cached_noise_floor()
+        # capability has its measurement surfaced into STATS_TYPE_RADIO instead
+        # of the 0 default.
+        class NoiseRadio(MockRadio):
+            def get_cached_noise_floor(self):
+                return -119.5
+
+        radio_stats = CompanionRadio(NoiseRadio(), LocalIdentity()).get_stats(1)
+        assert radio_stats["noise_floor"] == -119.5
+
+    def test_get_stats_radio_omits_noise_floor_before_first_measurement(self):
+        # The cached accessor returns None until a real measurement exists
+        # (initialised-but-never-connected backends included); the key is
+        # omitted so the frame keeps its 0 default rather than packing a
+        # placeholder like an initialisation sentinel.
+        class NoNoiseYetRadio(MockRadio):
+            def get_cached_noise_floor(self):
+                return None
+
+        radio_stats = CompanionRadio(NoNoiseYetRadio(), LocalIdentity()).get_stats(1)
+        assert "noise_floor" not in radio_stats
+
+    def test_get_stats_radio_never_calls_a_plain_noise_floor_getter(self):
+        # get_stats() runs on the event loop, and a backend's plain
+        # get_noise_floor() may do blocking modem I/O. Only the explicit
+        # nonblocking get_cached_noise_floor() capability is ever called — a
+        # backend without it keeps the 0 default even when it has a sync
+        # getter, instead of risking a stalled loop.
+        class BlockingOnlyRadio(MockRadio):
+            def get_noise_floor(self):
+                raise AssertionError("blocking get_noise_floor called on the event loop")
+
+        radio_stats = CompanionRadio(BlockingOnlyRadio(), LocalIdentity()).get_stats(1)
+        assert "noise_floor" not in radio_stats
+
+    def test_get_stats_radio_omits_noise_floor_when_unsupported(self):
+        # A radio without the capability (the base MockRadio) never gains the
+        # key — the stats stay untouched.
+        radio_stats = CompanionRadio(MockRadio(), LocalIdentity()).get_stats(1)
+        assert "noise_floor" not in radio_stats
+
 
 # ---------------------------------------------------------------------------
 # Binary request and repeater command (delegate to node)

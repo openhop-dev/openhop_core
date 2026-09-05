@@ -391,6 +391,17 @@ class CompanionRadio(CompanionBase):
             radio_stats["last_rssi"] = self._radio.get_last_rssi()
         if hasattr(self._radio, "get_last_snr"):
             radio_stats["last_snr"] = self._radio.get_last_snr()
+        # Radio backends that measure the channel noise floor expose it through
+        # LoRaRadio.get_cached_noise_floor(), an explicitly nonblocking accessor
+        # that returns only an already-taken measurement (get_stats() runs on
+        # the event loop, so a blocking sync getter must never be called here —
+        # some backends' get_noise_floor() does modem I/O). None means no
+        # measurement exists yet (unsupported backend, not yet connected, or a
+        # TX in progress); the stats frame then keeps its existing 0 fallback.
+        if hasattr(self._radio, "get_cached_noise_floor"):
+            noise_floor = self._radio.get_cached_noise_floor()
+            if noise_floor is not None:
+                radio_stats["noise_floor"] = noise_floor
         return radio_stats
 
     # -------------------------------------------------------------------------
