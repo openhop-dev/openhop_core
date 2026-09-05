@@ -1244,12 +1244,13 @@ class _SendOpsMixin:
         both directions: either the request never reached the peer, or the peer
         answered DIRECT down a route back to us that no longer works. Flooding
         the retry addresses both — it reaches the peer without depending on the
-        stored path, and a peer answers a *flood* request with a PATH-return
-        (``simple_repeater``/``BaseChatMesh`` ``onPeerDataRecv``), which is a real
-        observed inbound path for the return-path teacher to teach from. The
-        alternative — assuming the route is symmetric and teaching its reverse —
-        is wrong whenever it is not, and a peer taught a wrong route answers into
-        a void with no flood reply left to correct it.
+        stored path, and a peer answers a *flood* REQ or ANON_REQ with a
+        PATH-return (``simple_repeater`` ``onPeerDataRecv``/``onAnonDataRecv``,
+        ``BaseChatMesh::onPeerDataRecv``), which is a real observed inbound path
+        for the return-path teacher to teach from. The alternative — assuming the
+        route is symmetric and teaching its reverse — is wrong whenever it is not,
+        and a peer taught a wrong route answers into a void with no flood reply
+        left to correct it.
 
         Mirrors how firmware forces a single request to flood
         (``companion_radio/MyMesh.cpp``)::
@@ -1264,15 +1265,15 @@ class _SendOpsMixin:
         rather than discarding it. ``build_packet`` is synchronous, so no other
         task can observe the mask, and it is restored on every exit path.
 
-        The forced flood is sent **unscoped**, marked ``_flood_scope_applied`` so
-        neither the companion nor the dispatcher resolver stamps a region on it.
-        A region-scoped retry is worse than no retry at all on a mixed mesh: a
-        repeater that has no regions configured cannot match the transport code,
-        so ``allowPacketForward`` refuses it (``simple_repeater/MyMesh.cpp``:
-        ``recv_pkt_region == NULL`` for a flood packet) and the retry dies at the
-        first hop — while the direct attempt it replaces at least had a route. The
-        trade-off is a mesh whose repeaters deny unscoped floods outright, where
-        the reverse holds; reach in the common case wins.
+        The retry carries the node's normal flood scope. Masking ``out_path_len``
+        is all firmware does: ``sendRequest`` then takes its
+        ``sendFloodScoped(recipient, pkt)`` branch, which resolves the region the
+        same way as any other companion flood (send_unscoped, else the transient
+        send_scope, else the persisted default). Sending the retry un-scoped
+        instead would strand it at hop 0 on a mesh whose repeaters run
+        ``flood.max.unscoped = 0`` — precisely the meshes that scope their
+        traffic — so the recovery attempt would fail exactly where the first
+        attempt already had.
         """
         saved = getattr(proxy, "out_path_len", None)
         if saved is None or saved < 0:
@@ -1287,8 +1288,7 @@ class _SendOpsMixin:
         finally:
             proxy.out_path_len = saved
         if pkt is not None and pkt.is_route_flood():
-            pkt._flood_scope_applied = True
-            logger.debug("[PATHDIAG] %s: retry forced to unscoped FLOOD", log_label)
+            logger.debug("[PATHDIAG] %s: retry forced to FLOOD", log_label)
         return pkt, tag
 
     async def _wait_for_path_propagation(self, proxy: Any, request_type: str) -> None:
