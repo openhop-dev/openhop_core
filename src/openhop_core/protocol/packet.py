@@ -471,6 +471,20 @@ class Packet:
             ValueError: If the packet format is invalid, truncated, or contains
                 invalid values (e.g., path_len too large, invalid payload size).
         """
+        # A Packet object may be reused across frames (pooling, or an app
+        # parsing into a scratch packet). Every field below describes a decision
+        # about *this* frame, so none of the previous frame's may survive into
+        # it: a stale _recv_region_* would have the next reply mirror the wrong
+        # region, and a stale _flood_scope_applied / _path_hash_mode_applied
+        # would make both send-layer resolvers skip a packet they have never
+        # seen. The dispatcher's own RX builds a fresh Packet, so this is a
+        # guard on the public API rather than a fix to a shipped path.
+        self._recv_region_captured = False
+        self._recv_region_key = None
+        self._recv_region_unscoped = False
+        self._flood_scope_applied = False
+        self._path_hash_mode_applied = False
+
         idx, data_len = 0, len(data)
         self.header = data[idx]
         idx += 1

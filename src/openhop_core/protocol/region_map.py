@@ -195,15 +195,23 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
     """
     if region_map is None:
         return
-    if getattr(pkt, "_recv_region_captured", False):
+    if getattr(pkt, "_recv_region_captured", False) and (
+        getattr(pkt, "_recv_region_key", None) is not None
+        or getattr(pkt, "_recv_region_unscoped", False)
+    ):
         # Firmware captures ``recv_pkt_region`` exactly once, in onRecvPacket,
         # and every later consumer reads that one decision. Here a Packet can
         # reach two entrypoints -- the dispatcher, then a CompanionBridge the
         # host delegates it to -- with awaits and flood hold time in between,
         # during which the shared RegionMap can be rebuilt (the repeater
-        # hot-reloads it on a transport-key change). Keep the first capture: it
-        # is the one taken against the map that was live when the packet
-        # actually arrived.
+        # hot-reloads it on a transport-key change). Keep a capture that reached
+        # a decision: it was taken against the map that was live when the packet
+        # actually arrived, and re-running it against a newer map would silently
+        # replace a correct answer with a worse one.
+        #
+        # A capture that resolved *nothing* is not a decision, so it does not
+        # block a second entrypoint whose own RegionMap may resolve the code --
+        # a bridge is free to serve regions its host dispatcher does not.
         return
     pkt._recv_region_captured = True
     pkt._recv_region_unscoped = False

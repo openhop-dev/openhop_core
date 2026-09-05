@@ -825,8 +825,13 @@ class TestFinalDecisionsSurviveBothResolvers:
         assert reply.transport_codes == [0, 0]
 
     def test_companion_resolver_still_scopes_its_own_fresh_packets(self):
-        """The guard must not disarm the companion's ordinary scoping: every
-        call site builds its packet immediately before resolving it."""
+        """The guard must not disarm the companion's ordinary scoping.
+
+        Pins the mechanism -- an unmarked packet still scopes. That this is
+        what every production call site hands it (each builds its packet
+        immediately before resolving it, so none is ever pre-marked) is a
+        property of those call sites, not something this test establishes.
+        """
         companion = _make_companion()
         key = get_auto_key_for("#override-region")
         companion.set_flood_scope(key)

@@ -2251,8 +2251,8 @@ class TestLoginServerHandler:
     @pytest.mark.asyncio
     async def test_zero_hop_out_path_keeps_its_declared_width(self):
         """A direct reply is a ``sendDirect``, which firmware never routes
-        through ``sendFloodReply`` -- so it must not be re-stamped with the
-        request's path-hash width, nor handed to the reply-scope helper.
+        through ``sendFloodReply``, so it must not be re-stamped with the
+        request's path-hash width.
 
         Only zero hops can show this: ``apply_path_hash_mode`` returns early
         once ``get_path_hash_count()`` is non-zero, so a multi-hop stored route
@@ -2260,6 +2260,10 @@ class TestLoginServerHandler:
         stored route is a direct neighbour, so dropping the ``is_route_flood()``
         guard rewrites the reply's ``path_len`` from 0 to ``encode_path_len(2,
         0)`` -- a width the stored route never had.
+
+        The guard also withholds the reply from ``apply_reply_scope``, which
+        this does *not* prove: on a DIRECT request that call is a no-op either
+        way, so no assertion here can distinguish it.
         """
         self.handler.get_out_path = lambda _ident: (b"", 0)
 

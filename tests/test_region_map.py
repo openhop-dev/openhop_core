@@ -204,9 +204,10 @@ class TestApplyReplyScopeDefault:
         ``sendFloodScoped(recipient, ...)`` prefers ``send_scope`` over
         ``default_scope``. Firmware's *repeater* has no override concept, so
         with no default configured its ``sendFloodReply`` would send this reply
-        plain. No topology here reaches that state -- CompanionBridge never
-        writes these dispatcher fields, and a CompanionRadio owns its own
-        dispatcher, where honouring the override is correct.
+        plain. This test pins the behaviour openhop actually has; the claim
+        that no shipped topology reaches it lives in the apply_reply_scope
+        docstring, and is an argument about wiring rather than something a unit
+        test can establish.
         """
         override = get_auto_key_for("#override-region")
         req = Packet()
@@ -256,15 +257,16 @@ class TestCaptureRecvRegion:
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
 
-    def test_a_second_capture_keeps_the_first_region(self):
-        """Firmware captures ``recv_pkt_region`` once, in onRecvPacket.
+    def test_a_capture_that_decided_survives_a_later_one(self):
+        """A resolved capture is a decision and must not be re-run.
 
-        A Packet here reaches two entrypoints -- the dispatcher, then a
-        CompanionBridge the host delegates it to -- with awaits and flood hold
-        time between them, and the repeater hot-reloads its RegionMap on a
-        transport-key change. A re-capture against the newer map would silently
-        replace a decision that was correct when the packet arrived, and the
-        reply would drop to DEFAULT instead of mirroring its request.
+        Two entrypoints can capture the same Packet -- the dispatcher, then a
+        CompanionBridge the host delegates it to -- and the repeater hot-reloads
+        its RegionMap on a transport-key change. Re-capturing against the newer
+        map would replace an answer that was correct when the packet arrived,
+        dropping the reply to DEFAULT instead of mirroring its request. Calls
+        the helper directly; the two-entrypoint wiring itself is covered by
+        TestRegionCaptureBothEntrypoints in test_flood_scope_fix.py.
         """
         key_a = get_auto_key_for("#region-a")
         req = _make_scoped_packet("region-a")
@@ -272,9 +274,65 @@ class TestCaptureRecvRegion:
         capture_recv_region(RegionMap([RegionEntry(id=1, name="#region-a")]), req)
         assert req._recv_region_key == key_a
 
-        # The shared map is rebuilt and no longer serves region A.
+        # The map is rebuilt and no longer serves region A.
         capture_recv_region(RegionMap(), req)
         assert req._recv_region_key == key_a
+
+    def test_an_unscoped_capture_also_counts_as_decided(self):
+        """Mirroring an un-scoped request is a decision too, not an absence of
+        one, so it is equally protected from a later capture."""
+        req = Packet()
+        req.header = ROUTE_TYPE_FLOOD
+
+        capture_recv_region(RegionMap(), req)
+        assert req._recv_region_unscoped is True
+
+        denying = RegionMap()
+        denying.wildcard.flags |= REGION_DENY_FLOOD
+        capture_recv_region(denying, req)
+        assert req._recv_region_unscoped is True
+
+    def test_a_capture_that_resolved_nothing_does_not_block_another_map(self):
+        """Resolving nothing is not a decision.
+
+        A bridge may serve regions its host dispatcher does not. When the first
+        capture could not match the transport code, the second entrypoint's own
+        map must still get to try -- otherwise the reply defers to DEFAULT when
+        a request scope was in fact knowable.
+        """
+        key_b = get_auto_key_for("#region-b")
+        req = _make_scoped_packet("region-b")
+
+        capture_recv_region(RegionMap([RegionEntry(id=1, name="#region-a")]), req)
+        assert req._recv_region_captured is True
+        assert req._recv_region_key is None  # map A cannot resolve it
+
+        capture_recv_region(RegionMap([RegionEntry(id=2, name="#region-b")]), req)
+        assert req._recv_region_key == key_b
+
+    def test_reparsing_a_packet_clears_a_previous_frames_capture(self):
+        """A reused Packet must not carry a decision into the next frame.
+
+        ``read_from`` repopulates every wire field, so any in-memory decision
+        about the previous frame is stale: a surviving capture would have the
+        next reply mirror a region this frame never arrived under, and a
+        surviving ``_flood_scope_applied`` would make both send-layer resolvers
+        skip a packet they have never seen.
+        """
+        scoped = _make_scoped_packet("region-a")
+        capture_recv_region(RegionMap([RegionEntry(id=1, name="#region-a")]), scoped)
+        scoped._flood_scope_applied = True
+        assert scoped._recv_region_key is not None
+
+        plain = PacketBuilder.create_advert(
+            local_identity=LocalIdentity(), name="y", route_type="flood"
+        )
+        scoped.read_from(plain.write_to())
+
+        assert scoped._recv_region_captured is False
+        assert scoped._recv_region_key is None
+        assert scoped._recv_region_unscoped is False
+        assert scoped._flood_scope_applied is False
 
     def test_allowed_wildcard_flood_is_mirrored_as_unscoped(self):
         """An allowed wildcard means the requester chose un-scoped. That is a
