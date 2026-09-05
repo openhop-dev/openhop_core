@@ -388,14 +388,20 @@ class TextMessageHandler(BaseHandler):
         decoded_msg = message_body[:visible_len].decode("utf-8", "replace")
         self.log(f"Received TXT_MSG: {decoded_msg}")
 
-        # Publish the text and its type before any branch below can return, so
-        # every caller sees the same shape whether or not the message is
-        # intercepted. The type rides along because a downstream node dispatches
-        # on it and cannot recover it once the plaintext is gone: firmware's
-        # simple_repeater and simple_room_server both gate their CLI on
-        # {PLAIN, CLI_DATA, CLI_COMMAND}, and the room server tells a post from
-        # a command by type rather than by reading the text.
-        packet.decrypted = {"text": decoded_msg, "txt_type": txt_type}
+        # Publish the text, its type and the sender's timestamp before any branch
+        # below can return, so every caller sees the same shape whether or not
+        # the message is intercepted. All three ride along because a downstream
+        # node needs them and cannot recover them once the plaintext is gone:
+        # firmware's simple_repeater and simple_room_server gate their CLI on
+        # the type ({PLAIN, CLI_DATA, CLI_COMMAND}, and the room server tells a
+        # post from a command by it), and both guard replays on the timestamp
+        # against the client's stored watermark. It is the *sender's* clock,
+        # which may be wrong -- it is a replay watermark, not a wall clock.
+        packet.decrypted = {
+            "text": decoded_msg,
+            "txt_type": txt_type,
+            "sender_timestamp": timestamp_int,
+        }
 
         # Intercept as a repeater-command response only for CLI_DATA replies whose
         # authenticated sender has a pending command (firmware routes only

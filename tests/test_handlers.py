@@ -816,7 +816,9 @@ class TestTextMessageHandler:
     # Text types -- firmware BaseChatMesh::onPeerDataRecv
     # ------------------------------------------------------------------
 
-    def _typed_dm(self, txt_type: int, *, flood: bool, text: str = "ping"):
+    def _typed_dm(
+        self, txt_type: int, *, flood: bool, text: str = "ping", timestamp: int = 0x5EEDBEEF
+    ):
         """A real encrypted DM addressed to us, carrying ``txt_type``.
 
         Returns (packet, sender_identity); the sender is registered as a known
@@ -836,6 +838,7 @@ class TestTextMessageHandler:
             attempt=0,
             message_type="flood" if flood else "direct",
             txt_type=txt_type,
+            timestamp=timestamp,
         )
         contact = MockContact(public_key=sender.get_public_key().hex(), name="peer")
         self.contacts.contacts = [contact]
@@ -920,6 +923,8 @@ class TestTextMessageHandler:
 
         assert packet.decrypted["txt_type"] == txt_type
         assert packet.decrypted["text"] == "ver"
+        # The sender's clock, not ours: a server uses it as a replay watermark.
+        assert packet.decrypted["sender_timestamp"] == 0x5EEDBEEF
 
     @pytest.mark.asyncio
     async def test_decrypted_is_published_even_when_a_waiter_consumes_the_reply(self):
@@ -936,7 +941,11 @@ class TestTextMessageHandler:
         result = await self.handler(packet)
 
         assert result.authenticated is True
-        assert packet.decrypted == {"text": "fw v1", "txt_type": TXT_TYPE_CLI_DATA}
+        assert packet.decrypted == {
+            "text": "fw v1",
+            "txt_type": TXT_TYPE_CLI_DATA,
+            "sender_timestamp": 0x5EEDBEEF,
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("text_len", [0, 11, 27])
