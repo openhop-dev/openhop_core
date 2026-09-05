@@ -1174,27 +1174,37 @@ class Dispatcher:
         tx_metadata = None
         # Resolve which fabric/radio endpoint will TX for log clarity (multi-radio).
         tx_radio_id = self._resolve_tx_radio_id_for_log(raw, radio_id)
+        # The hash above was tracked on the assumption this send reaches the
+        # air. Release it from a finally if it does not, so every exit from the
+        # send below — including one added later — keeps the seen-table honest:
+        # a hash left behind suppresses copies of a packet we never sent.
+        transmitted = False
         try:
-            # Prefer fabric/radio multi-radio send(data, radio_id=...) when
-            # available; fall back to the legacy single-arg send(raw).
-            send_fn = self.radio.send
-            if radio_id is not None:
-                try:
-                    tx_metadata = await send_fn(raw, radio_id=radio_id)
-                except TypeError:
+            try:
+                # Prefer fabric/radio multi-radio send(data, radio_id=...) when
+                # available; fall back to the legacy single-arg send(raw).
+                send_fn = self.radio.send
+                if radio_id is not None:
+                    try:
+                        tx_metadata = await send_fn(raw, radio_id=radio_id)
+                    except TypeError:
+                        tx_metadata = await send_fn(raw)
+                else:
                     tx_metadata = await send_fn(raw)
-            else:
-                tx_metadata = await send_fn(raw)
-        except Exception as e:
-            radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
-            self._log(f"Radio transmit error{radio_label}: {e}")
-            self.state = DispatcherState.IDLE
-            return (False, None, None)
-        if tx_metadata is None:
-            radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
-            self._log(f"Radio transmit returned no confirmation metadata{radio_label}")
-            self.state = DispatcherState.IDLE
-            return (False, None, None)
+            except Exception as e:
+                radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
+                self._log(f"Radio transmit error{radio_label}: {e}")
+                self.state = DispatcherState.IDLE
+                return (False, None, None)
+            if tx_metadata is None:
+                radio_label = f" radio={tx_radio_id}" if tx_radio_id else ""
+                self._log(f"Radio transmit returned no confirmation metadata{radio_label}")
+                self.state = DispatcherState.IDLE
+                return (False, None, None)
+            transmitted = True
+        finally:
+            if not transmitted:
+                self.packet_filter.untrack_packet(packet_hash)
         # Spend the airtime budget on the completed transmit (client-repeat only).
         if self._client_repeat_enabled:
             self._debit_tx_budget(packet)

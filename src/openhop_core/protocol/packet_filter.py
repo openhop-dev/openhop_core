@@ -45,6 +45,15 @@ class PacketFilter:
         """Track a packet hash with current timestamp."""
         self._packet_hashes[packet_hash] = time.time()
 
+    def untrack_packet(self, packet_hash: str) -> None:
+        """Drop a tracked hash.
+
+        Counterpart to :meth:`track_packet` for a transmission that was
+        tracked before it started and then never reached the air: keeping the
+        hash would suppress the copies that are still worth processing.
+        """
+        self._packet_hashes.pop(packet_hash, None)
+
     def blacklist(self, packet_hash: str) -> None:
         """Add a packet hash to the blacklist.
 

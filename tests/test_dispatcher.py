@@ -1329,3 +1329,69 @@ class TestDispatcherSendMarksSeen:
         await dispatcher._process_received_packet(pkt.write_to())
 
         assert mock_handler.call_count == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "break_the_radio",
+        [
+            lambda radio: setattr(radio, "send", AsyncMock(side_effect=RuntimeError("radio gone"))),
+            lambda radio: setattr(radio, "send", AsyncMock(return_value=None)),
+        ],
+        ids=["send_raises", "send_returns_none"],
+    )
+    async def test_send_that_never_reached_the_air_does_not_suppress_later_copies(
+        self, dispatcher, break_the_radio
+    ):
+        """The mark is a bet that the send happens; a failed send must take it back.
+
+        Otherwise this node drops every later copy of a packet it never put on
+        the air — for the whole dedup window — which is exactly the case where
+        another node's copy is still worth processing.
+        """
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        pkt = Packet()
+        pkt.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"never made it out")
+        pkt.payload_len = len(pkt.payload)
+
+        break_the_radio(dispatcher.radio)
+        assert await dispatcher.send_packet(pkt, wait_for_ack=False) is False
+
+        await dispatcher._process_received_packet(pkt.write_to())
+
+        assert mock_handler.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_send_does_not_lift_the_suppression_of_a_sent_packet(self, dispatcher):
+        """Releasing must be keyed on the failed packet, not on recent state.
+
+        A release that is not keyed would let the earlier packet's own echo
+        back through, which is the loopback the mark exists to stop.
+        """
+        mock_handler = MockHandler(PAYLOAD_TYPE_TXT_MSG)
+        dispatcher.register_handler(PAYLOAD_TYPE_TXT_MSG, mock_handler)
+
+        sent = Packet()
+        sent.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        sent.path_len = 0
+        sent.path = bytearray()
+        sent.payload = bytearray(b"this one really went out")
+        sent.payload_len = len(sent.payload)
+        assert await dispatcher.send_packet(sent, wait_for_ack=False) is True
+
+        failed = Packet()
+        failed.header = (PAYLOAD_TYPE_TXT_MSG << 2) | ROUTE_TYPE_FLOOD  # version 0
+        failed.path_len = 0
+        failed.path = bytearray()
+        failed.payload = bytearray(b"this one did not")
+        failed.payload_len = len(failed.payload)
+        dispatcher.radio.send = AsyncMock(return_value=None)
+        assert await dispatcher.send_packet(failed, wait_for_ack=False) is False
+
+        await dispatcher._process_received_packet(sent.write_to())
+
+        assert mock_handler.call_count == 0
