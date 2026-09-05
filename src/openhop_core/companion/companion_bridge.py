@@ -17,7 +17,7 @@ from ..node.handlers import create_core_handlers
 from ..node.handlers.crypto_helpers import iter_decrypt_by_src_hash
 from ..node.handlers.login_server import LoginServerHandler
 from ..node.handlers.result import HandlerResult
-from ..protocol import LocalIdentity, Packet
+from ..protocol import Identity, LocalIdentity, Packet
 from ..protocol.constants import (
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
@@ -208,9 +208,10 @@ class CompanionBridge(CompanionBase):
         self._packet_injector = packet_injector
 
         # Region registry for reply-region capture. None by default so a
-        # standalone bridge captures nothing (replies fall through to plain). The
-        # host repeater points this at its dispatcher's region_map so incoming
-        # request regions are captured and mirrored onto replies.
+        # standalone bridge captures nothing (replies fall through to the
+        # ordinary send precedence). A host repeater points this at its
+        # dispatcher's region_map so incoming request regions are captured and
+        # mirrored onto replies.
         self.region_map: Optional[RegionMap] = None
 
         async def _handler_send_packet(pkt: Packet, wait_for_ack: bool = False) -> bool:
@@ -251,8 +252,22 @@ class CompanionBridge(CompanionBase):
 
             auth_cb = _reject_all
 
+        def _get_login_out_path(client_identity: Identity) -> Optional[tuple[bytes, int]]:
+            contact = self.contacts.get_by_key(client_identity.get_public_key())
+            if contact is None or contact.out_path_len < 0:
+                return None
+            return (bytes(contact.out_path or b""), contact.out_path_len)
+
+        def _clear_login_out_path(client_identity: Identity) -> None:
+            self.reset_path(client_identity.get_public_key())
+
         login_server_handler = LoginServerHandler(
-            identity, _log, authenticate_callback=auth_cb, is_room_server=False
+            identity,
+            _log,
+            authenticate_callback=auth_cb,
+            is_room_server=False,
+            get_out_path=_get_login_out_path,
+            clear_out_path=_clear_login_out_path,
         )
         login_server_handler.set_send_packet_callback(_login_send_callback)
 

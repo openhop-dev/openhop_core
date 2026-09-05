@@ -89,6 +89,7 @@ from .region_map import (
     RegionMap,
     apply_reply_scope,
     capture_recv_region,
+    choose_reply_scope,
 )
 from .transport_keys import calc_transport_code, get_auto_key_for, scope_packet
 from .utils import decode_appdata, is_self_advert, parse_advert_payload
@@ -109,6 +110,7 @@ __all__ = [
     "REGION_DENY_DIRECT",
     "capture_recv_region",
     "apply_reply_scope",
+    "choose_reply_scope",
     # Utility functions
     "parse_advert_payload",
     "decode_appdata",

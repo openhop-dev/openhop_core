@@ -297,11 +297,25 @@ async def run_login_server(
     # Create ACL for managing authenticated clients
     acl = ClientACL(max_clients=32, admin_password=admin_password, guest_password=guest_password)
 
+    def get_out_path(client_identity: Identity):
+        client = acl.get_client(client_identity.get_public_key())
+        if client is None or client.out_path_len < 0:
+            return None
+        return (bytes(client.out_path), client.out_path_len)
+
+    def clear_out_path(client_identity: Identity):
+        client = acl.get_client(client_identity.get_public_key())
+        if client is not None:
+            client.out_path_len = -1
+            client.out_path = bytearray()
+
     # Create login server handler with authentication callback
     login_handler = LoginServerHandler(
         local_identity=identity,
         log_fn=lambda msg: print(msg),
         authenticate_callback=acl.authenticate_client,  # Delegate authentication to ACL
+        get_out_path=get_out_path,
+        clear_out_path=clear_out_path,
     )
 
     # Set up packet sending callback

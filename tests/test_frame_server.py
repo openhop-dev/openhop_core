@@ -8,6 +8,7 @@ import sys
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+
 from openhop_core.companion.constants import (
     CMD_GET_CUSTOM_VARS,
     CMD_GET_DEVICE_TIME,
@@ -455,13 +456,11 @@ async def test_cmd_add_update_contact_preserves_exact_encoded_path_bytes(encoded
 
 
 @pytest.mark.asyncio
-async def test_cmd_send_raw_data_short_of_min_payload_writes_unsupported():
-    """path_len=0 but fewer than 4 payload bytes -> ERR_CODE_UNSUPPORTED_CMD.
+async def test_cmd_send_raw_data_never_enters_branch_writes_unsupported():
+    """Firmware `len < 6` (command byte included) never enters CMD_SEND_RAW_DATA.
 
-    Previously this was rejected by a blanket `len(data) < 6` guard; now it
-    falls through to the path-aware bounds check (1 + path_byte_len + 4 >
-    len(data)), which rejects it for the same reason firmware does
-    (MyMesh.cpp: `i + path_len + 4 <= len` fails) with the same error code.
+    ``data`` is command-stripped, so fewer than 5 bytes is that case and must
+    stay ``ERR_CODE_UNSUPPORTED_CMD`` (MyMesh.cpp catch-all).
     """
     bridge = _MockBridgeSendRawDirect()
     server = CompanionFrameServer(bridge, "hash", port=0)
@@ -470,6 +469,25 @@ async def test_cmd_send_raw_data_short_of_min_payload_writes_unsupported():
     await server._cmd_send_raw_data(b"\x00\x00\x00")
     assert len(bridge.calls) == 0
     server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_data_short_of_min_payload_writes_illegal_arg():
+    """Valid path, entered the branch, remaining payload < 4 → ILLEGAL_ARG.
+
+    Firmware: ``len >= 6`` enters; ``isValidPathLen``; ``writePath``; then
+    ``i + 4 > len`` → ``ERR_CODE_ILLEGAL_ARG`` (dev / 0cce9197). Five
+    command-stripped bytes is firmware ``len == 6``. path_len=1 consumes one
+    hop byte, leaving 3 payload bytes.
+    """
+    bridge = _MockBridgeSendRawDirect()
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_data(bytes([1, 0x42, 0x01, 0x02, 0x03]))
+    assert len(bridge.calls) == 0
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
     server._write_ok.assert_not_called()
 
 
@@ -570,7 +588,11 @@ async def test_cmd_send_raw_data_invalid_path_encoding():
 
 @pytest.mark.asyncio
 async def test_cmd_send_raw_data_truncated_multibyte_path():
-    """CMD_SEND_RAW_DATA with not enough path bytes for 2-byte encoding → error."""
+    """Valid encoding, not enough path+payload bytes → ILLEGAL_ARG.
+
+    Firmware ``writePath`` still advances by the encoded byte length, then
+    ``i + 4 > len`` fails with ``ERR_CODE_ILLEGAL_ARG``.
+    """
     from openhop_core.protocol.packet_utils import PathUtils
 
     bridge = _MockBridgeSendRawDirect()
@@ -583,7 +605,7 @@ async def test_cmd_send_raw_data_truncated_multibyte_path():
     data = bytes([path_len_byte]) + b"\x00" * 8  # only 8 bytes, need 6+4=10
     await server._cmd_send_raw_data(data)
     assert len(bridge.calls) == 0
-    server._write_err.assert_called_once_with(ERR_CODE_UNSUPPORTED_CMD)
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
 
 
 @pytest.mark.asyncio
@@ -1506,6 +1528,32 @@ async def test_cmd_send_raw_packet_too_short():
     server._write_err = Mock()
     await server._cmd_send_raw_packet(bytes([0x00]))
     server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_parse_fail_writes_illegal_arg():
+    """Unparseable body maps to ILLEGAL_ARG (firmware releasePacket + ILLEGAL_ARG)."""
+    bridge = Mock()
+    bridge.send_raw_packet = AsyncMock(return_value=SentResult(success=False, error="illegal_arg"))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00, 0xAA, 0xBB]))
+    server._write_err.assert_called_once_with(ERR_CODE_ILLEGAL_ARG)
+    server._write_ok.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cmd_send_raw_packet_send_failure_writes_table_full():
+    """TX/queue full still maps to TABLE_FULL."""
+    bridge = Mock()
+    bridge.send_raw_packet = AsyncMock(return_value=SentResult(success=False, error="send_failed"))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    server._write_ok = Mock()
+    server._write_err = Mock()
+    await server._cmd_send_raw_packet(bytes([0x00, 0xAA, 0xBB]))
+    server._write_err.assert_called_once_with(ERR_CODE_TABLE_FULL)
+    server._write_ok.assert_not_called()
 
 
 def test_parse_binary_response_regions():

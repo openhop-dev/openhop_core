@@ -606,14 +606,18 @@ class _MessagingCommandsMixin:
         """Handle CMD_SEND_RAW_DATA (25).
         Format: [path_len_encoded][path][payload] (min 4-byte payload).
 
-        Firmware (MyMesh.cpp handleCmdFrame): `len >= 6` (len includes the
-        command byte, so the stripped `data` here only needs the path_len
-        byte to be present) then `path_len >= 0 && i + path_len + 4 <= len`,
-        which is exactly `1 + path_byte_len + 4 <= len(data)` below. A
-        zero-hop frame (path_len=0, 4-byte payload -> len(data) == 5) is the
-        firmware minimum and must not be rejected here.
+        Firmware (MyMesh.cpp handleCmdFrame, `dev` / 0cce9197):
+        - Frame never enters the branch (`len < 6`, command byte included) →
+          catch-all ``ERR_CODE_UNSUPPORTED_CMD``.
+        - Invalid encoded ``path_len`` → ``ERR_CODE_UNSUPPORTED_CMD``.
+        - Valid path, then remaining payload (or path bytes) short of 4 →
+          ``ERR_CODE_ILLEGAL_ARG`` (``writePath`` then ``i + 4 > len``).
+
+        ``data`` is command-stripped, so ``len(data) < 5`` is the ``len < 6``
+        case. A zero-hop frame (path_len=0, 4-byte payload → len(data) == 5)
+        is the firmware minimum and must not be rejected here.
         """
-        if len(data) < 1:
+        if len(data) < 5:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         path_len_byte = data[0]
@@ -622,7 +626,7 @@ class _MessagingCommandsMixin:
             return
         path_byte_len = PathUtils.get_path_byte_len(path_len_byte)
         if 1 + path_byte_len + 4 > len(data):
-            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         path = data[1 : 1 + path_byte_len]
         payload = data[1 + path_byte_len :]
@@ -650,12 +654,17 @@ class _MessagingCommandsMixin:
             self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         try:
-            ok = await send_raw_packet(priority, packet_bytes)
+            result = await send_raw_packet(priority, packet_bytes)
         except Exception as e:
             logger.error("send_raw_packet error: %s", e, exc_info=True)
             self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
-        if ok:
+        # Firmware: tryParsePacket fail → releasePacket + ILLEGAL_ARG;
+        # obtainNewPacket fail / send fail → TABLE_FULL.
+        if result is True or getattr(result, "success", False):
             self._write_ok()
+            return
+        if getattr(result, "error", None) == "illegal_arg":
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
         else:
             self._write_err(ERR_CODE_TABLE_FULL)

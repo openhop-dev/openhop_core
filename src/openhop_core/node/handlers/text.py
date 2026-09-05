@@ -159,8 +159,10 @@ class TextMessageHandler(BaseHandler):
             )
             # Firmware sends the flood PATH-return (carrying the ACK) via
             # sendFloodScoped(from, path, TXT_ACK_DELAY): scope the reply to the
-            # region the request arrived under, decided synchronously here from
-            # the request packet before the delayed send task runs.
+            # region the request arrived under. Read synchronously from the
+            # request packet, before the delayed send task runs, because the
+            # capture lives on that Packet. A request whose scope is unknowable
+            # is REPLY_SCOPE_DEFAULT and resolves at send time instead.
             apply_reply_scope(ack_packet, packet)
             self.log(f"FLOOD ACK timing - delay:{TXT_ACK_DELAY_MS}ms")
             return [(ack_packet, TXT_ACK_DELAY_MS / 1000.0)]
