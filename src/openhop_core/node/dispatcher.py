@@ -591,7 +591,7 @@ class Dispatcher:
         # Capture the region this packet arrived under before any handler
         # runs, so a reply builder can scope its reply to that region. No-op when
         # no RegionMap is configured (standalone node/companion).
-        capture_recv_region(self.region_map, pkt, default_key=self.default_flood_transport_key)
+        capture_recv_region(self.region_map, pkt)
 
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:

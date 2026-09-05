@@ -122,7 +122,6 @@ class Packet:
         "_recv_region_captured",
         "_recv_region_key",
         "_recv_region_unscoped",
-        "_recv_default_scope_key",
     )
 
     def __init__(self):
@@ -156,16 +155,15 @@ class Packet:
         # the repeater inject path so the companion fan-out can withhold the packet
         # from its own sender -- a node never hears its own transmission.
         self._injected_origin_hash: Optional[str] = None
-        # Region captured from this packet on receive. Only set True when
-        # a RegionMap was actually consulted; the matched region key (or None)
-        # plus the snapshotted default key are read by region_map.apply_reply_scope
-        # when a handler builds a flood reply (chooseReplyScope REQUEST / DEFAULT /
+        # Region captured from this packet on receive. Only set True when a
+        # RegionMap was actually consulted; the matched region key (or None) and
+        # the un-scoped flag are read by region_map.apply_reply_scope when a
+        # handler builds a flood reply (chooseReplyScope REQUEST / DEFAULT /
         # NONE). Lives on the Packet, never a shared dispatcher member, because
         # replies are sent from background tasks that would race.
         self._recv_region_captured: bool = False
         self._recv_region_key: Optional[bytes] = None
         self._recv_region_unscoped: bool = False
-        self._recv_default_scope_key: Optional[bytes] = None
 
     def get_route_type(self) -> int:
         """

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from openhop_core.node.dispatcher import Dispatcher
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
     ROUTE_TYPE_DIRECT,
@@ -101,49 +102,149 @@ class TestChooseReplyScope:
         assert choose_reply_scope(False, True, False) == REPLY_SCOPE_NONE
 
 
+class _MockRadio:
+    """Minimal radio so a Dispatcher can be built for its TX-time scoping."""
+
+    def set_rx_callback(self, callback):
+        pass
+
+    async def send(self, data: bytes) -> bool:
+        return True
+
+
+def _resolve_at_tx(reply, *, default_key=None, override=None, unscoped=False):
+    """Run a built reply through the send layer, as an actual TX would.
+
+    ``apply_reply_scope`` defers the DEFAULT case, so a test that wants to see
+    the resulting scope has to ask the layer that decides it.
+    """
+    dispatcher = Dispatcher(_MockRadio())
+    dispatcher.default_flood_transport_key = default_key
+    dispatcher.flood_transport_key = override
+    dispatcher.flood_unscoped = unscoped
+    dispatcher._apply_flood_scope(reply)
+    return reply
+
+
+def _flood_reply():
+    return PacketBuilder.create_advert(local_identity=LocalIdentity(), name="x", route_type="flood")
+
+
 class TestApplyReplyScopeDefault:
-    def test_direct_request_uses_captured_default_key(self):
+    """REPLY_SCOPE_DEFAULT is deferred to the send layer, not resolved here."""
+
+    def test_direct_request_defers_to_the_send_layer(self):
+        """A DIRECT request carries no transport codes, so its scope is
+        unknowable. The helper must leave the reply unmarked so the ordinary
+        precedence runs -- marking it would suppress that chain entirely."""
+        req = Packet()
+        req.header = ROUTE_TYPE_DIRECT
+        capture_recv_region(RegionMap(), req)
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+
+        assert reply._flood_scope_applied is False
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+
+    def test_deferred_direct_request_then_takes_the_node_default(self):
+        """Firmware's repeater answers this case with
+        ``sendFloodScoped(default_scope, ...)``; here the same key arrives via
+        the send layer. This is the behaviour MeshCore PR #3106 added -- an
+        un-scoped reply is dropped at hop 0 by ``flood.max.unscoped=0``."""
         default_key = get_auto_key_for("#default-region")
         req = Packet()
         req.header = ROUTE_TYPE_DIRECT
-        req._recv_region_captured = True
-        req._recv_region_key = None
-        req._recv_default_scope_key = default_key
+        capture_recv_region(RegionMap(), req)
 
-        reply = PacketBuilder.create_advert(
-            local_identity=LocalIdentity(), name="x", route_type="flood"
-        )
+        reply = _flood_reply()
         apply_reply_scope(reply, req)
+        _resolve_at_tx(reply, default_key=default_key)
+
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
-        assert reply._flood_scope_applied is True
+
+    def test_deferred_direct_request_honours_explicit_unscoped(self):
+        """A node told to force un-scoped floods keeps doing so. Firmware's
+        companion overload checks ``send_unscoped`` before any scope; resolving
+        DEFAULT inside the helper would silently override the operator."""
+        default_key = get_auto_key_for("#default-region")
+        req = Packet()
+        req.header = ROUTE_TYPE_DIRECT
+        capture_recv_region(RegionMap(), req)
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+        _resolve_at_tx(reply, default_key=default_key, unscoped=True)
+
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
+    def test_deferred_direct_request_honours_the_transient_override(self):
+        """``send_scope`` beats ``default_scope`` in firmware's companion
+        overload, so the reply must carry the override, not the default."""
+        default_key = get_auto_key_for("#default-region")
+        override = get_auto_key_for("#override-region")
+        req = Packet()
+        req.header = ROUTE_TYPE_DIRECT
+        capture_recv_region(RegionMap(), req)
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+        _resolve_at_tx(reply, default_key=default_key, override=override)
+
+        assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
+        assert reply.transport_codes[0] == calc_transport_code(override, reply)
+
+    def test_deferred_direct_request_with_no_scope_stays_plain(self):
+        """Firmware's final ``REPLY_SCOPE_NONE``: nothing configured, so the
+        reply goes out a plain flood."""
+        req = Packet()
+        req.header = ROUTE_TYPE_DIRECT
+        capture_recv_region(RegionMap(), req)
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+        _resolve_at_tx(reply)
+
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
 
 
 class TestCaptureRecvRegion:
-    def test_second_capture_without_default_preserves_dispatcher_snapshot(self):
-        """Bridge delegation must not erase a default captured by the dispatcher."""
-        default_key = get_auto_key_for("#default-region")
-        req = Packet()
-        req.header = ROUTE_TYPE_DIRECT
-
-        capture_recv_region(RegionMap(), req, default_key=default_key)
-        capture_recv_region(RegionMap(), req, default_key=None)
-
-        assert req._recv_default_scope_key == default_key
-
-    def test_plain_flood_uses_default_when_wildcard_denies_flood(self):
+    def test_wildcard_denying_flood_makes_the_scope_unknowable(self):
+        """Firmware leaves ``recv_pkt_region`` NULL when the wildcard denies
+        FLOOD, which is *unknowable*, not *un-scoped*: the reply must defer
+        rather than mirror the request as plain."""
         default_key = get_auto_key_for("#default-region")
         region_map = RegionMap()
         region_map.wildcard.flags |= REGION_DENY_FLOOD
         req = Packet()
         req.header = ROUTE_TYPE_FLOOD
 
-        capture_recv_region(region_map, req, default_key=default_key)
+        capture_recv_region(region_map, req)
         assert req._recv_region_unscoped is False
 
-        reply = PacketBuilder.create_advert(
-            local_identity=LocalIdentity(), name="x", route_type="flood"
-        )
+        reply = _flood_reply()
         apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is False
+
+        _resolve_at_tx(reply, default_key=default_key)
         assert reply.get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
         assert reply.transport_codes[0] == calc_transport_code(default_key, reply)
+
+    def test_allowed_wildcard_flood_is_mirrored_as_unscoped(self):
+        """An allowed wildcard means the requester chose un-scoped. That is a
+        decision, so it is marked final and a node default cannot override it."""
+        default_key = get_auto_key_for("#default-region")
+        req = Packet()
+        req.header = ROUTE_TYPE_FLOOD
+
+        capture_recv_region(RegionMap(), req)
+        assert req._recv_region_unscoped is True
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, req)
+        assert reply._flood_scope_applied is True
+
+        _resolve_at_tx(reply, default_key=default_key)
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD

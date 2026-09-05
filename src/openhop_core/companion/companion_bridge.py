@@ -209,12 +209,10 @@ class CompanionBridge(CompanionBase):
 
         # Region registry for reply-region capture. None by default so a
         # standalone bridge captures nothing (replies fall through to the
-        # dispatcher default). A host repeater points this at its dispatcher's
-        # region_map so incoming request regions are captured and mirrored onto
-        # replies. If the dispatcher captured a default before delegation, a
-        # second bridge capture preserves that per-packet snapshot.
+        # ordinary send precedence). A host repeater points this at its
+        # dispatcher's region_map so incoming request regions are captured and
+        # mirrored onto replies.
         self.region_map: Optional[RegionMap] = None
-        self.default_flood_transport_key: Optional[bytes] = None
 
         async def _handler_send_packet(pkt: Packet, wait_for_ack: bool = False) -> bool:
             return await self._packet_injector(pkt, wait_for_ack=wait_for_ack)
@@ -478,7 +476,7 @@ class CompanionBridge(CompanionBase):
         # Capture the region this request arrived under before the handler
         # builds any reply, so a flood reply is scoped to that region (or plain).
         # No-op when no RegionMap is configured (standalone bridge).
-        capture_recv_region(self.region_map, packet, default_key=self.default_flood_transport_key)
+        capture_recv_region(self.region_map, packet)
 
         handler = self._handlers.get(ptype)
         if handler:
