@@ -1125,6 +1125,31 @@ class TestNoiseFloorSampling:
             radio._sample_noise_floor()
         radio.lora.getRssiInst.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "marker", [IRQ_PREAMBLE_DETECTED, IRQ_SYNC_WORD_VALID, IRQ_HEADER_VALID]
+    )
+    def test_no_sample_after_progress_irq_is_cleared(self, radio, mock_lora, marker):
+        # The handler clears the hardware flags, so only the software latch
+        # still shows the in-flight packet.
+        irq = {"status": marker}
+        mock_lora.getIrqStatus.side_effect = lambda: irq["status"]
+        mock_lora.clearIrqStatus.side_effect = lambda mask: irq.update(
+            status=irq["status"] & ~mask
+        )
+        with patch(
+            "openhop_core.hardware.sx1262_wrapper.time.monotonic", return_value=1000.0
+        ):
+            radio._handle_interrupt()
+            assert irq["status"] == 0
+            assert radio.is_receiving_packet()
+            assert radio._pending_rx_irq_status == 0
+            with patch(
+                "openhop_core.hardware.sx1262_wrapper.time.time", return_value=2000.0
+            ):
+                radio._sample_noise_floor()
+        mock_lora.getRssiInst.assert_not_called()
+        assert radio._num_floor_samples == 0
+
     def test_no_sample_with_pending_rx_irq_status(self, radio):
         radio._pending_rx_irq_status = IRQ_RX_DONE
         with patch("openhop_core.hardware.sx1262_wrapper.time.time", return_value=30.0):
@@ -1255,6 +1280,21 @@ class TestNoiseFloorSampling:
         radio._noise_floor = -120.0
         radio._num_floor_samples = 1
         assert radio.get_noise_floor() == pytest.approx(-120.0)
+
+    def test_get_cached_noise_floor_survives_the_tx_lock(self, radio):
+        radio._noise_floor = -120.0  # reset sentinel, not a reading
+        radio._num_floor_samples = 0
+        assert radio.get_cached_noise_floor() is None
+
+        radio._noise_floor = -101.5
+        radio._num_floor_samples = 3
+        radio._tx_lock = MagicMock()
+        radio._tx_lock.locked.return_value = True
+        assert radio.get_noise_floor() is None
+        assert radio.get_cached_noise_floor() == pytest.approx(-101.5)
+
+        radio._initialized = False
+        assert radio.get_cached_noise_floor() is None
 
 
 # ===========================================================================

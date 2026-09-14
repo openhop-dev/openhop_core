@@ -1572,8 +1572,8 @@ class SX1262Radio(LoRaRadio):
         if self._tx_lock.locked():
             return
 
-        # Don't sample if packet processing is active or RX terminal IRQs are pending.
-        if self._is_receiving_packet:
+        # Don't sample during reception, packet processing, or pending RX terminal IRQs.
+        if self._is_receiving_packet or self.is_receiving_packet():
             return
         if self._pending_rx_irq_status:
             return
@@ -1641,6 +1641,17 @@ class SX1262Radio(LoRaRadio):
             return None
 
         # Return the properly sampled and averaged noise floor
+        return self._noise_floor
+
+    def get_cached_noise_floor(self) -> Optional[float]:
+        """
+        Return the last accepted background sample in dBm without I/O, or None.
+        Unlike get_noise_floor(), stays available while the TX lock is held.
+        """
+        if not self._initialized or self.lora is None:
+            return None
+        if self._num_floor_samples <= 0:
+            return None
         return self._noise_floor
 
     def set_frequency(self, frequency: int) -> bool:
