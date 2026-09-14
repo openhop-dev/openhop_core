@@ -68,6 +68,7 @@ from openhop_core.companion.constants import (
     RESP_CODE_STATS,
     RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_PACKETS,
+    TXT_TYPE_SIGNED_PLAIN,
 )
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.frame_server import (
@@ -4041,3 +4042,91 @@ async def test_openhop_probe_returns_exactly_32_public_key_bytes_from_real_bridg
     assert frames[0][1:7] == OPENHOP_EXTENSION_MARKER
     assert frames[0][7:] == bridge.get_public_key()
     assert len(frames[0]) == 1 + 6 + PUB_KEY_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Message frames over MAX_FRAME_SIZE: clip the text, never drop the frame
+# ---------------------------------------------------------------------------
+#
+# sync_next_message() pops the message before its frame is built, so a frame
+# _enqueue_frame refuses leaves the client waiting on CMD_SYNC_NEXT_MESSAGE for a
+# message that no longer exists.
+
+
+def _queued(text: str, **kw) -> QueuedMessage:
+    base = dict(
+        sender_key=bytes(range(6)),
+        txt_type=TXT_TYPE_SIGNED_PLAIN,
+        timestamp=1700000000,
+        text=text,
+        is_channel=False,
+        path_len=4,
+        snr=0.0,
+        rssi=-90,
+        sender_prefix=bytes(4),
+    )
+    base.update(kw)
+    return QueuedMessage(**base)
+
+
+def _msg_server(app_target_ver: int, bridge=None) -> CompanionFrameServer:
+    """A frame server on one app-protocol variant, with a real write queue."""
+    server = CompanionFrameServer(bridge or Mock(), "hash", port=0)
+    server._app_target_ver = app_target_ver
+    server._write_queue = asyncio.Queue(maxsize=8)
+    return server
+
+
+_MSG_KINDS = [
+    ("dm_signed", {}),
+    ("dm_plain", {"txt_type": 0}),
+    ("channel", {"is_channel": True, "txt_type": 0, "channel_idx": 0}),
+]
+
+
+@pytest.mark.parametrize("app_target_ver", [0, 3])
+@pytest.mark.parametrize("kind,kwargs", _MSG_KINDS, ids=[k for k, _ in _MSG_KINDS])
+def test_message_text_that_fits_is_sent_unchanged(app_target_ver, kind, kwargs):
+    server = _msg_server(app_target_ver)
+    text = "short message ěščř"
+    head = server._build_message_frame(_queued("", **kwargs))
+    assert server._build_message_frame(_queued(text, **kwargs)) == head + text.encode()
+
+
+@pytest.mark.parametrize("app_target_ver", [0, 3])
+@pytest.mark.parametrize("kind,kwargs", _MSG_KINDS, ids=[k for k, _ in _MSG_KINDS])
+@pytest.mark.parametrize("char", ["a", "ě", "€", "\U0001f600"], ids=["1b", "2b", "3b", "4b"])
+def test_over_long_message_text_is_sent_as_its_longest_fitting_prefix(
+    app_target_ver, kind, kwargs, char
+):
+    server = _msg_server(app_target_ver)
+    # Numbered, so no suffix or middle slice of the text is also a prefix of it.
+    text = "".join(f"{i}{char}" for i in range(MAX_FRAME_SIZE))
+    head = server._build_message_frame(_queued("", **kwargs))
+    frame = server._build_message_frame(_queued(text, **kwargs))
+
+    assert frame.startswith(head)
+    delivered = frame[len(head) :]
+    delivered.decode("utf-8")  # raises if a character was split
+    assert text.encode().startswith(delivered), "not a prefix of the text"
+    budget = MAX_FRAME_SIZE - len(head)
+    assert budget - len(char.encode()) < len(delivered) <= budget, "clipped more than needed"
+    server._enqueue_frame(frame)
+    assert not server._write_queue.empty(), f"{kind}/v{app_target_ver} frame was dropped"
+
+
+@pytest.mark.asyncio
+async def test_sync_next_message_answers_for_the_message_it_popped():
+    """The pop site: _cmd_sync_next_message -> _write_frame -> _enqueue_frame, unmocked."""
+    msg = _queued("x" * 160)  # v3 signed header is 20 bytes: 180 > MAX_FRAME_SIZE
+    bridge = Mock()
+    bridge.sync_next_message.return_value = msg
+    server = _msg_server(3, bridge)
+
+    await server._cmd_sync_next_message(b"")
+
+    bridge.sync_next_message.assert_called_once()
+    assert not server._write_queue.empty(), "message popped but no frame sent"
+    frame = server._write_queue.get_nowait()[3:]  # strip prefix + uint16 length
+    assert frame == server._build_message_frame(msg)
+    assert len(frame) == MAX_FRAME_SIZE, "text should be clipped to fill the frame, not emptied"
