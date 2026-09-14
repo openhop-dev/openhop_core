@@ -8,7 +8,6 @@ import time
 
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
-    MAX_PAYLOAD_SIZE,
     OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     PUSH_CODE_BINARY_RESPONSE,
@@ -272,15 +271,18 @@ class _PushMixin:
 
     def _on_raw_data_received(self, payload_bytes: bytes, snr: float, rssi: int) -> None:
         """Push PUSH_CODE_RAW_DATA (0x84): code, SNR byte, RSSI byte,
-        path-len byte (unknown), payload."""
+        path-len byte (unknown), payload.
+
+        Never clipped: an over-long frame is dropped by _enqueue_frame, as
+        firmware onRawDataRecv() drops it.
+        """
         snr_byte = max(-128, min(127, int(round(snr * 4))))
         rssi_byte = max(-128, min(127, int(rssi)))
-        payload_len = min(len(payload_bytes), MAX_PAYLOAD_SIZE - 4)
         data = (
             bytes([PUSH_CODE_RAW_DATA])
             + struct.pack("<bb", snr_byte, rssi_byte)
             + bytes([OUT_PATH_UNKNOWN])
-            + payload_bytes[:payload_len]
+            + payload_bytes
         )
         self._enqueue_frame(data)
 
@@ -372,8 +374,9 @@ class _PushMixin:
             snr_byte += 256
         if rssi_byte < 0:
             rssi_byte += 256
-        payload_len = min(len(raw), MAX_PAYLOAD_SIZE - 3)  # 3 = code + snr + rssi
-        data = bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF]) + raw[:payload_len]
+        # Never clipped: a clipped frame still parses but its MAC fails. An
+        # over-long one is dropped by _enqueue_frame, as firmware logRxRaw() does.
+        data = bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF]) + raw
         self._enqueue_frame(data)
 
     async def push_rx_raw_async(self, snr: float, rssi: int, raw: bytes) -> None:
@@ -412,8 +415,8 @@ class _PushMixin:
         if rssi_byte < 0:
             rssi_byte += 256
         path_len_byte = max(0, min(255, int(path_len) if path_len is not None else 0))
-        payload_max = MAX_PAYLOAD_SIZE - 4  # 4 = code + snr + rssi + path_len_byte
-        payload_slice = bytes(payload[:payload_max]) if payload else b""
+        # Never clipped; see _on_raw_data_received (firmware onControlDataRecv()).
+        payload_slice = bytes(payload) if payload else b""
         data = (
             bytes(
                 [

@@ -40,9 +40,12 @@ from openhop_core.companion.constants import (
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_BINARY_RESPONSE,
+    PUSH_CODE_CONTROL_DATA,
+    PUSH_CODE_LOG_RX_DATA,
     PUSH_CODE_MSG_WAITING,
     PUSH_CODE_NEW_ADVERT,
     PUSH_CODE_PATH_DISCOVERY_RESPONSE,
+    PUSH_CODE_RAW_DATA,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
@@ -4130,3 +4133,56 @@ async def test_sync_next_message_answers_for_the_message_it_popped():
     frame = server._write_queue.get_nowait()[3:]  # strip prefix + uint16 length
     assert frame == server._build_message_frame(msg)
     assert len(frame) == MAX_FRAME_SIZE, "text should be clipped to fill the frame, not emptied"
+
+
+# ---------------------------------------------------------------------------
+# RF-derived pushes over MAX_FRAME_SIZE: drop, never clip
+# ---------------------------------------------------------------------------
+#
+# A clipped RX-log frame still parses, so a client decoding the RX log stores a
+# packet whose MAC fails. Firmware drops these pushes (logRxRaw, onRawDataRecv,
+# onControlDataRecv).
+
+# (code, bytes the push puts in front of the packet data)
+_RF_PUSHES = [(PUSH_CODE_LOG_RX_DATA, 3), (PUSH_CODE_RAW_DATA, 4), (PUSH_CODE_CONTROL_DATA, 4)]
+_RF_PUSH_IDS = ["rx_log", "raw_data", "control_data"]
+
+
+async def _rf_push(server, code: int, body: bytes) -> None:
+    if code == PUSH_CODE_LOG_RX_DATA:
+        server.push_rx_raw(snr=0.0, rssi=-90, raw=body)
+    elif code == PUSH_CODE_RAW_DATA:
+        server._on_raw_data_received(body, snr=0.0, rssi=-90)
+    else:
+        await server.push_control_data(snr=0.0, rssi=-90, path_len=0, path_bytes=b"", payload=body)
+
+
+def _push_server() -> CompanionFrameServer:
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,head_len", _RF_PUSHES, ids=_RF_PUSH_IDS)
+async def test_rf_push_that_fits_is_sent_whole(code, head_len):
+    server = _push_server()
+    body = bytes(range(MAX_PAYLOAD_SIZE - head_len))
+
+    await _rf_push(server, code, body)
+
+    frame = server._write_queue.get_nowait()[3:]  # strip prefix + uint16 length
+    assert frame[0] == code
+    assert frame[head_len:] == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,head_len", _RF_PUSHES, ids=_RF_PUSH_IDS)
+async def test_rf_push_that_does_not_fit_is_dropped_not_clipped(code, head_len, caplog):
+    server = _push_server()
+
+    with caplog.at_level(logging.WARNING, logger="CompanionFrameServer"):
+        await _rf_push(server, code, bytes(MAX_PAYLOAD_SIZE - head_len + 1))
+
+    assert server._write_queue.empty()
+    assert f"code=0x{code:02x}" in caplog.text
