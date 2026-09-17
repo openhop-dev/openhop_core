@@ -87,6 +87,7 @@ class SX1262Radio(LoRaRadio):
         use_dio3_tcxo: bool = False,
         dio3_tcxo_voltage: float = 1.8,
         use_dio2_rf: bool = False,
+        lna_gain_db: float = 0.0,
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
@@ -159,6 +160,15 @@ class SX1262Radio(LoRaRadio):
         self.use_dio3_tcxo = use_dio3_tcxo
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.use_dio2_rf = use_dio2_rf
+
+        # Gain of any external front-end LNA sitting between the antenna and the
+        # SX1262. The chip cannot know it is there, so every RSSI it reports -
+        # received packets and the idle noise floor alike - is inflated by this
+        # much. Subtracting it refers those figures back to the antenna port so
+        # they can be compared against a bare SX1262. Defaults to 0.0, which
+        # leaves behaviour unchanged for boards without a front end.
+        # SNR is a ratio, so front-end gain cancels out: it is NOT adjusted.
+        self.lna_gain_db = float(lna_gain_db)
 
         # State variables
         self.lora: Optional[SX126x] = None
@@ -614,6 +624,8 @@ class SX1262Radio(LoRaRadio):
                                             snr_db,
                                             signal_rssi_dbm,
                                         ) = self.lora.getSignalMetrics()
+                                        packet_rssi_dbm -= self.lna_gain_db
+                                        signal_rssi_dbm -= self.lna_gain_db
                                         (
                                             payloadLengthRx,
                                             rxStartBufferPointer,
@@ -670,9 +682,9 @@ class SX1262Radio(LoRaRadio):
                                         snr_db,
                                         signal_rssi_dbm,
                                     ) = self.lora.getSignalMetrics()
-                                    self.last_rssi = int(packet_rssi_dbm)
+                                    self.last_rssi = int(packet_rssi_dbm - self.lna_gain_db)
                                     self.last_snr = snr_db
-                                    self.last_signal_rssi = int(signal_rssi_dbm)
+                                    self.last_signal_rssi = int(signal_rssi_dbm - self.lna_gain_db)
 
                                     logger.debug(
                                         "[RX] Packet received: length=%d, RSSI=%ddBm, SNR=%.1fdB",
@@ -1607,6 +1619,10 @@ class SX1262Radio(LoRaRadio):
                 logger.debug("[Noise] Sample rejected: out-of-range RSSI %.1f dBm", current_rssi)
                 return
 
+            # Range check above is against the chip's own scale; refer the
+            # accepted sample back to the antenna port before averaging.
+            current_rssi -= self.lna_gain_db
+
             self._noise_floor_samples.append(current_rssi)
             if len(self._noise_floor_samples) > self.NUM_NOISE_FLOOR_SAMPLES:
                 self._noise_floor_samples.pop(0)
@@ -1760,6 +1776,7 @@ class SX1262Radio(LoRaRadio):
             "last_rssi": self.last_rssi,
             "last_snr": self.last_snr,
             "last_signal_rssi": self.last_signal_rssi,
+            "lna_gain_db": self.lna_gain_db,
             "crc_error_count": self.crc_error_count,
         }
 
