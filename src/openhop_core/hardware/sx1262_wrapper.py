@@ -53,6 +53,7 @@ class SX1262Radio(LoRaRadio):
 
     # Common timing constants to avoid magic numbers
     RADIO_TIMING_DELAY = 0.01  # 10ms delay for standard radio operations
+    CAD_BURST_TIMEOUT_S = 1.0  # per CAD inside measure_rssi_dwell; perform_cad's default
     FRONTEND_SETTLE_DELAY_S = 0.100
 
     # SX1262 receiver-sensitivity workaround used by other SX126x implementations:
@@ -2137,6 +2138,8 @@ class SX1262Radio(LoRaRadio):
         settle_s: float = 0.02,
         respect_tx_lock: bool = True,
         lock_timeout: float = 5.0,
+        cad_symbols: Optional[int] = None,
+        cad_count: int = 0,
     ) -> dict:
         """
         Listen on one frequency and return every instantaneous RSSI sample heard.
@@ -2156,16 +2159,26 @@ class SX1262Radio(LoRaRadio):
         Readings >= -1 dBm or <= -126 dBm are unsettled front-end or bus noise
         and are counted in `discarded` rather than returned.
 
+        With cad_count > 0 the dwell ends with that many back-to-back CADs on the
+        same channel (cad_symbols 1/2/4/8/16, default the radio's own setting)
+        and adds a "cad" block: hits, the longest run of hits, and timeouts.
+
         Returns:
             dict: {"freq_hz", "dwell_s", "started_ts", "n", "samples", "discarded"}
-                  on success, or {"error": <reason>} if the radio could not be
-                  taken (for example, a transmit held the lock past lock_timeout).
+                  on success, plus "cad" when requested, or {"error": <reason>}
+                  if the radio could not be taken (for example, a transmit held
+                  the lock past lock_timeout).
         """
         if not self._initialized:
             raise RuntimeError("Radio not initialized")
 
         if not self.lora:
             raise RuntimeError("LoRa radio object not available")
+
+        if cad_count > 0:
+            if cad_symbols is None:
+                cad_symbols = self._custom_cad_symbol_num or 2
+            cad_symbol_constant = self._resolve_cad_symbol_constant(int(cad_symbols))
 
         acquired_tx_lock = False
         if respect_tx_lock:
@@ -2217,7 +2230,7 @@ class SX1262Radio(LoRaRadio):
                         samples.append(value)
                 await asyncio.sleep(max(0.0, float(sample_gap_s)))
 
-            return {
+            result = {
                 "freq_hz": int(freq_hz),
                 "dwell_s": float(dwell_s),
                 "started_ts": started_ts,
@@ -2225,6 +2238,11 @@ class SX1262Radio(LoRaRadio):
                 "samples": samples,
                 "discarded": discarded,
             }
+            if cad_count > 0:
+                result["cad"] = await self._cad_burst(
+                    cad_symbol_constant, int(cad_symbols), int(cad_count)
+                )
+            return result
         finally:
             try:
                 # Back to the mesh channel before the RX routes come up, so the
@@ -2240,6 +2258,58 @@ class SX1262Radio(LoRaRadio):
             finally:
                 if acquired_tx_lock and self._tx_lock.locked():
                     self._tx_lock.release()
+
+    async def _cad_burst(self, cad_symbol_constant: int, cad_symbols: int, cad_count: int) -> dict:
+        """
+        Run cad_count CADs on the channel the chip is tuned to now; the caller
+        holds the lock and restores. Not perform_cad: its cleanup re-arms the RX
+        routes on the current channel after every CAD.
+        """
+        det_peak, det_min = self._get_thresholds_for_current_settings()
+        cad_mask = self.lora.IRQ_CAD_DONE | self.lora.IRQ_CAD_DETECTED
+        self.lora.setStandby(self.lora.STANDBY_RC)
+        await asyncio.sleep(self.RADIO_TIMING_DELAY)
+        self.lora.clearIrqStatus(0xFFFF)
+        self.lora.setDioIrqParams(cad_mask, cad_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
+        self.lora.setCadParams(cad_symbol_constant, det_peak, det_min, self.lora.CAD_EXIT_STDBY, 0)
+
+        hits = timeouts = run = longest = 0
+        for _ in range(cad_count):
+            _ = self._gpio_manager.read_pin(self.irq_pin_number)  # prime edge detection
+            await asyncio.sleep(0.02)  # one poll cycle, as perform_cad does
+            # Cleared last thing before the CAD starts, so a late interrupt from a
+            # CAD that timed out cannot be taken for this one's answer.
+            self._cad_event.clear()
+            self.lora.setCad()
+            try:
+                await asyncio.wait_for(self._cad_event.wait(), timeout=self.CAD_BURST_TIMEOUT_S)
+                detected = bool(self._last_cad_detected)
+            except asyncio.TimeoutError:
+                timeouts += 1
+                detected = False
+            if detected:
+                hits += 1
+                run += 1
+                longest = max(longest, run)
+            else:
+                run = 0
+            irq = self.lora.getIrqStatus()
+            if irq:
+                self.lora.clearIrqStatus(irq)
+
+        _trace(f"[CAD] Burst done - {hits}/{cad_count} hits, run {longest}, {timeouts} timeouts")
+
+        return {
+            "symbols": int(cad_symbols),
+            "n_cad": int(cad_count),
+            "hits": hits,
+            "longest_run": longest,
+            "timeouts": timeouts,
+            "det_peak": int(det_peak),
+            "det_min": int(det_min),
+            "sf": self.spreading_factor,
+            "bw_hz": self.bandwidth,
+        }
 
     def _bind_instance_spi_transport(self) -> None:
         """Attach a per-instance SPI transport when possible.
