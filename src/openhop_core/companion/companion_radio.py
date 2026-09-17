@@ -391,6 +391,12 @@ class CompanionRadio(CompanionBase):
             radio_stats["last_rssi"] = self._radio.get_last_rssi()
         if hasattr(self._radio, "get_last_snr"):
             radio_stats["last_snr"] = self._radio.get_last_snr()
+        # Optional capability; None keeps the frame's existing 0 fallback.
+        getter = getattr(self._radio, "get_cached_noise_floor", None)
+        if callable(getter):
+            noise_floor = getter()
+            if noise_floor is not None:
+                radio_stats["noise_floor"] = noise_floor
         return radio_stats
 
     # -------------------------------------------------------------------------
