@@ -4041,3 +4041,50 @@ async def test_openhop_probe_returns_exactly_32_public_key_bytes_from_real_bridg
     assert frames[0][1:7] == OPENHOP_EXTENSION_MARKER
     assert frames[0][7:] == bridge.get_public_key()
     assert len(frames[0]) == 1 + 6 + PUB_KEY_SIZE
+
+
+# ---------------------------------------------------------------------------
+# attach(): serving a client over a socket the host already holds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_attach_serves_a_client_without_the_tcp_listener():
+    """A socketpair end handed to ``attach`` is served like a TCP client:
+    the same handler, the same single slot, no ``start()`` and no bind."""
+    import socket
+    import struct
+    from unittest.mock import AsyncMock
+
+    from openhop_core.companion.companion_bridge import CompanionBridge
+    from openhop_core.companion.constants import (
+        CMD_DEVICE_QUERY,
+        FRAME_INBOUND_PREFIX,
+        FRAME_OUTBOUND_PREFIX,
+        RESP_CODE_DEVICE_INFO,
+    )
+    from openhop_core.protocol import LocalIdentity
+
+    bridge = CompanionBridge(LocalIdentity(), AsyncMock(return_value=True))
+    server = CompanionFrameServer(bridge, "hash", port=0)
+    assert server._server is None  # never started: nothing is listening
+
+    host_end, client_end = socket.socketpair()
+    serve = asyncio.create_task(server.attach(host_end))
+    reader, writer = await asyncio.open_connection(sock=client_end)
+
+    payload = bytes([CMD_DEVICE_QUERY, 3])
+    writer.write(bytes([FRAME_INBOUND_PREFIX]) + struct.pack("<H", len(payload)) + payload)
+    await writer.drain()
+
+    header = await asyncio.wait_for(reader.readexactly(3), timeout=2)
+    assert header[0] == FRAME_OUTBOUND_PREFIX
+    (length,) = struct.unpack("<H", header[1:3])
+    body = await asyncio.wait_for(reader.readexactly(length), timeout=2)
+    assert body[0] == RESP_CODE_DEVICE_INFO
+    assert server._client_writer is not None
+
+    writer.close()
+    await writer.wait_closed()
+    await asyncio.wait_for(serve, timeout=2)
+    assert server._client_writer is None
