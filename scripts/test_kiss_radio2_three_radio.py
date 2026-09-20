@@ -4,15 +4,15 @@
 This is an RF hardware-in-the-loop test, not a pytest test.  It needs three
 MeshCore KISS v2 modems:
 
-* a Station G3 KISS image driven by OpenHop (the device under test),
+* a MeshCore KISS v2 image driven by OpenHop (the device under test),
 * a peer whose primary radio is profile A, and
 * a peer whose primary radio is profile B.
 
-The G3 alternates locally between profile A on KISS port 0 and profile B on
-KISS port 1.  Every radio configuration command is session-only in the
-MeshCore KISS firmware.  The runner snapshots and restores the primary radio,
-``radio2``, TX power, and signal-report setting before closing each serial
-connection.
+The modem under test alternates locally between profile A on KISS port 0 and
+profile B on KISS port 1.  Every radio configuration command is session-only
+in the MeshCore KISS firmware.  The runner snapshots and restores the primary
+radio, ``radio2``, TX power, and signal-report setting before closing each
+serial connection.
 
 The runner deliberately refuses to emit RF without ``--yes-transmit``.  Use
 low power plus adequate attenuation or shielding for a bench test.
@@ -129,7 +129,12 @@ class TestModem:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--g3-port", required=True, help="Station G3 KISS serial path")
+    parser.add_argument("--modem-port", required=True, help="KISS modem-under-test serial path")
+    parser.add_argument(
+        "--modem-name",
+        default="KISS modem",
+        help="label for the modem under test in test output",
+    )
     parser.add_argument("--peer-a-port", required=True, help="profile-A peer serial path")
     parser.add_argument("--peer-b-port", required=True, help="profile-B peer serial path")
     parser.add_argument("--frequency", type=int, default=909_500_000, help="frequency in Hz")
@@ -315,13 +320,17 @@ def run_leg(
 
 def print_plan(args: argparse.Namespace, profile_a: RadioProfile, profile_b: RadioProfile) -> None:
     print("Three-radio KISS v2 HIL plan")
-    print(f"  G3:     {args.g3_port} (primary A, radio2 B)")
+    print(f"  {args.modem_name}: {args.modem_port} (primary A, radio2 B)")
     print(f"  Peer A: {args.peer_a_port} (primary A, radio2 B)")
     print(f"  Peer B: {args.peer_b_port} (primary B, radio2 A)")
     print(f"  A: {profile_a.radio2_dict()}")
     print(f"  B: {profile_b.radio2_dict()}")
     print(f"  TX: {args.tx_power} dBm, {args.trials} trials per directional leg")
-    print("  Required checks: A->G3 port0, B->G3 port1, G3 port0->A, G3 port1->B")
+    print(
+        "  Required checks: "
+        f"A->{args.modem_name} port0, B->{args.modem_name} port1, "
+        f"{args.modem_name} port0->A, {args.modem_name} port1->B"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -346,26 +355,54 @@ def main(argv: list[str] | None = None) -> int:
         print("Dry run only. Re-run with --yes-transmit after confirming the bench setup.")
         return 0
 
-    g3: TestModem | None = None
+    dut: TestModem | None = None
     peer_a: TestModem | None = None
     peer_b: TestModem | None = None
     try:
-        g3 = connect_modem("G3", args.g3_port, profile_a)
+        dut = connect_modem(args.modem_name, args.modem_port, profile_a)
         peer_a = connect_modem("peer A", args.peer_a_port, profile_a)
         peer_b = connect_modem("peer B", args.peer_b_port, profile_b)
-        modems = (g3, peer_a, peer_b)
+        modems = (dut, peer_a, peer_b)
         for modem in modems:
             capture_snapshot(modem)
 
-        configure_modem(g3, profile_a, profile_b, args.tx_power)
+        configure_modem(dut, profile_a, profile_b, args.tx_power)
         configure_modem(peer_a, profile_a, profile_b, args.tx_power)
         configure_modem(peer_b, profile_b, profile_a, args.tx_power)
 
         legs = (
-            ("peer A -> G3", 1, peer_a, g3, KISS_RADIO_PORT, KISS_RADIO_PORT),
-            ("peer B -> G3", 2, peer_b, g3, KISS_RADIO_PORT, KISS_RADIO2_PORT),
-            ("G3 port 0 -> peer A", 3, g3, peer_a, KISS_RADIO_PORT, KISS_RADIO_PORT),
-            ("G3 port 1 -> peer B", 4, g3, peer_b, KISS_RADIO2_PORT, KISS_RADIO_PORT),
+            (
+                f"peer A -> {args.modem_name}",
+                1,
+                peer_a,
+                dut,
+                KISS_RADIO_PORT,
+                KISS_RADIO_PORT,
+            ),
+            (
+                f"peer B -> {args.modem_name}",
+                2,
+                peer_b,
+                dut,
+                KISS_RADIO_PORT,
+                KISS_RADIO2_PORT,
+            ),
+            (
+                f"{args.modem_name} port 0 -> peer A",
+                3,
+                dut,
+                peer_a,
+                KISS_RADIO_PORT,
+                KISS_RADIO_PORT,
+            ),
+            (
+                f"{args.modem_name} port 1 -> peer B",
+                4,
+                dut,
+                peer_b,
+                KISS_RADIO2_PORT,
+                KISS_RADIO_PORT,
+            ),
         )
         successes = {
             name: run_leg(name, leg, sender, receiver, sender_port, receiver_port, args)
@@ -379,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     finally:
-        for modem in (g3, peer_a, peer_b):
+        for modem in (dut, peer_a, peer_b):
             if modem is None:
                 continue
             if not args.no_restore:
