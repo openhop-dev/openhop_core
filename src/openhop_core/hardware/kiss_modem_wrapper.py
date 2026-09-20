@@ -25,10 +25,12 @@ import serial
 from ..protocol.packet_utils import PacketTimingUtils
 from .base import LoRaRadio
 
-# RX callback: (data) for backward compat, or (data, rssi, snr) for per-packet metrics
+# RX callback: (data) for backward compat, (data, rssi, snr) for per-packet
+# metrics, or (data, rssi, snr, radio_port) for KISS v2 profile selection.
 RxCallback = Union[
     Callable[[bytes], None],
     Callable[[bytes, Optional[int], Optional[float]], None],
+    Callable[[bytes, Optional[int], Optional[float], int], None],
 ]
 
 
@@ -37,8 +39,9 @@ def _invoke_rx_callback(
     data: bytes,
     rssi: int,
     snr: float,
+    radio_port: int = 0,
 ) -> None:
-    """Invoke RX callback with 1 or 3 args depending on what it accepts.
+    """Invoke RX callback with 1, 3, or 4 args depending on what it accepts.
 
     Tolerates ``None`` (a callback cleared between dispatch and invoke).
     """
@@ -49,7 +52,9 @@ def _invoke_rx_callback(
         nparams = len([p for p in sig.parameters if p != "self"])
     except (ValueError, TypeError):
         nparams = 1
-    if nparams >= 3:
+    if nparams >= 4:
+        callback(data, rssi, snr, radio_port)
+    elif nparams >= 3:
         callback(data, rssi, snr)
     else:
         callback(data)
@@ -74,6 +79,15 @@ KISS_CMD_TXTAIL = 0x04  # Post-TX hold time in 10ms units (default: 0)
 KISS_CMD_FULLDUPLEX = 0x05  # 0 = half duplex, nonzero = full duplex (default: 0)
 KISS_CMD_SETHARDWARE = 0x06  # SetHardware: first payload byte is sub-command
 KISS_CMD_RETURN = 0xFF  # Exit KISS mode (no-op)
+
+# KISS v2 maps MeshCore's time-shared radio profiles directly onto KISS data
+# ports.  Control / SetHardware commands remain on port 0.
+KISS_RADIO_PORT = 0
+KISS_RADIO2_PORT = 1
+KISS_DATA_PORTS = frozenset((KISS_RADIO_PORT, KISS_RADIO2_PORT))
+KISS_RADIO2_PARAMS_SIZE = 13
+KISS_TEMPRADIO2_PARAMS_SIZE = 15
+KISS_MAX_TEMPRADIO2_MINUTES = 10080
 
 # SetHardware request sub-commands (Host -> TNC, first data byte inside 0x06)
 HW_CMD_GET_IDENTITY = 0x01
@@ -102,6 +116,10 @@ HW_CMD_PING = 0x17
 HW_CMD_REBOOT = 0x18
 HW_CMD_SET_SIGNAL_REPORT = 0x19
 HW_CMD_GET_SIGNAL_REPORT = 0x1A
+HW_CMD_SET_RADIO2 = 0x1B
+HW_CMD_GET_RADIO2 = 0x1C
+HW_CMD_SET_TEMPRADIO2 = 0x1D
+HW_CMD_GET_TEMPRADIO2 = 0x1E
 
 # SetHardware response sub-commands (TNC -> Host)
 # Spec: response = command | 0x80 for command responses; 0xF0+ for generic/unsolicited
@@ -131,6 +149,8 @@ HW_RESP_ERROR = 0xF1
 HW_RESP_TX_DONE = 0xF8  # Unsolicited
 HW_RESP_RX_META = 0xF9  # Unsolicited
 HW_RESP_SIGNAL_REPORT = 0x9A  # HW_CMD_GET_SIGNAL_REPORT | 0x80
+HW_RESP_RADIO2 = 0x9C  # HW_CMD_GET_RADIO2 | 0x80
+HW_RESP_TEMPRADIO2 = 0x9E  # HW_CMD_GET_TEMPRADIO2 | 0x80
 
 # Backward-compatible aliases (same values as HW_*)
 CMD_GET_IDENTITY = HW_CMD_GET_IDENTITY
@@ -154,6 +174,10 @@ CMD_GET_STATS = HW_CMD_GET_STATS
 CMD_GET_BATTERY = HW_CMD_GET_BATTERY
 CMD_GET_SENSORS = HW_CMD_GET_SENSORS
 CMD_PING = HW_CMD_PING
+CMD_SET_RADIO2 = HW_CMD_SET_RADIO2
+CMD_GET_RADIO2 = HW_CMD_GET_RADIO2
+CMD_SET_TEMPRADIO2 = HW_CMD_SET_TEMPRADIO2
+CMD_GET_TEMPRADIO2 = HW_CMD_GET_TEMPRADIO2
 
 RESP_IDENTITY = HW_RESP_IDENTITY
 RESP_RANDOM = HW_RESP_RANDOM
@@ -177,6 +201,8 @@ RESP_STATS = HW_RESP_STATS
 RESP_BATTERY = HW_RESP_BATTERY
 RESP_PONG = HW_RESP_PONG
 RESP_SENSORS = HW_RESP_SENSORS
+RESP_RADIO2 = HW_RESP_RADIO2
+RESP_TEMPRADIO2 = HW_RESP_TEMPRADIO2
 
 # Error codes (SetHardware Error response payload)
 HW_ERR_INVALID_LENGTH = 0x01
@@ -250,9 +276,11 @@ class KissModemWrapper(LoRaRadio):
         The callback may accept either:
         - (data: bytes) - backward compatible, single argument
         - (data: bytes, rssi: int, snr: float) - per-packet signal metrics
+        - (data: bytes, rssi: int, snr: float, radio_port: int) - KISS v2
+          per-packet metrics plus the ``radio``/``radio2`` data port
 
-        When using the 3-argument form, rssi and snr are the values for that
-        specific packet, avoiding race conditions with get_last_rssi/get_last_snr.
+        In the extended forms, rssi and snr are the values for that specific
+        packet, avoiding race conditions with get_last_rssi/get_last_snr.
     """
 
     # Some SetHardware requests may legitimately respond with OK instead of the
@@ -262,6 +290,8 @@ class KissModemWrapper(LoRaRadio):
         HW_CMD_SET_TX_POWER,
         HW_CMD_SET_SIGNAL_REPORT,
         HW_CMD_REBOOT,
+        HW_CMD_SET_RADIO2,
+        HW_CMD_SET_TEMPRADIO2,
     }
 
     # Some SetHardware setters answer with the GET-form response code rather than
@@ -333,6 +363,11 @@ class KissModemWrapper(LoRaRadio):
         self.bandwidth = self.radio_config.get("bandwidth", int(62500))
         self.coding_rate = self.radio_config.get("coding_rate", 8)
         self.preamble_length = self.radio_config.get("preamble_length", 32)
+        # KISS v2's radio2/tempradio2 state is owned by the modem.  These
+        # cached copies are informational and are refreshed by the matching
+        # get methods; they do not replace the modem's configured profile.
+        self.radio2_config: Optional[Dict[str, Any]] = None
+        self.temporary_radio2_config: Optional[Dict[str, Any]] = None
 
         self.serial_conn: Optional[serial.Serial] = None
         self.is_connected = False
@@ -437,9 +472,11 @@ class KissModemWrapper(LoRaRadio):
         self._tx_last_verdict: Optional[str] = None
 
         # Pending RX data payloads (Data frame) awaiting their RxMeta frame.
-        # Each entry is (payload, deadline_monotonic); a frame is dispatched with
-        # sentinel metrics once its deadline passes if no RxMeta has arrived.
-        self._pending_rx_queue: deque[tuple[bytes, float]] = deque()
+        # Each entry is (payload, deadline_monotonic, radio_port); a frame is
+        # dispatched with sentinel metrics once its deadline passes if no RxMeta
+        # has arrived.  Retaining the port lets a KISS v2 caller map the packet to
+        # the profile which was active when the modem received it.
+        self._pending_rx_queue: deque[tuple[bytes, float, int]] = deque()
         self._pending_rx_lock = threading.Lock()
 
         self.stats = {
@@ -1237,12 +1274,14 @@ class KissModemWrapper(LoRaRadio):
             logger.error(f"Radio configuration error: {e}")
             return False
 
-    def send_frame(self, data: bytes) -> bool:
+    def send_frame(self, data: bytes, *, radio_port: int = KISS_RADIO_PORT) -> bool:
         """
         Send a data frame via KISS modem
 
         Args:
             data: Raw packet data to send (2-255 bytes)
+            radio_port: MeshCore KISS data port: ``0`` for ``radio`` or ``1``
+                for ``radio2``.  The default preserves legacy single-radio KISS.
 
         Returns:
             True if frame queued successfully, False otherwise
@@ -1257,9 +1296,14 @@ class KissModemWrapper(LoRaRadio):
             )
             return False
 
+        if radio_port not in KISS_DATA_PORTS:
+            logger.warning("Unsupported KISS data port: %s", radio_port)
+            return False
+
         try:
-            # Create KISS frame with CMD_DATA command
-            kiss_frame = self._encode_kiss_frame(CMD_DATA, data)
+            # Create a KISS data frame.  MeshCore KISS v2 chooses the radio
+            # profile from the port nibble rather than changing packet bytes.
+            kiss_frame = self._encode_kiss_frame(CMD_DATA, data, port=radio_port)
 
             # Add to TX buffer
             if len(self.tx_buffer) < TX_BUFFER_SIZE:
@@ -1274,11 +1318,16 @@ class KissModemWrapper(LoRaRadio):
             logger.error(f"Failed to send frame: {e}")
             return False
 
+    def send_radio2_frame(self, data: bytes) -> bool:
+        """Queue a raw packet for the saved/active ``radio2`` profile."""
+        return self.send_frame(data, radio_port=KISS_RADIO2_PORT)
+
     def send_frame_and_wait(
         self,
         data: bytes,
         timeout: float = RESPONSE_TIMEOUT,
         *,
+        radio_port: int = KISS_RADIO_PORT,
         verdict: Optional[list] = None,
     ) -> bool:
         """
@@ -1293,6 +1342,8 @@ class KissModemWrapper(LoRaRadio):
             data: Raw packet data to send
             timeout: Base timeout in seconds to wait for TX_DONE; extended to cover
                 the estimated airtime of long frames.
+            radio_port: MeshCore KISS data port: ``0`` for ``radio`` or ``1``
+                for ``radio2``.
 
         Returns:
             True only when the modem confirms the transmit with TX_DONE status 0x01.
@@ -1306,18 +1357,55 @@ class KissModemWrapper(LoRaRadio):
                 next send may already have replaced it. Pass a list to be given the
                 reason belonging to *this* call.
         """
-        ok, reason = self._send_frame_and_wait_verdict(data, timeout)
+        ok, reason = self._send_frame_and_wait_verdict(data, timeout, radio_port=radio_port)
         if verdict is not None:
             verdict.append(reason)
         return ok
+
+    def send_radio2_frame_and_wait(
+        self,
+        data: bytes,
+        timeout: float = RESPONSE_TIMEOUT,
+        *,
+        verdict: Optional[list] = None,
+    ) -> bool:
+        """Send on KISS port 1 and wait for the modem's TX completion frame."""
+        return self.send_frame_and_wait(
+            data,
+            timeout,
+            radio_port=KISS_RADIO2_PORT,
+            verdict=verdict,
+        )
 
     def _verdict(self, reason: str) -> tuple[bool, str]:
         """Record *reason* as the latest failure and return it to this caller."""
         self._tx_last_verdict = reason
         return (False, reason)
 
+    def _airtime_config_for_port(self, radio_port: int) -> Dict[str, Any]:
+        """Choose the best known on-air tuple for a KISS Data port.
+
+        A port-1 packet can use a much slower profile than primary ``radio``.
+        Using the primary tuple for the TX_DONE deadline would let a valid
+        secondary transmit time out on the host before the modem finishes it.
+        An expired temporary cache is merely conservative, which is preferable
+        to underestimating the wait.
+        """
+        if radio_port == KISS_RADIO2_PORT:
+            temporary = self.temporary_radio2_config
+            if temporary and temporary.get("mode") == 2 and temporary.get("active", True):
+                return temporary
+            saved = self.radio2_config
+            if saved and saved.get("mode") == 2:
+                return saved
+        return self.radio_config
+
     def _send_frame_and_wait_verdict(
-        self, data: bytes, timeout: float = RESPONSE_TIMEOUT
+        self,
+        data: bytes,
+        timeout: float = RESPONSE_TIMEOUT,
+        *,
+        radio_port: int = KISS_RADIO_PORT,
     ) -> tuple[bool, Optional[str]]:
         """:meth:`send_frame_and_wait`, returning (ok, reason) to the calling send.
 
@@ -1337,7 +1425,12 @@ class KissModemWrapper(LoRaRadio):
         # Extend the wait to cover real airtime; a high-SF flood advert can exceed the
         # flat command timeout, which would otherwise look like a spurious TX_DONE timeout.
         try:
-            airtime_s = PacketTimingUtils.estimate_airtime_ms(len(data), self.radio_config) / 1000.0
+            airtime_s = (
+                PacketTimingUtils.estimate_airtime_ms(
+                    len(data), self._airtime_config_for_port(radio_port)
+                )
+                / 1000.0
+            )
         except Exception:
             airtime_s = 0.0
         effective_timeout = max(timeout, airtime_s + TX_DONE_TIMEOUT_MARGIN_S)
@@ -1348,7 +1441,14 @@ class KissModemWrapper(LoRaRadio):
             self._tx_busy_seen = False
             self._tx_last_verdict = None
 
-            if not self.send_frame(data):
+            # Preserve the legacy call shape on port 0.  Besides backwards
+            # compatibility for subclasses, this keeps existing host test
+            # doubles that implement ``send_frame(data)`` working unchanged.
+            if radio_port == KISS_RADIO_PORT:
+                sent = self.send_frame(data)
+            else:
+                sent = self.send_frame(data, radio_port=radio_port)
+            if not sent:
                 return self._verdict("frame not written to the modem")
 
             # Poll in short slices so a shutdown or mid-flight link failure returns
@@ -1504,6 +1604,178 @@ class KissModemWrapper(LoRaRadio):
                 "coding_rate": cr,
             }
         return None
+
+    @staticmethod
+    def _pack_radio2_config(
+        frequency: int,
+        bandwidth: int,
+        spreading_factor: int,
+        coding_rate: int,
+        mode: int,
+        preamble_length: int,
+    ) -> bytes:
+        """Encode the fixed KISS v2 ``radio2`` tuple.
+
+        The wire layout deliberately follows the CLI order: frequency and
+        bandwidth in Hz, then SF, CR, mode (0=off, 1=RX, 2=RX+TX), and an
+        optional preamble in symbols (zero means automatic).
+        """
+        return struct.pack(
+            "<IIBBBH",
+            frequency,
+            bandwidth,
+            spreading_factor,
+            coding_rate,
+            mode,
+            preamble_length,
+        )
+
+    @staticmethod
+    def _unpack_radio2_config(payload: bytes) -> Optional[Dict[str, int]]:
+        """Decode the 13-byte KISS v2 ``radio2`` tuple, if complete."""
+        if len(payload) < KISS_RADIO2_PARAMS_SIZE:
+            return None
+        frequency, bandwidth, sf, cr, mode, preamble_length = struct.unpack(
+            "<IIBBBH", payload[:KISS_RADIO2_PARAMS_SIZE]
+        )
+        return {
+            "frequency": frequency,
+            "bandwidth": bandwidth,
+            "spreading_factor": sf,
+            "coding_rate": cr,
+            "mode": mode,
+            "preamble_length": preamble_length,
+        }
+
+    def set_radio2_config(
+        self,
+        frequency: int,
+        bandwidth: int,
+        spreading_factor: int,
+        coding_rate: int,
+        *,
+        mode: int = 2,
+        preamble_length: int = 0,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Set the saved secondary profile used by KISS data port 1.
+
+        This is the KISS equivalent of MeshCore's ``radio2`` command.  It is
+        kept in modem session state; the modem validates radio-specific values
+        and responds with an error if the profile cannot be scheduled safely.
+        """
+        try:
+            payload = self._pack_radio2_config(
+                frequency,
+                bandwidth,
+                spreading_factor,
+                coding_rate,
+                mode,
+                preamble_length,
+            )
+        except (struct.error, TypeError, ValueError) as exc:
+            logger.warning("Invalid radio2 configuration: %s", exc)
+            return False
+
+        response = self._send_command(
+            HW_CMD_SET_RADIO2,
+            payload,
+            timeout=timeout if timeout is not None else RESPONSE_TIMEOUT,
+        )
+        if not response or response[0] == HW_RESP_ERROR:
+            return False
+
+        self.radio2_config = self._unpack_radio2_config(payload)
+        # MeshCore intentionally leaves an active tempradio2 lease in place.
+        # The saved value becomes active only when that lease expires or is
+        # explicitly cancelled.
+        return True
+
+    def get_radio2_config(self, timeout: Optional[float] = None) -> Optional[Dict[str, int]]:
+        """Return the saved KISS v2 ``radio2`` profile from the modem."""
+        response = self._send_command(
+            HW_CMD_GET_RADIO2,
+            timeout=timeout if timeout is not None else RESPONSE_TIMEOUT,
+        )
+        if not response or response[0] != HW_RESP_RADIO2:
+            return None
+        config = self._unpack_radio2_config(response[1])
+        if config is not None:
+            self.radio2_config = config
+        return config
+
+    def set_temporary_radio2_config(
+        self,
+        frequency: int,
+        bandwidth: int,
+        spreading_factor: int,
+        coding_rate: int,
+        duration_minutes: int,
+        *,
+        mode: int = 2,
+        preamble_length: int = 0,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Temporarily override ``radio2`` for ``duration_minutes``.
+
+        The fixed 15-byte ``tempradio2`` request is the 13-byte ``radio2``
+        tuple followed by an unsigned little-endian minute count.  Expiry and
+        restoration of the saved secondary profile occur inside the modem.
+        """
+        try:
+            payload = self._pack_radio2_config(
+                frequency,
+                bandwidth,
+                spreading_factor,
+                coding_rate,
+                mode,
+                preamble_length,
+            ) + struct.pack("<H", duration_minutes)
+        except (struct.error, TypeError, ValueError) as exc:
+            logger.warning("Invalid temporary radio2 configuration: %s", exc)
+            return False
+
+        response = self._send_command(
+            HW_CMD_SET_TEMPRADIO2,
+            payload,
+            timeout=timeout if timeout is not None else RESPONSE_TIMEOUT,
+        )
+        if not response or response[0] == HW_RESP_ERROR:
+            return False
+
+        config = self._unpack_radio2_config(payload)
+        if mode == 0 and duration_minutes == 0:
+            self.temporary_radio2_config = None
+        elif config is not None:
+            config["remaining_minutes"] = duration_minutes
+            config["active"] = True
+            self.temporary_radio2_config = config
+        return True
+
+    def get_temporary_radio2_config(
+        self, timeout: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return KISS v2 ``tempradio2`` data, including its ``active`` flag."""
+        response = self._send_command(
+            HW_CMD_GET_TEMPRADIO2,
+            timeout=timeout if timeout is not None else RESPONSE_TIMEOUT,
+        )
+        if (
+            not response
+            or response[0] != HW_RESP_TEMPRADIO2
+            or len(response[1]) < KISS_TEMPRADIO2_PARAMS_SIZE
+        ):
+            return None
+        config = self._unpack_radio2_config(response[1])
+        if config is None:
+            return None
+        config["remaining_minutes"] = struct.unpack(
+            "<H", response[1][KISS_RADIO2_PARAMS_SIZE:KISS_TEMPRADIO2_PARAMS_SIZE]
+        )[0]
+        active = config["mode"] != 0 and config["remaining_minutes"] != 0
+        config["active"] = active
+        self.temporary_radio2_config = config if active else None
+        return config
 
     def set_tx_power(self, power: int) -> bool:
         """Set TX power in dBm.
@@ -1846,9 +2118,10 @@ class KissModemWrapper(LoRaRadio):
         """
         Set the RX callback function.
 
-        The callback may be (data: bytes) or (data, rssi, snr). When invoked
-        by this wrapper it is always called with (data, rssi, snr) so each
-        packet gets correct per-packet metrics without race conditions.
+        The callback may be (data: bytes), (data, rssi, snr), or the KISS v2
+        form (data, rssi, snr, radio_port).  Extended forms get per-packet
+        metrics without race conditions; ``radio_port`` is 0 for ``radio`` and
+        1 for ``radio2``.
         """
         self.on_frame_received = callback
         logger.debug("RX callback set")
@@ -2105,19 +2378,29 @@ class KissModemWrapper(LoRaRadio):
 
     # KISS frame encoding/decoding
 
-    def _encode_kiss_frame(self, cmd: int, data: bytes) -> bytes:
+    def _encode_kiss_frame(
+        self, cmd: int, data: bytes, *, port: int = KISS_RADIO_PORT
+    ) -> bytes:
         """
         Encode data into KISS frame format
 
         Args:
-            cmd: Command byte
+            cmd: KISS command nibble, or ``KISS_CMD_RETURN``
             data: Raw data to encode
+            port: KISS port for ordinary commands.  MeshCore KISS v2 uses data
+                port 0 for ``radio`` and 1 for ``radio2``; SetHardware remains
+                on port 0.
 
         Returns:
             Encoded KISS frame
         """
-        # Start with FEND and command
-        frame = bytearray([KISS_FEND, cmd])
+        if not 0 <= port <= 0x0F:
+            raise ValueError(f"Invalid KISS port: {port}")
+        # Return is a complete KISS type byte, not a port-zero command nibble.
+        type_byte = KISS_CMD_RETURN if cmd == KISS_CMD_RETURN else ((port << 4) | (cmd & 0x0F))
+
+        # Start with FEND and type byte
+        frame = bytearray([KISS_FEND, type_byte])
 
         # Escape and add data
         for byte in data:
@@ -2260,7 +2543,9 @@ class KissModemWrapper(LoRaRadio):
         self.in_frame = in_frame
         self.escaped = escaped
 
-    def _dispatch_rx_callback(self, data: bytes, rssi: int, snr: float) -> None:
+    def _dispatch_rx_callback(
+        self, data: bytes, rssi: int, snr: float, radio_port: int = KISS_RADIO_PORT
+    ) -> None:
         """
         Dispatch RX callback without blocking the RX thread.
 
@@ -2273,6 +2558,8 @@ class KissModemWrapper(LoRaRadio):
             data: Received packet data
             rssi: RSSI in dBm
             snr: SNR in dB
+            radio_port: KISS data port on which the packet arrived (``0`` for
+                ``radio`` and ``1`` for ``radio2``).
         """
         # Snapshot once: the callback can be cleared concurrently (dispatcher
         # RX disarm, wait_for_rx swap), so re-reading the attribute at invoke
@@ -2284,7 +2571,7 @@ class KissModemWrapper(LoRaRadio):
         if self._event_loop is not None:
             try:
                 self._event_loop.call_soon_threadsafe(
-                    lambda: _invoke_rx_callback(callback, data, rssi, snr)
+                    lambda: _invoke_rx_callback(callback, data, rssi, snr, radio_port)
                 )
             except RuntimeError as e:
                 logger.warning(f"Failed to schedule RX callback on event loop: {e}")
@@ -2292,10 +2579,12 @@ class KissModemWrapper(LoRaRadio):
             # We're in the RX thread; run callback in executor so we don't block reading
             if self._callback_executor is None:
                 self._callback_executor = ThreadPoolExecutor(max_workers=1)
-            self._callback_executor.submit(_invoke_rx_callback, callback, data, rssi, snr)
+            self._callback_executor.submit(
+                _invoke_rx_callback, callback, data, rssi, snr, radio_port
+            )
         else:
             # Called from main thread (e.g. unit test); invoke directly
-            _invoke_rx_callback(callback, data, rssi, snr)
+            _invoke_rx_callback(callback, data, rssi, snr, radio_port)
 
     def _process_received_frame(self):
         """Process a complete received KISS frame (spec: type byte = port | cmd)."""
@@ -2306,14 +2595,14 @@ class KissModemWrapper(LoRaRadio):
         port = (type_byte >> 4) & 0x0F
         cmd = type_byte & 0x0F
 
-        # Only process port 0 (single-port TNC)
-        if port != 0:
-            return
-
-        self.stats["frames_received"] += 1
-        self.stats["bytes_received"] += len(self.rx_frame_buffer) - 1
-
         if cmd == CMD_DATA:
+            # KISS v2 exposes the two time-shared on-board profiles as data
+            # ports.  The payload stays raw MeshCore bytes and RxMeta remains
+            # unchanged; the port itself identifies the profile.
+            if port not in KISS_DATA_PORTS:
+                return
+            self.stats["frames_received"] += 1
+            self.stats["bytes_received"] += len(self.rx_frame_buffer) - 1
             # Data frame: raw packet only (≤255 bytes per spec). Queue it with a
             # deadline; RxMeta (only sent when signal reporting is on) pairs metrics,
             # otherwise the frame is flushed with sentinel metrics once it times out.
@@ -2327,9 +2616,11 @@ class KissModemWrapper(LoRaRadio):
                     )
                 else:
                     deadline = time.monotonic() + RX_META_WAIT_SECONDS
-                    self._pending_rx_queue.append((payload, deadline))
+                    self._pending_rx_queue.append((payload, deadline, port))
 
-        elif cmd == KISS_CMD_SETHARDWARE:
+        elif cmd == KISS_CMD_SETHARDWARE and port == KISS_RADIO_PORT:
+            self.stats["frames_received"] += 1
+            self.stats["bytes_received"] += len(self.rx_frame_buffer) - 1
             # SetHardware: first byte is sub_cmd, rest is payload
             if len(self.rx_frame_buffer) < 2:
                 return
@@ -2352,13 +2643,12 @@ class KissModemWrapper(LoRaRadio):
                     self.stats["last_rssi"] = rssi_raw
                     self.stats["rx_packets"] += 1
                 with self._pending_rx_lock:
-                    packet_data = (
-                        self._pending_rx_queue.popleft()[0] if self._pending_rx_queue else None
-                    )
-                if packet_data is not None:
+                    pending = self._pending_rx_queue.popleft() if self._pending_rx_queue else None
+                if pending is not None:
+                    packet_data, _deadline, radio_port = pending
                     if self.on_frame_received:
                         try:
-                            self._dispatch_rx_callback(packet_data, rssi_raw, snr_db)
+                            self._dispatch_rx_callback(packet_data, rssi_raw, snr_db, radio_port)
                         except Exception as e:
                             logger.error(f"Error in frame received callback: {e}")
                 else:
@@ -2432,11 +2722,11 @@ class KissModemWrapper(LoRaRadio):
             with self._pending_rx_lock:
                 if not self._pending_rx_queue or self._pending_rx_queue[0][1] > now:
                     break
-                payload = self._pending_rx_queue.popleft()[0]
+                payload, _deadline, radio_port = self._pending_rx_queue.popleft()
                 self.stats["rx_packets"] += 1
             if self.on_frame_received:
                 try:
-                    self._dispatch_rx_callback(payload, -999, -999.0)
+                    self._dispatch_rx_callback(payload, -999, -999.0, radio_port)
                 except Exception as e:
                     logger.error(f"Error in frame received callback: {e}")
 
