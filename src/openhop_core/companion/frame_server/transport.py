@@ -55,6 +55,20 @@ class _FrameTransportMixin:
             hash_int,
         )
 
+    async def attach(self, sock: socket.socket) -> None:
+        """Serve one client over an already-connected socket.
+
+        The TCP acceptor is not the only way in: a host that already holds the
+        client's bytes (a WebSocket proxy in the same process) can hand one end
+        of a ``socket.socketpair()`` here and skip the listener entirely, so a
+        client that reaches the host is never turned away because the TCP
+        listener failed to bind. The client takes the same path, and the same
+        single slot, as one that arrived over TCP; the call returns when that
+        client disconnects.
+        """
+        reader, writer = await asyncio.open_connection(sock=sock)
+        await self._handle_client(reader, writer)
+
     async def stop(self) -> None:
         """Stop the TCP server and disconnect any client."""
         # Signal writer task to stop and wait for it
