@@ -426,6 +426,15 @@ class RFFabric:
                 logger.warning("Radio %s health check failed: %s", radio_id, exc)
         return healthy
 
+    async def reset_agc(self) -> None:
+        """Reset the AGC of each registered radio that supports it."""
+        for radio_id, radio in list(self._radios.items()):
+            if hasattr(radio, "reset_agc"):
+                try:
+                    await radio.reset_agc()
+                except Exception as exc:
+                    logger.warning("Radio %s AGC reset failed: %s", radio_id, exc)
+
     def __getattr__(self, name: str) -> Any:
         """Attribute pass-through for radio settings used by Dispatcher."""
         if name.startswith("_"):

@@ -1474,6 +1474,35 @@ class SX1262Radio(LoRaRadio):
         except Exception as e:
             logger.warning(f"[RX] Failed to restore RX mode: {e}")
 
+    async def reset_agc(self) -> None:
+        """Reset the receiver's AGC unless a packet is in flight.
+
+        Parity with MeshCore RadioLibWrapper::resetAGC() and SX126xReset.h: warm
+        sleep and a full calibration, then the RX settings are re-applied and RX
+        restarts.
+        """
+        if not self._initialized or self.lora is None or self._tx_lock.locked():
+            return
+        async with self._tx_lock:
+            if (
+                self._is_receiving_packet
+                or self._pending_rx_irq_status
+                or self.is_receiving_packet()
+                or self.lora.getIrqStatus() & self._get_rx_irq_mask()
+            ):
+                return
+            try:
+                self.lora.sleep()
+                self.lora.wake()
+                self.lora.calibrate(0x7F)
+                # Calibrate(0x7F) leaves image calibration at 902-928 MHz
+                self.lora.setFrequency(self.frequency)
+                self.lora.setDio2RfSwitch(self.use_dio2_rf)
+                self.lora.setRxGain(self.lora.RX_GAIN_BOOSTED)
+                self._apply_rx_sensitivity_fix()
+            finally:
+                await self._restore_rx_mode()
+
     async def send(self, data: bytes) -> dict:
         """Send a packet asynchronously. Returns transmission metadata including LBT metrics."""
         if not self._initialized or self.lora is None:

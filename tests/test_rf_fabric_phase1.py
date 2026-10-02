@@ -12,7 +12,7 @@ Covers the production-safe foundation only:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from openhop_core.node.dispatcher import Dispatcher
@@ -121,6 +121,21 @@ class TestRFFabricSingleRadio:
         fabric.register_radio(radio)
         await fabric.send(b"tx")
         assert radio.sent == [b"tx"]
+
+
+@pytest.mark.asyncio
+async def test_fabric_resets_agc_on_each_radio_that_supports_it():
+    ok, failing = _MockRadio(), _MockRadio()
+    ok.reset_agc = AsyncMock()
+    failing.reset_agc = AsyncMock(side_effect=RuntimeError("BUSY stuck"))
+    fabric = RFFabric()
+    for rid, radio in (("a", failing), ("b", ok), ("c", _MockRadio())):
+        fabric.register_radio(radio, radio_id=rid)
+
+    # The dispatcher holds a FabricRadio, which passes reset_agc through.
+    await FabricRadio(fabric=fabric).reset_agc()
+    failing.reset_agc.assert_awaited_once()
+    ok.reset_agc.assert_awaited_once()
 
 
 class TestFabricRadioDispatcherPath:
