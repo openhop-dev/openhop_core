@@ -490,6 +490,26 @@ class TestCompanionRadioStats:
         assert "direct_rx" in tot
         assert "tx_errors" in tot
 
+    def test_get_stats_radio_surfaces_cached_noise_floor(self):
+        class NoiseRadio(MockRadio):
+            def get_cached_noise_floor(self):
+                return -119.5
+
+        radio_stats = CompanionRadio(NoiseRadio(), LocalIdentity()).get_stats(1)
+        assert radio_stats["noise_floor"] == -119.5
+
+    def test_get_stats_radio_omits_noise_floor_without_a_measurement(self):
+        class NoNoiseYetRadio(MockRadio):
+            def get_cached_noise_floor(self):
+                return None
+
+        class BlockingOnlyRadio(MockRadio):
+            def get_noise_floor(self):
+                raise AssertionError("blocking get_noise_floor called")
+
+        for radio in (NoNoiseYetRadio(), BlockingOnlyRadio(), MockRadio()):
+            assert "noise_floor" not in CompanionRadio(radio, LocalIdentity()).get_stats(1)
+
 
 # ---------------------------------------------------------------------------
 # Binary request and repeater command (delegate to node)
