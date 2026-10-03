@@ -101,7 +101,8 @@ class _FrameTransportMixin:
             # Firmware writeFrame() refuses (returns 0) rather than truncating; a
             # truncated frame would corrupt the response. Drop it instead.
             logger.warning(
-                "Outbound frame payload too large (%s > %s); dropping frame",
+                "Outbound frame payload too large (code=0x%02x, %s > %s); dropping frame",
+                data[0],
                 len(data),
                 MAX_PAYLOAD_SIZE,
             )
