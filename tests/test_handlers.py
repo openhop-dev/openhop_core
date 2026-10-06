@@ -2354,8 +2354,11 @@ class TestLoginServerHandler:
 
         self.handler.set_send_packet_callback(capture_send)
 
-    def _build_login_packet(self, password="admin123", route_type="flood", path=None):
-        """Build an ANON_REQ login packet the same way the client does."""
+    def _build_login_packet(
+        self, password="admin123", route_type="flood", path=None, sync_since=None
+    ):
+        """Build an ANON_REQ login packet the same way the client does (room server format when
+        ``sync_since`` is given)."""
         client_pubkey = self.client_identity_local.get_public_key()
         server_pubkey = self.server_identity.get_public_key()
 
@@ -2365,8 +2368,10 @@ class TestLoginServerHandler:
         aes_key = shared_secret[:16]
 
         # Repeater format plaintext: timestamp(4) + password + null
+        # Room server format: timestamp(4) + sync_since(4) + password + null
         timestamp = int(time.time())
-        plaintext = struct.pack("<I", timestamp) + password.encode("utf-8") + b"\x00"
+        room = b"" if sync_since is None else struct.pack("<I", sync_since)
+        plaintext = struct.pack("<I", timestamp) + room + password.encode("utf-8") + b"\x00"
         encrypted = CryptoUtils.encrypt_then_mac(aes_key, shared_secret, plaintext)
 
         # ANON_REQ payload: dest_hash(1) + client_pubkey(32) + encrypted_data
@@ -2708,6 +2713,37 @@ class TestLoginServerHandler:
 
         fw_ver = login_reply[12]
         assert fw_ver == FIRMWARE_VER_LEVEL
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("room_server", [False, True])
+    async def test_login_logs_neither_the_plaintext_nor_the_password(
+        self, monkeypatch, room_server
+    ):
+        """The decrypted login carries the password: its two lines are still logged, in the same
+        order and wording, with only the hex value replaced by ****** (#156)."""
+        monkeypatch.setattr(time, "time", lambda: 1700000000)
+        self.handler.is_room_server = room_server
+        password = "s3cret-pass"
+        sync_since = 7 if room_server else None
+        room = b"" if sync_since is None else struct.pack("<I", sync_since)
+        plaintext = struct.pack("<I", 1700000000) + room + password.encode("utf-8") + b"\x00"
+        await self.handler(self._build_login_packet(password=password, sync_since=sync_since))
+
+        assert self.auth_callback.call_args.args[2] == password  # decrypted and parsed
+        lines = [str(c.args[0]) for c in self.log_fn.call_args_list]
+        for line in lines:
+            assert plaintext.hex() not in line
+            assert password.encode("utf-8").hex() not in line
+            assert password not in line
+        masked = [
+            line
+            for line in lines
+            if line.startswith(("[LoginServer] Plaintext hex", "[LoginServer] Password hex"))
+        ]
+        expected = ["[LoginServer] Plaintext hex: ******"]
+        if room_server:
+            expected.append("[LoginServer] Password hex: ******")
+        assert masked == expected
 
     @pytest.mark.asyncio
     async def test_failed_auth_sends_no_response(self):
