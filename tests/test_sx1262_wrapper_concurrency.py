@@ -1262,6 +1262,44 @@ class TestNoiseFloorSampling:
 # ===========================================================================
 
 
+class TestAgcReset:
+    """reset_agc(): MeshCore's SX126x AGC reset, only while RX is idle."""
+
+    @pytest.mark.asyncio
+    async def test_resets_then_restores_rx(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = 0
+        await radio.reset_agc()
+
+        order = ["sleep", "wake", "calibrate", "setFrequency", "setDio2RfSwitch", "setRxGain"]
+        order.append("request")  # RX_CONTINUOUS, from _restore_rx_mode
+        assert [c[0] for c in mock_lora.method_calls if c[0] in order] == order
+        mock_lora.calibrate.assert_called_once_with(0x7F)
+        mock_lora.setFrequency.assert_called_once_with(radio.frequency)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("busy", ["tx", "processing", "pending_irq", "chip_preamble"])
+    async def test_skipped_while_busy(self, radio, mock_lora, busy):
+        chip_irq = IRQ_PREAMBLE_DETECTED if busy == "chip_preamble" else 0
+        mock_lora.getIrqStatus.return_value = chip_irq
+        radio._is_receiving_packet = busy == "processing"
+        radio._pending_rx_irq_status = IRQ_RX_DONE if busy == "pending_irq" else 0
+        if busy == "tx":
+            await radio._tx_lock.acquire()
+
+        await radio.reset_agc()
+        mock_lora.sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_failure_still_restores_rx(self, radio, mock_lora):
+        mock_lora.getIrqStatus.return_value = 0
+        mock_lora.calibrate.side_effect = RuntimeError("BUSY stuck")
+
+        with pytest.raises(RuntimeError):
+            await radio.reset_agc()
+        mock_lora.request.assert_called_once_with(mock_lora.RX_CONTINUOUS)
+        assert not radio._tx_lock.locked()
+
+
 class TestTxAirtimeCalculation:
     """_calculate_tx_timeout must produce sensible LoRa airtime values."""
 
