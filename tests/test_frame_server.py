@@ -1377,6 +1377,7 @@ async def test_evicted_handler_cleanup_does_not_cancel_new_writer_task():
     """Old handler finally block must not tear down new client writer state."""
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
 
     first_release = asyncio.Event()
@@ -1422,6 +1423,7 @@ async def test_handle_client_idle_timeout_disconnects_cleanly(caplog):
     caplog.set_level(logging.INFO, logger="CompanionFrameServer")
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=0.01)
 
     await server._handle_client(_NeverReader(), _DummyWriter())
@@ -1438,6 +1440,7 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     caplog.set_level(logging.INFO, logger="CompanionFrameServer")
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
 
     await server._handle_client(_RaisingReader(ConnectionResetError("boom")), _DummyWriter())
@@ -1446,6 +1449,31 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_handle_client_queue_fits_contact_dump_above_default_limit():
+    """A raised max_contacts must not drop the tail of a full contact dump."""
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 2130
+    bridge.get_contacts = Mock(return_value=[_contact()] * 2130)
+    bridge.get_contact_count = Mock(return_value=2130)
+    server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
+    release = asyncio.Event()
+    task = asyncio.create_task(server._handle_client(_BlockingReader(release), _DummyWriter()))
+    for _ in range(50):
+        if server._writer_task is not None:
+            break
+        await asyncio.sleep(0)
+    queue = server._write_queue
+
+    await server._cmd_get_contacts(b"")
+
+    assert queue.qsize() == 2132  # START + 2130 contacts + END
+
+    release.set()
+    await task
 
 
 class _FakeSocket:

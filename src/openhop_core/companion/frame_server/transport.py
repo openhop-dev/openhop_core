@@ -10,6 +10,7 @@ from typing import Optional
 
 from ..constants import (
     BINARY_REQ_TIMEOUT_HINT_MS,
+    DEFAULT_MAX_CONTACTS,
     FRAME_INBOUND_PREFIX,
     FRAME_OUTBOUND_PREFIX,
     MAX_FRAME_SIZE,
@@ -152,6 +153,7 @@ class _FrameTransportMixin:
 
     # Must exceed DEFAULT_MAX_CONTACTS (+2 for START/END) so that
     # _cmd_get_contacts can enqueue the full contact dump without drops.
+    # _handle_client adds any max_contacts above that default.
     _WRITE_QUEUE_MAXSIZE = 2048
     # Drain after every frame so clients that count one TCP receive per response
     # (e.g. _receive_count per data_received()) stay in sync with sends.
@@ -319,7 +321,8 @@ class _FrameTransportMixin:
         self._client_reader = reader
         self._client_writer = writer
         self._configure_socket(writer)
-        local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE)
+        extra = max(0, self.bridge.contacts.max_contacts - DEFAULT_MAX_CONTACTS)
+        local_write_queue: asyncio.Queue = asyncio.Queue(maxsize=self._WRITE_QUEUE_MAXSIZE + extra)
         self._write_queue = local_write_queue
         self._setup_push_callbacks()
         logger.info("Companion client connected (port=%s)", self.port)
