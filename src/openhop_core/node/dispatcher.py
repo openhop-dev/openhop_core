@@ -199,6 +199,11 @@ class Dispatcher:
         # firmware default. Synced from prefs/config by the owning layer.
         self.rx_delay_base: float = 0.0
 
+        # AGC reset interval in seconds (MeshCore agc.reset.interval); 0 is off.
+        # Synced from prefs/config by the owning layer, like rx_delay_base.
+        self.agc_reset_interval: int = 0
+        self._last_agc_reset_at = 0.0
+
         # Client-repeat forwarding (MeshCore _prefs.client_repeat). Off by
         # default; only CompanionRadio.set_client_repeat toggles it. Nodes that
         # do their own forwarding (e.g. the repeater) leave this False.
@@ -1508,6 +1513,18 @@ class Dispatcher:
 
                 # Clean old packet hashes for deduplication
                 self.packet_filter.cleanup_old_hashes()
+
+                # Reset the radio AGC every agc_reset_interval seconds
+                if (
+                    self.agc_reset_interval > 0
+                    and now - self._last_agc_reset_at >= self.agc_reset_interval
+                    and hasattr(self.radio, "reset_agc")
+                ):
+                    self._last_agc_reset_at = now
+                    try:
+                        await self.radio.reset_agc()
+                    except Exception as e:
+                        self._logger.warning(f"AGC reset failed: {e}")
 
                 # Simple health check every 60 seconds
                 health_check_counter += 1
