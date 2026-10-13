@@ -1188,3 +1188,104 @@ async def test_started_request_retry_loop_floods_every_retry():
     assert all(p.is_route_flood() for p in sender.sent), "every retry floods"
     assert proxy.out_path_len == OUT_PATH_LEN
     assert sender.scoped == sender.sent
+
+
+# --------------------------------------------------------------------------- #
+# A copy delivered in-process (multi-identity host) is never displaced by an echo
+# --------------------------------------------------------------------------- #
+
+ZERO_HOP_LEN = PathUtils.encode_path_len(2, 0)
+# Our own flood relayed straight back by a repeater next to the host: one hop,
+# and a last hop as strong as a bench neighbour gets.
+ECHO_1HOP = bytes([0x87, 0x04])
+ECHO_1HOP_LEN = PathUtils.encode_path_len(2, 1)
+
+
+def _in_process_copy() -> Packet:
+    """The zero-hop copy a multi-identity host hands a co-hosted peer without RF.
+
+    The repeater's inject path marks it ``_injected_for_tx`` before the local
+    fan-out; its RSSI/SNR are 0 because no radio measured it.
+    """
+    pkt = _flood_path_packet()
+    pkt.path = bytearray()
+    pkt.path_len = ZERO_HOP_LEN
+    pkt._rssi = 0
+    pkt._snr = 0
+    pkt._injected_for_tx = True
+    return pkt
+
+
+def _echo_of(pkt: Packet) -> Packet:
+    echo = _copy_of(pkt, in_path=ECHO_1HOP, rssi=-16, len_byte=ECHO_1HOP_LEN)
+    echo._snr = 13.2
+    return echo
+
+
+@pytest.mark.asyncio
+async def test_reteach_never_replaces_an_in_process_copy_with_an_echo():
+    """Seen on a two-board bench: the host sent a flood PATH between two of its
+    own identities, a repeater next to it re-flooded it, and the echo (1 hop,
+    23 dB margin) re-taught the co-hosted peer a route through that repeater.
+    From then on their traffic went over the air. The in-process copy carries
+    no RF measurement but is zero-hop and loss-free; nothing heard can beat it.
+    """
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    local = _in_process_copy()
+
+    teacher.seed_copy(local)
+    teacher.note_flood_copy(_echo_of(local))
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(local, taught_path=b"", taught_len_byte=ZERO_HOP_LEN)
+    )
+
+    assert sent is False
+    assert injector.packets == []
+
+
+@pytest.mark.asyncio
+async def test_seeded_radio_copy_is_still_replaced_by_a_better_one():
+    """Seeding the copy in hand must not freeze a genuinely worse radio route:
+    the in-process tier is for host-delivered copies only."""
+    injector = _Injector()
+    teacher = _teacher(injector=injector)
+    first = _flood_path_packet()
+    first._rssi = -100
+
+    teacher.seed_copy(first)
+    teacher.note_flood_copy(_copy_of(first, in_path=SHORT_2HOP, rssi=-40, len_byte=SHORT_2HOP_LEN))
+
+    sent = await teacher.maybe_reteach_better_copy(
+        **_reteach_kwargs(first, taught_path=IN_PATH, taught_len_byte=IN_PATH_LEN)
+    )
+
+    assert sent is True
+    assert _decode_teach(injector.packets[0])[1] == SHORT_2HOP
+
+
+@pytest.mark.asyncio
+async def test_reciprocal_after_in_process_login_is_not_retaught_by_an_echo():
+    """End-to-end through the handler: the reciprocal PATH goes out on the
+    in-process copy, and the echo landing during the settle window must not
+    trigger a corrective re-teach. Before the fix this sent two packets."""
+    injector = _Injector()
+    handler = ProtocolResponseHandler(lambda _m: None, LOCAL_IDENTITY, _contacts())
+    handler.set_packet_injector(injector)
+    teacher = handler.return_path_teacher
+    local = _in_process_copy()
+
+    async def echo_lands_while_settling(_seconds):
+        teacher.note_flood_copy(_echo_of(local))
+
+    teacher._settle_s = 0.01
+    teacher._settle = echo_lands_while_settling
+
+    await handler(local)
+    await handler.wait_for_pending_reciprocals()
+    await teacher.wait_for_pending()
+
+    assert len(injector.packets) == 1  # the reciprocal only
+    _, embedded = _decode_teach(injector.packets[0])
+    assert embedded == b""
