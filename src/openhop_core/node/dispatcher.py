@@ -631,6 +631,12 @@ class Dispatcher:
         # Multi-radio: stamp which fabric radio delivered this frame (if known).
         if rx_radio_id is not None:
             pkt._rx_radio_id = rx_radio_id
+        # The path hash width of a received frame belongs to its originator.
+        # A repeater forwarding it may strip the last hop (direct forward drops
+        # the count to 0) and send this very object, and firmware never
+        # re-widths a forwarded packet -- so the node default must not touch
+        # it. read_from() cleared the marker; set it once the frame is ours.
+        pkt._path_hash_mode_applied = True
 
         # Capture the region this packet arrived under before any handler
         # runs, so a reply builder can scope its reply to that region. No-op when
@@ -750,11 +756,13 @@ class Dispatcher:
         self._scope_packet(pkt, key)
 
     def set_default_path_hash_mode(self, mode: Optional[int]) -> None:
-        """Set or clear the default path hash mode for flood packets with 0 hops.
+        """Set or clear the default path hash mode for packets this node originates.
 
-        When set, packets sent via send_packet() that have not already had path
-        hash mode applied (e.g. by the companion) will get path_len bits 6-7
-        set from this mode. Companion-originated packets are never overwritten.
+        When set, zero-hop packets sent via send_packet() -- flood or direct --
+        that have not already had path hash mode applied (e.g. by the companion)
+        will get path_len bits 6-7 set from this mode. Companion-originated
+        packets are never overwritten, and neither are received packets being
+        forwarded: their width belongs to the originator.
 
         Args:
             mode: 0=1-byte, 1=2-byte, 2=3-byte per hop; None to disable.
@@ -767,9 +775,15 @@ class Dispatcher:
         """Apply dispatcher default path hash mode if set and packet is eligible."""
         if self.path_hash_mode is None:
             return
-        route_type = pkt.get_route_type()
-        if route_type not in (ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD):
-            return
+        # Route type deliberately does not gate the default: locally
+        # originated DIRECT sends (companion DMs, zero-hop server replies)
+        # need the node width just like flood origins, otherwise they leave
+        # with a 1-byte path hash and analyzers attribute the node as
+        # 1-byte. Pre-widthed packets carry the _path_hash_mode_applied
+        # marker and stay untouched; so do received packets, which the RX
+        # path marks (_process_received_packet) -- a direct forward reaches
+        # 0 hops on its last hop, so the hop count alone does not tell a
+        # forward from an origin.
         if pkt.get_path_hash_count() != 0:
             return
         if getattr(pkt, "_path_hash_mode_applied", False):

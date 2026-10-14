@@ -606,6 +606,87 @@ class TestDispatcherSendPacket:
         assert path_len_byte == 0x40
 
     @pytest.mark.asyncio
+    async def test_default_path_hash_mode_applied_to_direct_origin(self, dispatcher):
+        """Zero-hop DIRECT origins get the node default width too, not only floods.
+
+        A locally originated direct send (companion DM, a server reply built
+        without a request width to mirror) used to leave with a 1-byte path
+        hash regardless of the configured default. Analyzers attribute hash
+        width from observed origin packets, so a node configured for 2-byte
+        hashes was flagged as 1-byte on the map. Forwarded and pre-widthed
+        packets carry the ``_path_hash_mode_applied`` marker (see the received
+        direct forward test below), so route type must not gate the default.
+        """
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
+
+        dispatcher.set_default_path_hash_mode(1)  # 2-byte hashes
+        pkt = Packet()
+        pkt.header = (1 << 6) | (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        pkt.path_len = 0
+        pkt.path = bytearray()
+        pkt.payload = bytearray(b"direct_payload")
+        pkt.payload_len = len(pkt.payload)
+
+        await dispatcher.send_packet(pkt)
+
+        raw = dispatcher.radio.tx_data
+        assert raw is not None
+        assert raw[1] == 0x40
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "origin_hash_size, node_mode",
+        [(1, 1), (3, 1), (2, 0)],
+        ids=["1B-origin-2B-node", "3B-origin-2B-node", "2B-origin-1B-node"],
+    )
+    async def test_received_direct_forward_keeps_originator_width_on_last_hop(
+        self, dispatcher, origin_hash_size, node_mode
+    ):
+        """A direct packet forwarded on its last hop leaves at the originator's width.
+
+        The repeater's direct forward strips this node's hash, which takes the
+        last hop to a count of 0, and sends the received object. At count 0 the
+        hop guard no longer tells it from an origin, so without the RX marker
+        the node default re-widthed it -- a 1-byte origin left as 0x40 and
+        analyzers attributed the originator at the forwarder's width. Firmware
+        never re-widths a forwarded packet.
+
+        Drives the real RX path: raw frame -> _process_received_packet ->
+        the forward the repeater does (deepcopy, strip one hop) -> send_packet.
+        """
+        import copy
+
+        from openhop_core.protocol.constants import PH_TYPE_SHIFT
+
+        dispatcher.set_default_path_hash_mode(node_mode)
+        assert node_mode + 1 != origin_hash_size  # otherwise the test proves nothing
+
+        rx = Packet()
+        rx.header = (PAYLOAD_TYPE_TXT_MSG << PH_TYPE_SHIFT) | ROUTE_TYPE_DIRECT
+        rx.path = bytearray(b"\xab" * origin_hash_size)  # this node is the last hop
+        rx.path_len = PathUtils.encode_path_len(origin_hash_size, 1)
+        rx.payload = bytearray(b"\x12\x34" + b"ciphertext-ish")
+        rx.payload_len = len(rx.payload)
+
+        received = []
+        dispatcher.packet_analysis_callback = lambda pkt, data: received.append(pkt)
+        await dispatcher._process_received_packet(rx.write_to())
+        assert len(received) == 1
+
+        # What repeater/engine.py does: process a deepcopy, then direct_forward
+        # strips the first hash and re-encodes the count at the packet's width.
+        fwd = copy.deepcopy(received[0])
+        size = fwd.get_path_hash_size()
+        fwd.path = bytearray(fwd.path[size:])
+        fwd.path_len = PathUtils.encode_path_len(size, 0)
+
+        await dispatcher.send_packet(fwd)
+
+        raw = dispatcher.radio.tx_data
+        assert raw is not None
+        assert raw[1] == PathUtils.encode_path_len(origin_hash_size, 0)
+
+    @pytest.mark.asyncio
     async def test_path_hash_mode_not_overwritten_when_companion_applied(self, dispatcher):
         """Packet with _path_hash_mode_applied is not overwritten by dispatcher default."""
         from openhop_core.protocol.constants import PH_TYPE_SHIFT
