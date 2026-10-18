@@ -263,7 +263,7 @@ class Packet:
             mode: Path hash mode: 0=1-byte, 1=2-byte, 2=3-byte per hop.
             mark_applied: If True, set ``_path_hash_mode_applied``, which stops
                 ``Dispatcher._apply_default_path_hash_mode`` overwriting this
-                width with the node default on the way out. Three callers claim
+                width with the node default on the way out. These callers claim
                 it, for the same reason -- the width was decided by something
                 that outranks the node preference:
 
@@ -274,7 +274,12 @@ class Packet:
                   packet->getPathHashSize())`` does -- the node preference
                   governs only self-originated floods;
                 * the dispatcher itself on a packet being forwarded, whose width
-                  belongs to the originator.
+                  belongs to the originator;
+                * the dispatcher's RX path on every received frame
+                  (``Dispatcher._process_received_packet``), for the same
+                  reason: a repeater's direct forward strips the last hop to 0
+                  and sends that object, which must keep the originator's width.
+                  It sets the attribute directly rather than calling this.
 
                 Leave it False to let the node default decide (the dispatcher's
                 own call site, which is that default).
