@@ -85,6 +85,8 @@ class SX1262Radio(LoRaRadio):
         coding_rate: int = 5,
         preamble_length: int = 12,
         sync_word: int = 0x3444,
+        pa_config: str = "sx1262",
+        max_tx_power: Optional[int] = None,
         is_waveshare: bool = False,
         use_dio3_tcxo: bool = False,
         dio3_tcxo_voltage: float = 1.8,
@@ -158,6 +160,12 @@ class SX1262Radio(LoRaRadio):
         self.coding_rate = coding_rate
         self.preamble_length = preamble_length
         self.sync_word = sync_word
+        self.pa_config = pa_config.lower().strip()
+        self.max_tx_power_dbm = (
+            max_tx_power
+            if max_tx_power is not None
+            else (15 if self.pa_config == "sx1261" else 22)
+        )
         self.is_waveshare = is_waveshare
         self.use_dio3_tcxo = use_dio3_tcxo
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
@@ -986,6 +994,7 @@ class SX1262Radio(LoRaRadio):
             time.sleep(self._RADIO_TIMING_DELAY)
             if self.use_dio2_rf:
                 logger.info("DIO2 RF switch control enabled")
+            self.lora.setSyncWord(self.sync_word)
 
             # Common configuration for all board types
             self.lora._fixResistanceAntenna()
@@ -999,7 +1008,12 @@ class SX1262Radio(LoRaRadio):
 
             # Set TX power
             logger.info(f"Setting TX power to {self.tx_power} dBm during initialization")
-            self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
+            self.lora.setTxPower(
+                min(self.tx_power, self.max_tx_power_dbm),
+                self.lora.TX_POWER_SX1261
+                if self.pa_config == "sx1261"
+                else self.lora.TX_POWER_SX1262,
+            )
 
             # Configure modulation parameters
             # Enable LDRO if symbol duration > 16ms (SF11/62.5kHz = 32.768ms)
@@ -1021,6 +1035,8 @@ class SX1262Radio(LoRaRadio):
                 self.lora.CRC_ON,
                 self.lora.IQ_STANDARD,
             )
+
+            self.lora.setSyncWord(self.sync_word)
 
             # Configure RX interrupts and gain
             rx_mask = self._get_rx_irq_mask()
@@ -1506,7 +1522,12 @@ class SX1262Radio(LoRaRadio):
                 # Setup TX interrupts AFTER CAD checks (CAD changes interrupt config)
                 self._setup_tx_interrupts()
                 await asyncio.sleep(self.RADIO_TIMING_DELAY)
-                self.lora.setTxPower(self.tx_power, self.lora.TX_POWER_SX1262)
+                self.lora.setTxPower(
+                    min(self.tx_power, self.max_tx_power_dbm),
+                    self.lora.TX_POWER_SX1261
+                    if self.pa_config == "sx1261"
+                    else self.lora.TX_POWER_SX1262,
+                )
 
                 if not await self._execute_transmission(driver_timeout):
                     raise RuntimeError("Radio failed to start TX")
@@ -1677,8 +1698,13 @@ class SX1262Radio(LoRaRadio):
         """Set TX power in dBm"""
 
         def set_power():
-            self.tx_power = power
-            self.lora.setTxPower(power, self.lora.TX_POWER_SX1262)
+            self.tx_power = min(power, self.max_tx_power_dbm)
+            self.lora.setTxPower(
+                self.tx_power,
+                self.lora.TX_POWER_SX1261
+                if self.pa_config == "sx1261"
+                else self.lora.TX_POWER_SX1262,
+            )
 
         return self._safe_radio_operation("set TX power", set_power, f"TX power set to {power} dBm")
 
