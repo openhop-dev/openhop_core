@@ -1008,7 +1008,7 @@ class SX126x(BaseLoRa):
         buf = ((syncWord >> 8) & 0xFF, syncWord & 0xFF)
         if syncWord <= 0xFF:
             buf = ((syncWord & 0xF0) | 0x04, (syncWord << 4) | 0x04)
-        # self.writeRegister(self.REG_LORA_SYNC_WORD_MSB, buf, 2)
+        self.writeRegister(self.REG_LORA_SYNC_WORD_MSB, buf, 2)
 
     def setFskModulation(self, br: int, pulseShape: int, bandwidth: int, fdev: int):
         self.setModulationParamsFsk(br, pulseShape, bandwidth, fdev)
