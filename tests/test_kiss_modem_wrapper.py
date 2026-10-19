@@ -234,21 +234,23 @@ class TestKissFrameEncoding:
         assert len(modem._pending_rx_queue) == 1
         assert modem._pending_rx_queue[0][0] == b"\x01\x02\x03"
 
-    def test_port_non_zero_discarded(self):
-        """Frames with port != 0 are ignored (type byte 0x10 = port 1, cmd 0)"""
+    def test_port_one_data_is_queued_as_secondary_profile(self):
+        """KISS v2 uses type 0x10 for raw Data received on radio2."""
         modem = KissModemWrapper(port="/dev/null", auto_configure=False)
         modem.is_connected = True
 
         received = []
         modem.on_frame_received = lambda data: received.append(data)
 
-        # Type 0x10: port=1, cmd=0 (Data on port 1) - should be discarded
+        # Type 0x10: port=1, cmd=0 (Data on the secondary profile).
         frame = bytes([KISS_FEND, 0x10, 0x01, 0x02, 0x03, KISS_FEND])
         for byte in frame:
             modem._decode_kiss_byte(byte)
 
         assert len(received) == 0
-        assert len(modem._pending_rx_queue) == 0
+        assert len(modem._pending_rx_queue) == 1
+        assert modem._pending_rx_queue[0][0] == b"\x01\x02\x03"
+        assert modem._pending_rx_queue[0][2] == 1
 
 
 class TestRxMetaBoundedWait:
@@ -269,7 +271,7 @@ class TestRxMetaBoundedWait:
         """Force every queued Data frame's deadline into the past."""
         q = modem._pending_rx_queue
         for i in range(len(q)):
-            q[i] = (q[i][0], time.monotonic() - 1.0)
+            q[i] = (q[i][0], time.monotonic() - 1.0, q[i][2])
 
     def test_data_with_prompt_rx_meta_uses_real_metrics(self):
         """Data followed promptly by RxMeta is dispatched with real metrics."""
