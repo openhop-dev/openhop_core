@@ -18,6 +18,8 @@ IRQ_HEADER_VALID = 0x0010
 IRQ_HEADER_ERR = 0x0020
 IRQ_CRC_ERR = 0x0040
 IRQ_TIMEOUT = 0x0200
+IRQ_CAD_DONE = 0x0080
+IRQ_CAD_DETECTED = 0x0100
 
 MESH_FREQ = 910_525_000
 SWEEP_FREQ = 903_400_000
@@ -33,6 +35,12 @@ def _make_mock_lora(rssi_raw_values) -> MagicMock:
     lora.IRQ_HEADER_ERR = IRQ_HEADER_ERR
     lora.IRQ_CRC_ERR = IRQ_CRC_ERR
     lora.IRQ_TIMEOUT = IRQ_TIMEOUT
+    lora.IRQ_CAD_DONE = IRQ_CAD_DONE
+    lora.IRQ_CAD_DETECTED = IRQ_CAD_DETECTED
+    lora.CAD_ON_1_SYMB, lora.CAD_ON_2_SYMB, lora.CAD_ON_4_SYMB = 0x00, 0x01, 0x02
+    lora.CAD_ON_8_SYMB, lora.CAD_ON_16_SYMB = 0x03, 0x04
+    lora.CAD_EXIT_STDBY = 0x00
+    lora.getIrqStatus.return_value = 0
     lora.STANDBY_RC = 0x00
     lora.RX_CONTINUOUS = 0xFFFFFF
     # getRssiInst returns the raw register value; the wrapper converts -(raw/2).
@@ -185,3 +193,139 @@ async def test_dwell_requires_an_initialised_radio():
     radio._initialized = False
     with pytest.raises(RuntimeError, match="not initialized"):
         await radio.measure_rssi_dwell(SWEEP_FREQ, dwell_s=0.001)
+
+
+def _script_cads(radio, detections):
+    """Make each setCad() complete the way the interrupt handler would."""
+    seq = list(detections)
+
+    def _fire():
+        if not seq:
+            return  # silent: the interrupt never comes, and the burst must time out
+        radio._last_cad_detected = seq.pop(0)
+        radio._last_cad_irq_status = IRQ_CAD_DONE | (
+            IRQ_CAD_DETECTED if radio._last_cad_detected else 0
+        )
+        radio._cad_event.set()
+
+    radio.lora.setCad.side_effect = _fire
+
+
+async def test_dwell_without_cad_never_touches_cad():
+    radio = await _make_radio()
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.005, sample_gap_s=0.0, settle_s=0.0
+    )
+
+    assert "cad" not in result
+    radio.lora.setCad.assert_not_called()
+    radio.lora.setCadParams.assert_not_called()
+
+
+async def test_dwell_cad_burst_counts_hits_and_the_longest_run():
+    radio = await _make_radio()
+    _script_cads(radio, [True, True, False, True, False, False, True, True])
+    radio._custom_cad_peak, radio._custom_cad_min = 25, 11
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.005, sample_gap_s=0.0, settle_s=0.0, cad_symbols=8, cad_count=8
+    )
+
+    cad = result["cad"]
+    assert cad["n_cad"] == 8 and cad["hits"] == 5 and cad["longest_run"] == 2
+    assert cad["timeouts"] == 0 and cad["symbols"] == 8
+    assert (cad["det_peak"], cad["det_min"]) == (25, 11), "the radio's own thresholds are used"
+    assert cad["sf"] == radio.spreading_factor and cad["bw_hz"] == radio.bandwidth
+    assert radio.lora.setCad.call_count == 8
+    # Configured once, on the radio's own constant for 8 symbols, exiting to standby.
+    radio.lora.setCadParams.assert_called_once_with(
+        radio.lora.CAD_ON_8_SYMB, 25, 11, radio.lora.CAD_EXIT_STDBY, 0
+    )
+    # Still retuned home afterwards, and still holding nothing.
+    assert radio.lora.setFrequency.call_args_list[-1].args == (MESH_FREQ,)
+    assert not radio._tx_lock.locked()
+
+
+async def test_dwell_cad_routes_the_cad_irqs_before_the_first_cad_and_rx_after():
+    radio = await _make_radio()
+    lora = radio.lora
+    rx_mask = radio._get_rx_irq_mask()
+    cad_mask = IRQ_CAD_DONE | IRQ_CAD_DETECTED
+    log: list[tuple[str, tuple]] = []
+    lora.request.side_effect = (
+        lambda _t: lora.setDioIrqParams(rx_mask, rx_mask, IRQ_NONE, IRQ_NONE) or True
+    )
+    lora.setDioIrqParams.side_effect = lambda *a: log.append(("irq", a))
+    _script_cads(radio, [False])
+    real_fire = lora.setCad.side_effect
+    lora.setCad.side_effect = lambda: (log.append(("cad", ())), real_fire())
+
+    await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.001, sample_gap_s=0.0, settle_s=0.0, cad_symbols=2, cad_count=1
+    )
+
+    first_cad = next(i for i, (k, _) in enumerate(log) if k == "cad")
+    before = [a for k, a in log[:first_cad] if k == "irq"]
+    assert before[-1] == (
+        cad_mask,
+        cad_mask,
+        IRQ_NONE,
+        IRQ_NONE,
+    ), "CAD IRQs were not the live routes when CAD started"
+    after = [a for k, a in log[first_cad:] if k == "irq"]
+    assert after[-1] == (
+        rx_mask,
+        rx_mask,
+        IRQ_NONE,
+        IRQ_NONE,
+    ), "RX routes not restored after the burst"
+
+
+async def test_dwell_cad_timeout_counts_and_does_not_abort_the_burst():
+    radio = await _make_radio()
+    _script_cads(radio, [True])  # the second CAD is silent
+    radio.CAD_BURST_TIMEOUT_S = 0.02
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.001, sample_gap_s=0.0, settle_s=0.0, cad_symbols=4, cad_count=2
+    )
+
+    cad = result["cad"]
+    assert cad["n_cad"] == 2
+    assert cad["hits"] == 1
+    assert cad["timeouts"] == 1
+    assert cad["longest_run"] == 1
+    assert radio.lora.setCad.call_count == 2, "a silent CAD must not end the burst"
+    assert radio.lora.setFrequency.call_args_list[-1].args == (MESH_FREQ,)
+
+
+async def test_dwell_rejects_a_symbol_count_the_silicon_lacks_before_retuning():
+    radio = await _make_radio()
+
+    with pytest.raises(ValueError):
+        await radio.measure_rssi_dwell(SWEEP_FREQ, dwell_s=0.001, cad_symbols=3, cad_count=4)
+
+    radio.lora.setFrequency.assert_not_called()
+    assert not radio._tx_lock.locked()
+
+
+async def test_dwell_cad_defaults_to_the_radio_s_own_symbol_count():
+    radio = await _make_radio()
+    radio._custom_cad_symbol_num = 4
+    _script_cads(radio, [False])
+
+    result = await radio.measure_rssi_dwell(
+        SWEEP_FREQ, dwell_s=0.001, sample_gap_s=0.0, settle_s=0.0, cad_count=1
+    )
+
+    assert result["cad"]["symbols"] == 4
+    assert radio.lora.setCadParams.call_args.args[0] == radio.lora.CAD_ON_4_SYMB
+
+
+async def test_dwell_with_cad_reports_a_missing_radio_the_same_way_as_without():
+    radio = await _make_radio()
+    radio.lora = None
+
+    with pytest.raises(RuntimeError, match="LoRa radio object not available"):
+        await radio.measure_rssi_dwell(SWEEP_FREQ, dwell_s=0.001, cad_count=4)
