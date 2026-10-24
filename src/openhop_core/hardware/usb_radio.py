@@ -1148,6 +1148,8 @@ class USBLoRaRadio(_RadioBase, FrameRfControls):
         async with self._command_lock:
             if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
                 return None
+            if not await self._rf_wait_clean_async(timeout):
+                return None
 
             # Ensure event loop is captured
             if self._event_loop is None:

@@ -1000,6 +1000,8 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
         async with self._command_lock:
             if self._sock is None:
                 return None
+            if not await self._rf_wait_clean_async(timeout):
+                return None
 
             if self._event_loop is None:
                 try:

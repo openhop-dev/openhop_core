@@ -477,6 +477,9 @@ class KissModemWrapper(LoRaRadio):
         self._expected_response_subcmds: Optional[set[int]] = None
         self._active_request_subcmd: Optional[int] = None
         self._response_queue: deque[tuple[int, bytes]] = deque(maxlen=32)
+        self._stale_state_replies: set[int] = set()
+        self._stale_state_drained = threading.Event()
+        self._stale_state_drained.set()
 
         # TX completion tracking
         # Single-flight DATA transmit: the modem holds one pending TX, so only one
@@ -955,6 +958,11 @@ class KissModemWrapper(LoRaRadio):
         """
         if not self.serial_conn:
             return False
+
+        with self._response_lock:
+            self._stale_state_replies.clear()
+            self._stale_state_drained.set()
+            self._response_queue.clear()
 
         if self.post_open_delay_ms > 0:
             threading.Event().wait(self.post_open_delay_ms / 1000.0)
@@ -1731,6 +1739,15 @@ class KissModemWrapper(LoRaRadio):
         logger.warning("DATA send failed: %s", reason)
         return self._verdict(reason)
 
+    def _discard_stale_state_reply(self, sub_cmd: int) -> bool:
+        """Caller holds _response_lock. Either terminal reply drains the exchange."""
+        if sub_cmd not in self._stale_state_replies:
+            return False
+        self._stale_state_replies.clear()
+        self._stale_state_drained.set()
+        logger.debug("Discarding late SetHardware reply 0x%02X", sub_cmd)
+        return True
+
     def _send_command(
         self, sub_cmd: int, data: bytes = b"", timeout: float = RESPONSE_TIMEOUT
     ) -> Optional[tuple[int, bytes]]:
@@ -1761,6 +1778,13 @@ class KissModemWrapper(LoRaRadio):
             return None
 
         with self._command_lock:
+            deadline = time.monotonic() + timeout
+            while not self._stale_state_drained.is_set():
+                remaining = deadline - time.monotonic()
+                if self._shutting_down or remaining <= 0:
+                    logger.warning("Previous SetHardware reply still pending; command not sent")
+                    return None
+                self._stale_state_drained.wait(min(0.1, remaining))
             expected = sub_cmd | 0x80
             acceptable: set[int] = {expected, HW_RESP_ERROR}
             if sub_cmd in self._SETHW_ALLOW_OK_FOR:
@@ -1799,6 +1823,7 @@ class KissModemWrapper(LoRaRadio):
                 self._expected_response_subcmds = acceptable
                 self._active_request_subcmd = sub_cmd
 
+            sent = False
             try:
                 # SetHardware frame: type 0x06, payload = sub_cmd (1 byte) + data
                 kiss_frame = self._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data)
@@ -1806,9 +1831,9 @@ class KissModemWrapper(LoRaRadio):
                 if not self._write_frame(kiss_frame):
                     logger.warning("SetHardware frame write failed")
                     return None
+                sent = True
 
                 # Wait for response with shutdown-aware polling.
-                deadline = time.monotonic() + timeout
                 while not self._shutting_down:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -1824,6 +1849,14 @@ class KissModemWrapper(LoRaRadio):
                 return None
             finally:
                 with self._response_lock:
+                    if (
+                        sent
+                        and sub_cmd in self._SETHW_FRESH_REPLY_ONLY
+                        and self._pending_response is None
+                        and not self._shutting_down
+                    ):
+                        self._stale_state_replies = acceptable.copy()
+                        self._stale_state_drained.clear()
                     self._expected_response_subcmds = None
                     self._active_request_subcmd = None
 
@@ -2755,6 +2788,8 @@ class KissModemWrapper(LoRaRadio):
                     self._tx_busy_seen = True
                 else:
                     with self._response_lock:
+                        if self._discard_stale_state_reply(sub_cmd):
+                            return
                         expected = self._expected_response_subcmds
                         if expected is not None and sub_cmd in expected:
                             self._pending_response = (sub_cmd, payload)
@@ -2771,6 +2806,8 @@ class KissModemWrapper(LoRaRadio):
             else:
                 # Other response sub-commands (Identity, Radio, OK, etc.)
                 with self._response_lock:
+                    if self._discard_stale_state_reply(sub_cmd):
+                        return
                     expected = self._expected_response_subcmds
                     if expected is not None and sub_cmd in expected:
                         self._pending_response = (sub_cmd, payload)

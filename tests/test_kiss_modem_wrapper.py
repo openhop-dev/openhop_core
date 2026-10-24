@@ -3316,20 +3316,89 @@ class TestStateReplyRaces:
         assert len(modem._response_queue) == 0
 
     def test_late_reply_during_newer_request_does_not_confirm_it(self, modem):
-        # Request 1 (RX on) times out mid-TX. Request 2 (TX on) then receives
-        # request 1's reply, which shows TX gain still off.
         assert modem.set_fem_rx_gain(True) is False
+        before = len(self.writes)
+        # With no terminal reply yet, another request must not reach the modem.
+        assert modem.set_fem_tx_gain(True) is False
+        assert len(self.writes) == before
+        assert modem.applied_hardware_config == {}
+        self._feed(modem, HW_RESP_FEM_STATE, [0x03, HW_FEM_RX_GAIN])
         ok = self._call_with_reply(
             modem,
             lambda: modem.set_fem_tx_gain(True),
             HW_RESP_FEM_STATE,
-            [0x03, HW_FEM_RX_GAIN],
+            [0x03, HW_FEM_RX_GAIN | HW_FEM_TX_GAIN],
         )
 
-        assert ok is False
-        assert "fem_tx_gain" not in modem.radio_config
-        # What the modem did report is recorded as confirmed
-        assert modem.applied_hardware_config == {"fem_rx_gain": True, "fem_tx_gain": False}
+        assert ok is True
+        assert modem.radio_config["fem_tx_gain"] is True
+        assert modem.applied_hardware_config == {"fem_rx_gain": True, "fem_tx_gain": True}
+
+    @pytest.mark.parametrize("late_error", [False, True])
+    @pytest.mark.parametrize(
+        "cmd,resp,old_payload,new_payload,setter,expected",
+        [
+            (
+                HW_CMD_SET_AGC_RESET_INTERVAL,
+                HW_RESP_AGC_RESET_INTERVAL,
+                [30, 0],
+                [12, 0],
+                lambda m: m.set_agc_reset_interval(12),
+                12,
+            ),
+            (
+                HW_CMD_SET_FEM_STATE,
+                HW_RESP_FEM_STATE,
+                [3, 0],
+                [3, 1],
+                lambda m: m.set_fem_rx_gain(True),
+                True,
+            ),
+            (
+                HW_CMD_SET_RX_BOOSTED_GAIN,
+                HW_RESP_RX_BOOSTED_GAIN,
+                [0],
+                [1],
+                lambda m: m.set_rx_boosted_gain(True),
+                True,
+            ),
+        ],
+    )
+    def test_new_request_waits_for_late_terminal_reply(
+        self, modem, late_error, cmd, resp, old_payload, new_payload, setter, expected
+    ):
+        assert modem._send_command(cmd, timeout=0.01) is None
+        before = len(self.writes)
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(value=setter(modem)))
+        thread.start()
+        try:
+            time.sleep(0.01)
+            assert len(self.writes) == before
+            self._feed(
+                modem,
+                RESP_ERROR if late_error else resp,
+                [HW_ERR_UNSUPPORTED] if late_error else old_payload,
+            )
+            deadline = time.monotonic() + 0.5
+            while len(self.writes) == before and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert len(self.writes) == before + 1
+            self._feed(modem, resp, new_payload)
+        finally:
+            thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert result["value"] == expected
+        assert modem._stale_state_replies == set()
+
+    def test_reconnect_readiness_clears_pending_exchange(self, modem, monkeypatch):
+        assert modem._send_command(HW_CMD_SET_FEM_STATE, timeout=0.01) is None
+        modem.post_open_delay_ms = 0
+        modem.usb_reset_on_connect = False
+        monkeypatch.setattr(modem, "_send_command", lambda *a, **kw: (RESP_PONG, b""))
+        assert modem._wait_for_modem_ready()
+        assert modem._stale_state_replies == set()
+        assert modem._stale_state_drained.is_set()
 
     def test_tx_busy_for_second_fem_request_fails_without_recording(self, modem):
         ok = self._call_with_reply(

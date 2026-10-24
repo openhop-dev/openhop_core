@@ -1,9 +1,16 @@
 """Frame-protocol AGC/FEM/RX-boost client, with a scripted modem."""
 
+import asyncio
 import struct
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from openhop_core.hardware.frame_rf_frontend import FrameRfControls
 from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
+from openhop_core.hardware.tcp_radio import TCPLoRaRadio
+from openhop_core.hardware.usb_radio import USBLoRaRadio
 from openhop_core.hardware.protocol_constants import (
     AGC_INTERVAL_MAX_SEC,
     CMD_AGC_INTERVAL_RESP,
@@ -16,6 +23,8 @@ from openhop_core.hardware.protocol_constants import (
     CMD_SET_AGC_INTERVAL,
     CMD_SET_FEM_STATE,
     CMD_SET_RX_BOOST,
+    CMD_TX_DONE,
+    CMD_TX_REQUEST,
     ERR_RADIO_FAULT,
     ERR_UNSUPPORTED,
     FEM_STATE_RX_LNA,
@@ -43,13 +52,11 @@ class FakeModem(FrameRfControls):
 
     def _rf_transact_fresh(self, cmd, payload, expect, timeout):
         self.sent.append((cmd, bytes(payload), expect))
-        self._rf_awaiting_reply = True
         if not self.script:
             return None
         reply = self.script.pop(0)
         if reply is None:
             return None
-        self._rf_awaiting_reply = False
         return reply
 
 
@@ -152,25 +159,22 @@ def test_rx_boost_fault_does_not_claim_the_requested_state():
 
 def test_a_queued_reply_cannot_confirm_the_next_request():
     modem = FakeModem()
-    modem._stale_rf.append((CMD_AGC_INTERVAL_RESP, _u16(4)))
+    with modem._response_lock:
+        assert modem._rf_note_unsolicited(CMD_AGC_INTERVAL_RESP, _u16(4))
     modem.script.append((CMD_AGC_INTERVAL_RESP, _u16(30)))
 
     assert modem.set_agc_reset_interval(30) == 30
     assert modem.script == []
-    assert modem._stale_rf == []
     assert modem.sent == [(CMD_SET_AGC_INTERVAL, _u16(30), CMD_AGC_INTERVAL_RESP)]
 
 
 def test_a_reply_after_timeout_is_discarded():
     modem = FakeModem()
-    modem.script.append(None)
-    assert modem.set_agc_reset_interval(30) is None
-    assert CMD_AGC_INTERVAL_RESP in modem._rf_expect_stale
+    modem._rf_expect_stale = {CMD_AGC_INTERVAL_RESP, CMD_ERROR}
 
     with modem._response_lock:
         assert modem._rf_note_unsolicited(CMD_AGC_INTERVAL_RESP, _u16(30)) is True
-    assert modem._stale_rf == []
-    assert CMD_AGC_INTERVAL_RESP not in modem._rf_expect_stale
+    assert modem._rf_expect_stale == set()
 
     modem.script.append((CMD_AGC_INTERVAL_RESP, _u16(12)))
     assert modem.set_agc_reset_interval(12) == 12
@@ -215,3 +219,185 @@ def test_get_agc_reports_the_running_interval():
     modem.script.append((CMD_AGC_INTERVAL_RESP, _u16(12)))
     assert modem.get_agc_reset_interval() == 12
     assert modem.sent == [(CMD_GET_AGC_INTERVAL, b"", CMD_AGC_INTERVAL_RESP)]
+
+
+def _live_radio(cls):
+    radio = cls("unused")
+    if cls is TCPLoRaRadio:
+        radio._sock = object()
+    else:
+        radio._serial = SimpleNamespace(is_open=True)
+        radio._connected_event.set()
+    radio._event_loop = asyncio.get_running_loop()
+    radio._rf_write_frame = Mock()
+    return radio
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+@pytest.mark.parametrize("late_error", [False, True])
+@pytest.mark.parametrize(
+    "cmd,reply_cmd,old_reply,new_reply,setter,expected",
+    [
+        (
+            CMD_SET_RX_BOOST,
+            CMD_RX_BOOST_RESP,
+            b"\x00",
+            b"\x01",
+            lambda r: r.set_rx_boosted_gain(True),
+            True,
+        ),
+        (
+            CMD_SET_FEM_STATE,
+            CMD_FEM_STATE_RESP,
+            b"\x03\x00",
+            b"\x03\x01",
+            lambda r: r.set_fem_state(rx_gain=True),
+            {"rx_gain": True, "tx_gain": False},
+        ),
+        (
+            CMD_SET_AGC_INTERVAL,
+            CMD_AGC_INTERVAL_RESP,
+            _u16(30),
+            _u16(12),
+            lambda r: r.set_agc_reset_interval(12),
+            12,
+        ),
+    ],
+)
+async def test_next_request_waits_for_old_reply(
+    cls, late_error, cmd, reply_cmd, old_reply, new_reply, setter, expected
+):
+    radio = _live_radio(cls)
+    assert await asyncio.to_thread(radio._rf_transact, cmd, b"", reply_cmd, 0.01) is None
+    writes = radio._rf_write_frame.call_count
+    request = asyncio.create_task(asyncio.to_thread(setter, radio))
+    await asyncio.sleep(0.02)
+    assert radio._rf_write_frame.call_count == writes
+    if late_error:
+        radio._dispatch_frame(CMD_ERROR, bytes([ERR_UNSUPPORTED]))
+    else:
+        radio._dispatch_frame(reply_cmd, old_reply)
+
+    async def answer():
+        while radio._rf_write_frame.call_count == writes:
+            await asyncio.sleep(0.001)
+        radio._dispatch_frame(reply_cmd, new_reply)
+
+    await asyncio.wait_for(answer(), 0.5)
+    assert await asyncio.wait_for(request, 0.5) == expected
+    assert radio._rf_expect_stale == set()
+    assert radio._response_events == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_missing_late_reply_prevents_another_write(cls):
+    radio = _live_radio(cls)
+    for _ in range(2):
+        result = await asyncio.to_thread(
+            radio._rf_transact, CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.01
+        )
+        assert result is None
+    assert radio._rf_write_frame.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_command_lock_timeout_cannot_send_later(cls):
+    radio = _live_radio(cls)
+    await radio._command_lock.acquire()
+    result = await asyncio.to_thread(
+        radio._rf_transact, CMD_SET_AGC_INTERVAL, _u16(30), CMD_AGC_INTERVAL_RESP, 0.01
+    )
+    assert result is None
+    radio._command_lock.release()
+    await asyncio.sleep(0.02)
+    assert radio._rf_write_frame.call_count == 0
+    assert radio._rf_expect_stale == set()
+    assert radio._response_events == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_timeout_cleans_event_waiters_and_preserves_late_reply(cls):
+    radio = _live_radio(cls)
+    tasks = asyncio.all_tasks()
+    assert (
+        await asyncio.to_thread(
+            radio._rf_transact, CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.01
+        )
+        is None
+    )
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() == tasks
+    assert radio._response_events == {}
+    radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_normal_command_waits_for_late_reply_and_keeps_its_own_error(cls):
+    radio = _live_radio(cls)
+    assert (
+        await asyncio.to_thread(
+            radio._rf_transact, CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.01
+        )
+        is None
+    )
+    written = asyncio.Event()
+
+    def write(frame):
+        written.set()
+        asyncio.get_running_loop().call_soon(
+            radio._dispatch_frame, CMD_ERROR, bytes([ERR_UNSUPPORTED])
+        )
+
+    if cls is TCPLoRaRadio:
+        radio._sock_write = write
+    else:
+        radio._serial.write = write
+        radio._serial.flush = Mock()
+    request = asyncio.create_task(
+        radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, timeout=0.5)
+    )
+    await asyncio.sleep(0.02)
+    assert not written.is_set()
+    radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+    assert await asyncio.wait_for(request, 0.2) is None
+    assert written.is_set()
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_sync_exchange_drains_old_reply_before_writing(cls):
+    radio = cls("unused")
+    if cls is TCPLoRaRadio:
+        radio._sock = object()
+    else:
+        radio._serial = SimpleNamespace(is_open=True)
+    radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+    radio._rf_write_frame = Mock()
+
+    def read(timeout):
+        if radio._rf_expect_stale:
+            radio._rf_write_frame.assert_not_called()
+            return CMD_ERROR, bytes([ERR_UNSUPPORTED])
+        radio._rf_write_frame.assert_called_once()
+        return CMD_RX_BOOST_RESP, b"\x01"
+
+    radio._read_frame_sync = read
+    assert radio.set_rx_boosted_gain(True) is True
+    assert radio._rf_expect_stale == set()
+
+
+def test_reconnect_clears_pending_reply_even_without_saved_controls():
+    radio = TCPLoRaRadio("unused")
+    radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+    radio._rf_caps = 15
+    radio.applied_hardware_config["rx_boosted_gain"] = False
+    radio.apply_saved_rf_controls()
+    assert radio._rf_expect_stale == set()
+    assert radio._rf_caps is None
+    assert radio.applied_hardware_config == {}

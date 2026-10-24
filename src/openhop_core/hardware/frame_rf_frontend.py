@@ -5,9 +5,8 @@ a reconnect must send again; ``applied_hardware_config`` is only what a reply
 has confirmed on this link.
 
 FEM and RX-boost replies, including a bare ``CMD_ERROR``, carry no request id
-and can be held until the current reception ends. One command is in flight at
-a time. A reply that arrives after its wait has ended is dropped, so it cannot
-confirm the next request.
+and can be held until the current reception ends. A timed-out exchange must
+drain its reply before another command is sent on that link.
 """
 
 import asyncio
@@ -86,10 +85,8 @@ class FrameRfControls:
                 self.radio_config[key] = source[key]
         self.applied_hardware_config: Dict[str, object] = {}
         self._rf_caps: Optional[int] = None
-        self._stale_rf: list[tuple[int, bytes]] = []
         self._rf_expect_stale: set[int] = set()
         self._rf_lock = threading.Lock()
-        self._rf_awaiting_reply = False
         if not hasattr(self, "_response_lock"):
             self._response_lock = threading.Lock()
 
@@ -126,12 +123,10 @@ class FrameRfControls:
         rx = getattr(self, "_rx_thread", None)
         return rx is not None and threading.current_thread() is rx
 
-    def _drop_stale_rf(self, expect: int) -> None:
-        with self._response_lock:
-            self._stale_rf = [item for item in self._stale_rf if item[0] not in (expect, CMD_ERROR)]
-
     def _deliver_waiting_frame(self, cmd: int, payload: bytes) -> bool:
         """Wake the command waiting for ``cmd``. Caller holds ``_response_lock``."""
+        if self._rf_discard_late(cmd):
+            return True
         evt = self._response_events.get(cmd)
         if evt is None:
             return False
@@ -144,43 +139,39 @@ class FrameRfControls:
         return True
 
     def _rf_note_unsolicited(self, cmd: int, payload: bytes) -> bool:
-        """Queue or drop an RF reply that arrived with no waiter.
+        """Discard an unclaimed RF reply. Caller holds ``_response_lock``."""
+        return self._rf_discard_late(cmd) or cmd in _RF_REPLY_CMDS
 
-        Caller holds ``_response_lock``. A reply for a command that already
-        timed out is discarded. Anything else waits to be discarded before the
-        next command for that opcode is sent.
-        """
-        if cmd == CMD_ERROR:
-            if CMD_ERROR not in self._rf_expect_stale:
-                return False
-            self._rf_expect_stale.discard(CMD_ERROR)
-            logger.debug("Discarding late RF error 0x%02X", payload[0] if payload else 0)
-            return True
-        if cmd not in _RF_REPLY_CMDS:
-            return False
+    def _rf_discard_late(self, cmd: int) -> bool:
+        """Consume either terminal reply, never leave an orphan CMD_ERROR marker."""
         if cmd in self._rf_expect_stale:
-            self._rf_expect_stale.discard(cmd)
+            self._rf_expect_stale.clear()
             logger.debug("Discarding late RF reply 0x%02X", cmd)
             return True
-        self._stale_rf.append((cmd, payload))
-        del self._stale_rf[:-8]
-        return True
+        return False
 
-    def _rf_mark_stale(self, expect: int) -> None:
-        with self._response_lock:
-            self._rf_expect_stale.add(expect)
-            self._rf_expect_stale.add(CMD_ERROR)
+    async def _rf_wait_clean_async(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._response_lock:
+                if not self._rf_expect_stale:
+                    return True
+            if time.monotonic() >= deadline:
+                logger.warning("Previous RF reply still pending; command not sent")
+                return False
+            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
     def _rf_transact(
         self, cmd: int, payload: bytes, expect: int, timeout: float
     ) -> Optional[tuple[int, bytes]]:
+        try:
+            if asyncio.get_running_loop() is getattr(self, "_event_loop", None):
+                logger.error("RF control was called on the radio event loop")
+                return None
+        except RuntimeError:
+            pass
         with self._rf_lock:
-            self._drop_stale_rf(expect)
-            self._rf_awaiting_reply = False
-            reply = self._rf_transact_fresh(cmd, payload, expect, timeout)
-            if reply is None and self._rf_awaiting_reply:
-                self._rf_mark_stale(expect)
-            return reply
+            return self._rf_transact_fresh(cmd, payload, expect, timeout)
 
     def _rf_transact_fresh(
         self, cmd: int, payload: bytes, expect: int, timeout: float
@@ -189,48 +180,73 @@ class FrameRfControls:
             return None
         if self._rf_use_sync():
             return self._rf_transact_sync(cmd, payload, expect, timeout)
-        loop = self._event_loop
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            logger.error("RF control was called on the radio event loop")
-            return None
-        fut = asyncio.run_coroutine_threadsafe(
-            self._rf_transact_async(cmd, payload, expect, timeout), loop
-        )
+        finished = threading.Event()
+        cancelled = threading.Event()
+
+        async def exchange():
+            try:
+                # Include command-lock contention and draining in the same budget.
+                return await asyncio.wait_for(
+                    self._rf_transact_async(cmd, payload, expect, timeout, cancelled), timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("RF command timed out: 0x%02X", cmd)
+                return None
+            finally:
+                finished.set()
+
+        fut = asyncio.run_coroutine_threadsafe(exchange(), self._event_loop)
         try:
             return fut.result(timeout=timeout + 1.0)
         except Exception as exc:
+            cancelled.set()
+            fut.cancel()
+            finished.wait(timeout=1.0)
             logger.warning("RF exchange failed: %s", exc)
-            self._rf_awaiting_reply = True
             return None
 
     def _rf_transact_sync(
         self, cmd: int, payload: bytes, expect: int, timeout: float
     ) -> Optional[tuple[int, bytes]]:
-        self._rf_awaiting_reply = True
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._response_lock:
+                if not self._rf_expect_stale:
+                    break
+            if time.monotonic() >= deadline:
+                logger.warning("Previous RF reply still pending; command not sent")
+                return None
+            resp = self._read_frame_sync(timeout=max(0.01, deadline - time.monotonic()))
+            if resp:
+                with self._response_lock:
+                    self._rf_discard_late(resp[0])
         try:
             self._rf_write_frame(build_frame(cmd, payload))
         except Exception as exc:
-            self._rf_awaiting_reply = False
             logger.warning("RF write failed: %s", exc)
             return None
-        deadline = time.monotonic() + timeout
         accept = {expect, CMD_ERROR}
         while time.monotonic() < deadline:
             remaining = max(0.05, deadline - time.monotonic())
             resp = self._read_frame_sync(timeout=remaining)
             if resp and resp[0] in accept:
                 return resp
+        with self._response_lock:
+            self._rf_expect_stale = {expect, CMD_ERROR}
         return None
 
     async def _rf_transact_async(
-        self, cmd: int, payload: bytes, expect: int, timeout: float
+        self,
+        cmd: int,
+        payload: bytes,
+        expect: int,
+        timeout: float,
+        cancelled: Optional[threading.Event] = None,
     ) -> Optional[tuple[int, bytes]]:
         async with self._command_lock:
             if not self._rf_link_open():
+                return None
+            if not await self._rf_wait_clean_async(timeout):
                 return None
             if self._event_loop is None:
                 try:
@@ -240,23 +256,27 @@ class FrameRfControls:
             ok_evt = asyncio.Event()
             err_evt = asyncio.Event()
             with self._response_lock:
+                if cancelled is not None and cancelled.is_set():
+                    return None
                 self._response_events[expect] = ok_evt
                 self._response_data.pop(expect, None)
                 self._response_events[CMD_ERROR] = err_evt
                 self._response_data.pop(CMD_ERROR, None)
-            self._rf_awaiting_reply = True
+            sent = False
+            waiters = set()
             try:
                 try:
                     self._rf_write_frame(build_frame(cmd, payload))
+                    sent = True
                 except Exception as exc:
-                    self._rf_awaiting_reply = False
                     logger.warning("RF write failed: %s", exc)
                     return None
+                waiters = {
+                    asyncio.create_task(ok_evt.wait()),
+                    asyncio.create_task(err_evt.wait()),
+                }
                 done, pending = await asyncio.wait(
-                    {
-                        asyncio.create_task(ok_evt.wait()),
-                        asyncio.create_task(err_evt.wait()),
-                    },
+                    waiters,
                     timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -274,10 +294,19 @@ class FrameRfControls:
                     return (expect, data)
             finally:
                 with self._response_lock:
+                    if (
+                        sent
+                        and expect not in self._response_data
+                        and CMD_ERROR not in self._response_data
+                    ):
+                        self._rf_expect_stale = {expect, CMD_ERROR}
                     self._response_events.pop(expect, None)
                     self._response_data.pop(expect, None)
                     self._response_events.pop(CMD_ERROR, None)
                     self._response_data.pop(CMD_ERROR, None)
+                for task in waiters:
+                    task.cancel()
+                await asyncio.gather(*waiters, return_exceptions=True)
 
     def _rf_error_code(self, reply: Optional[tuple[int, bytes]]) -> Optional[int]:
         if not reply or reply[0] != CMD_ERROR or not reply[1]:
@@ -437,10 +466,12 @@ class FrameRfControls:
 
     def apply_saved_rf_controls(self) -> None:
         """Push configured front-end settings after connect. Never fatal."""
-        if not any(key in self.radio_config for key in FRONTEND_KEYS):
-            return
         self._rf_caps = None
         self.applied_hardware_config.clear()
+        with self._response_lock:
+            self._rf_expect_stale.clear()
+        if not any(key in self.radio_config for key in FRONTEND_KEYS):
+            return
 
         agc = self.radio_config.get("agc_reset_interval_seconds")
         if agc is not None:
