@@ -427,6 +427,18 @@ class TestCompanionBridgeSendAndShare:
         assert (pkt.header >> 2) & 0x0F == PAYLOAD_TYPE_TXT_MSG
         assert injector.expected_crcs[0] == result.expected_ack
 
+    async def test_channel_message_uses_its_own_slot_when_names_repeat(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        assert bridge.set_channel(0, "Ops", b"\x11" * 16)
+        assert bridge.set_channel(1, "Ops", b"\x22" * 16)
+
+        assert await bridge.send_channel_message(1, "hi")
+
+        pkt, _ = injector.calls[0]
+        key = b"\x22" * 16 + b"\x00" * 16
+        assert CryptoUtils.mac_then_decrypt(key[:16], key, bytes(pkt.payload)[1:])
+
     async def test_peer_with_matching_display_name_is_queued(self):
         """Group traffic has no sender identity, so a matching name is still inbound."""
         bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), node_name="Twin")

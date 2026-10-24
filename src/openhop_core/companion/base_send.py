@@ -512,7 +512,10 @@ class _SendOpsMixin:
                 local_identity=self._identity,
                 message=text,
                 sender_name=self.prefs.node_name,
-                channels_config=self.channels.get_channels(),
+                # This slot alone: the builder finds the secret by name, and two
+                # slots can share a name (firmware sends by slot, MyMesh.cpp
+                # CMD_SEND_CHANNEL_TXT_MSG).
+                channels_config=[{"name": channel.name, "secret": channel.secret}],
                 timestamp=timestamp,
             )
             # Attached to the freshly built packet with no await in between, so
