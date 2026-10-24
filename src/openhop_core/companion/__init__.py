@@ -58,6 +58,7 @@ from .models import (
     NodePrefs,
     PacketStats,
     QueuedMessage,
+    SentMessageEvent,
     SentResult,
 )
 from .path_cache import PathCache
@@ -86,6 +87,7 @@ __all__ = [
     "MessageEvent",
     "ChannelMessageEvent",
     "ChannelDataEvent",
+    "SentMessageEvent",
     # ADV Types
     "ADV_TYPE_CHAT",
     "ADV_TYPE_REPEATER",

@@ -94,6 +94,10 @@ class _CallbackMixin:
         """Register a channel-data callback receiving one ``ChannelDataEvent``."""
         self.add_push_callback("channel_data_event", callback)
 
+    def on_message_sent(self, callback: Callable) -> None:
+        """Register a sent-text callback receiving one ``SentMessageEvent``."""
+        self.add_push_callback("message_sent", callback)
+
     @staticmethod
     async def _call_legacy(callback: Callable, *args: Any) -> None:
         """Invoke a legacy positional callback, awaiting it when async."""

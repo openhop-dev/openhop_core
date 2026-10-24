@@ -11,8 +11,9 @@ from openhop_core.companion.constants import (
     ADV_TYPE_CHAT,
     AUTOADD_CHAT,
     AUTOADD_OVERWRITE_OLDEST,
+    TXT_TYPE_CLI_DATA,
 )
-from openhop_core.companion.models import Contact, MessageEvent, QueuedMessage
+from openhop_core.companion.models import Contact, MessageEvent, QueuedMessage, SentMessageEvent
 from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet, PacketBuilder
@@ -426,6 +427,40 @@ class TestCompanionBridgeSendAndShare:
         pkt, _ = injector.calls[0]
         assert (pkt.header >> 2) & 0x0F == PAYLOAD_TYPE_TXT_MSG
         assert injector.expected_crcs[0] == result.expected_ack
+
+    async def test_sent_texts_are_announced_before_injection_with_wire_timestamps(self):
+        sent, injected = [], []
+
+        async def injector(pkt: Packet, **_kwargs) -> bool:
+            injected.append((pkt, len(sent)))
+            return True
+
+        identity = LocalIdentity()
+        bridge = CompanionBridge(identity, injector)
+        contact = _make_peer_contact("Alice")
+        bridge.contacts.add(contact)
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+        bridge.on_message_sent(sent.append)
+
+        result = await bridge.send_text_message(contact.public_key, "Hello")
+        assert await bridge.send_channel_message(0, "hi")
+        await bridge.send_text_message(contact.public_key, "ver", txt_type=TXT_TYPE_CLI_DATA)
+
+        # Announced ahead of each injection; the CLI command, with no ACK, is not.
+        assert [announced for _, announced in injected] == [1, 2, 2]
+        dm_key = Identity(contact.public_key).calc_shared_secret(identity.get_private_key())
+        dm = CryptoUtils.mac_then_decrypt(dm_key[:16], dm_key, bytes(injected[0][0].payload)[2:])
+        grp_key = b"\x11" * 16 + b"\x00" * 16
+        grp = CryptoUtils.mac_then_decrypt(grp_key[:16], grp_key, bytes(injected[1][0].payload)[1:])
+        assert sent == [
+            SentMessageEvent(
+                "Hello",
+                int.from_bytes(dm[:4], "little"),
+                recipient_key=contact.public_key,
+                expected_ack=result.expected_ack,
+            ),
+            SentMessageEvent("hi", int.from_bytes(grp[:4], "little"), channel_idx=0),
+        ]
 
     async def test_peer_with_matching_display_name_is_queued(self):
         """Group traffic has no sender identity, so a matching name is still inbound."""
