@@ -458,9 +458,32 @@ class TestCompanionBridgeSendAndShare:
                 int.from_bytes(dm[:4], "little"),
                 recipient_key=contact.public_key,
                 expected_ack=result.expected_ack,
+                packet_hash=injected[0][0].calculate_packet_hash(),
             ),
-            SentMessageEvent("hi", int.from_bytes(grp[:4], "little"), channel_idx=0),
+            SentMessageEvent(
+                "hi",
+                int.from_bytes(grp[:4], "little"),
+                channel_idx=0,
+                packet_hash=injected[1][0].calculate_packet_hash(),
+            ),
         ]
+
+    async def test_send_results_carry_the_sent_packets_hash(self):
+        injector = MockPacketInjector()
+        bridge = CompanionBridge(LocalIdentity(), injector)
+        contact = _make_peer_contact("Alice")
+        bridge.contacts.add(contact)
+        assert bridge.set_channel(0, "Public", b"\x11" * 16)
+
+        dm = await bridge.send_text_message(contact.public_key, "Hello")
+        grp = await bridge.send_channel_message(0, "hi")
+        missing = await bridge.send_channel_message(7, "hi")
+
+        assert dm.packet_hash == injector.calls[0][0].calculate_packet_hash()
+        assert grp.packet_hash == injector.calls[1][0].calculate_packet_hash()
+        assert grp.success is True and grp.is_flood is True and bool(grp) is True
+        assert missing.success is False and bool(missing) is False
+        assert missing.packet_hash is None
 
     async def test_channel_message_uses_its_own_slot_when_names_repeat(self):
         injector = MockPacketInjector()

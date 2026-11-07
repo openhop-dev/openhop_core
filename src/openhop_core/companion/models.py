@@ -199,13 +199,23 @@ class NodePrefs:
 
 @dataclass
 class SentResult:
-    """Result of a message send operation."""
+    """Result of a message send operation.
+
+    Truthy when the send succeeded, so a caller that tests the result of
+    ``send_channel_message`` keeps reading it as the bool it used to be.
+    ``packet_hash`` is the sent packet's, as the dispatcher and a repeater's
+    packet log key it.
+    """
 
     success: bool
     is_flood: bool = False
     expected_ack: Optional[int] = None
     timeout_ms: Optional[int] = None
     error: Optional[str] = None
+    packet_hash: Optional[bytes] = None
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 @dataclass
@@ -323,7 +333,8 @@ class SentMessageEvent:
     that then fails to go out is reported too. A direct message has
     ``recipient_key`` and the ``expected_ack`` that ``send_confirmed`` reports; a
     channel message has ``channel_idx``. CLI commands, which earn no ACK, are not
-    reported.
+    reported. ``packet_hash`` is the sent packet's, as the dispatcher and a
+    repeater's packet log key it.
     """
 
     text: str
@@ -332,3 +343,4 @@ class SentMessageEvent:
     recipient_key: Optional[bytes] = None
     channel_idx: Optional[int] = None
     expected_ack: Optional[int] = None
+    packet_hash: Optional[bytes] = None

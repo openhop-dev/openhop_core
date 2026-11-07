@@ -363,7 +363,7 @@ class TestCompanionRadioMisc:
         radio = MockRadio()
         comp = CompanionRadio(radio, LocalIdentity())
         result = await comp.send_channel_message(0, "Hi")
-        assert result is False
+        assert result.success is False
 
 
 # ---------------------------------------------------------------------------
