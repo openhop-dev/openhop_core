@@ -812,6 +812,8 @@ class USBLoRaRadio(_RadioBase, FrameRfControls):
 
     def _reconnect_serial_sync(self) -> bool:
         """Reopen a re-enumerated USB modem and restore radio/CAD state."""
+        self._rf_reconnecting = True
+        self._rf_retire_link(preserve_pending=True)
         if self._serial is not None:
             try:
                 self._serial.close()
@@ -977,8 +979,13 @@ class USBLoRaRadio(_RadioBase, FrameRfControls):
                     continue
 
                 if expect_cmd is not None and cmd != expect_cmd:
+                    with self._response_lock:
+                        discarded = self._rf_discard_late(cmd)
+                    if discarded:
+                        continue
                     if cmd == CMD_ERROR:
                         return (cmd, payload)
+                    self._dispatch_frame(cmd, payload)
                     continue
 
                 return (cmd, payload)

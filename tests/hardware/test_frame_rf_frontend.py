@@ -2,6 +2,8 @@
 
 import asyncio
 import struct
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,23 +11,25 @@ import pytest
 
 from openhop_core.hardware.frame_rf_frontend import FrameRfControls
 from openhop_core.hardware.kiss_modem_wrapper import KissModemWrapper
-from openhop_core.hardware.tcp_radio import TCPLoRaRadio
-from openhop_core.hardware.usb_radio import USBLoRaRadio
 from openhop_core.hardware.protocol_constants import (
     AGC_INTERVAL_MAX_SEC,
     CMD_AGC_INTERVAL_RESP,
+    CMD_CONFIG_RESP,
     CMD_ERROR,
     CMD_FEM_STATE_RESP,
     CMD_GET_AGC_INTERVAL,
     CMD_GET_RF_CAPS,
     CMD_RF_CAPS_RESP,
     CMD_RX_BOOST_RESP,
+    CMD_RX_PACKET,
     CMD_SET_AGC_INTERVAL,
     CMD_SET_FEM_STATE,
     CMD_SET_RX_BOOST,
+    CMD_STATUS_RESP,
     CMD_TX_DONE,
     CMD_TX_REQUEST,
     ERR_RADIO_FAULT,
+    ERR_RADIO_INIT,
     ERR_UNSUPPORTED,
     FEM_STATE_RX_LNA,
     FEM_STATE_TX_PA,
@@ -33,7 +37,11 @@ from openhop_core.hardware.protocol_constants import (
     RF_CAP_FEM_RX_LNA,
     RF_CAP_FEM_TX_PA,
     RF_CAP_RX_BOOSTED_GAIN,
+    STATUS_RESP_FMT,
+    build_frame,
 )
+from openhop_core.hardware.tcp_radio import TCPLoRaRadio
+from openhop_core.hardware.usb_radio import USBLoRaRadio
 
 
 def _u16(value: int) -> bytes:
@@ -49,6 +57,8 @@ class FakeModem(FrameRfControls):
         self._init_rf_controls(radio_config)
         self.sent = []
         self.script = []
+        self._response_events = {}
+        self._response_data = {}
 
     def _rf_transact_fresh(self, cmd, payload, expect, timeout):
         self.sent.append((cmd, bytes(payload), expect))
@@ -401,3 +411,321 @@ def test_reconnect_clears_pending_reply_even_without_saved_controls():
     assert radio._rf_expect_stale == set()
     assert radio._rf_caps is None
     assert radio.applied_hardware_config == {}
+
+
+@pytest.mark.parametrize("setter", [False, True])
+def test_rx_boost_fault_invalidates_previously_confirmed_state(setter):
+    modem = FakeModem({"rx_boosted_gain": True})
+    modem.applied_hardware_config["rx_boosted_gain"] = True
+    modem.script.append((CMD_ERROR, bytes([ERR_RADIO_FAULT])))
+    result = modem.set_rx_boosted_gain(True) if setter else modem.get_rx_boosted_gain()
+    assert result is None
+    assert "rx_boosted_gain" not in modem.applied_hardware_config
+    assert modem.radio_config["rx_boosted_gain"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+@pytest.mark.parametrize("draining", [False, True])
+async def test_sync_rf_wait_preserves_received_packets(cls, draining):
+    radio = cls("unused")
+    if cls is TCPLoRaRadio:
+        radio._sock = object()
+    else:
+        radio._serial = SimpleNamespace(is_open=True)
+    radio._rf_write_frame = Mock()
+    radio.rx_callback = Mock()
+    radio._event_loop = asyncio.get_running_loop()
+    packet = struct.pack("<hhh", -90, 25, -91) + b"packet"
+    script = [(CMD_RX_PACKET, packet)]
+    if draining:
+        radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+        script.append((CMD_ERROR, bytes([ERR_UNSUPPORTED])))
+    script.append((CMD_RX_BOOST_RESP, b"\x01"))
+    replies = iter(script)
+    radio._read_frame_sync = lambda timeout: next(replies)
+
+    def restore():
+        radio._rx_thread = threading.current_thread()
+        return radio.set_rx_boosted_gain(True)
+
+    assert await asyncio.to_thread(restore) is True
+    radio.rx_callback.assert_called_once_with(b"packet")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_rf_write_does_not_block_event_loop(cls):
+    radio = _live_radio(cls)
+    started = threading.Event()
+    release = threading.Event()
+
+    def write(frame):
+        started.set()
+        release.wait(0.3)
+        radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+
+    radio._rf_write_frame = write
+    before = time.monotonic()
+    request = asyncio.create_task(asyncio.to_thread(radio.set_rx_boosted_gain, True))
+    try:
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        assert time.monotonic() - before < 0.15
+        assert not release.is_set()
+        # The write remains blocked while the loop services this task.
+        assert not request.done()
+        assert radio.applied_hardware_config == {}
+    finally:
+        release.set()
+    assert await request is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_old_exchange_cannot_quarantine_reconnected_link(cls):
+    radio = _live_radio(cls)
+    request = asyncio.create_task(
+        asyncio.to_thread(radio._rf_transact, CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.1)
+    )
+    while not radio._rf_write_frame.called:
+        await asyncio.sleep(0.001)
+    await asyncio.to_thread(radio.apply_saved_rf_controls)
+    assert await request is None
+    expected = {CMD_RX_BOOST_RESP, CMD_ERROR} if cls is USBLoRaRadio else set()
+    assert radio._rf_expect_stale == expected
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_rf_call_does_not_read_alongside_rx_worker_without_event_loop(cls):
+    radio = cls("unused")
+    if cls is TCPLoRaRadio:
+        radio._sock = object()
+    else:
+        radio._serial = SimpleNamespace(is_open=True)
+    radio._rx_thread = SimpleNamespace(is_alive=lambda: True)
+    radio._read_frame_sync = Mock(return_value=(CMD_RX_BOOST_RESP, b"\x01"))
+    radio._rf_write_frame = Mock()
+    assert radio.get_rx_boosted_gain() is None
+    radio._read_frame_sync.assert_not_called()
+    radio._rf_write_frame.assert_not_called()
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+@pytest.mark.parametrize("status_reply", [False, True])
+def test_radio_fault_from_dispatch_invalidates_boost_cache(cls, status_reply):
+    radio = cls("unused", radio_config={"rx_boosted_gain": True})
+    radio.applied_hardware_config["rx_boosted_gain"] = True
+    if status_reply:
+        radio._dispatch_frame(
+            CMD_STATUS_RESP, struct.pack(STATUS_RESP_FMT, 10, 1, 2, 0, -90, 20, -1000, 25, 2)
+        )
+    else:
+        radio._dispatch_frame(CMD_ERROR, bytes([ERR_RADIO_FAULT]))
+    assert "rx_boosted_gain" not in radio.applied_hardware_config
+    assert radio.radio_config["rx_boosted_gain"] is True
+
+
+def test_clean_rx_boost_rollback_keeps_previous_confirmed_mode():
+    modem = FakeModem({"rx_boosted_gain": False})
+    modem.applied_hardware_config["rx_boosted_gain"] = False
+    modem.script.append((CMD_ERROR, bytes([ERR_RADIO_INIT])))
+    assert modem.set_rx_boosted_gain(True) is None
+    assert modem.applied_hardware_config["rx_boosted_gain"] is False
+    assert modem.radio_config["rx_boosted_gain"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_failed_rf_write_still_quarantines_a_possible_reply(cls):
+    radio = _live_radio(cls)
+    radio._rf_write_frame.side_effect = OSError("partial write")
+    assert await asyncio.to_thread(radio.set_rx_boosted_gain, True) is None
+    assert radio._rf_expect_stale == {CMD_RX_BOOST_RESP, CMD_ERROR}
+    radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_cancelling_inflight_write_keeps_command_ownership(cls):
+    radio = _live_radio(cls)
+    started = threading.Event()
+    release = threading.Event()
+    writes = []
+
+    def write(frame):
+        writes.append(frame)
+        if len(writes) == 1:
+            started.set()
+            release.wait(1)
+        radio._dispatch_frame(CMD_RX_BOOST_RESP, bytes([len(writes) == 1]))
+
+    radio._rf_write_frame = write
+    first = asyncio.create_task(
+        radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 1)
+    )
+    while not started.is_set():
+        await asyncio.sleep(0.001)
+    first.cancel()
+    second = asyncio.create_task(
+        radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x00", CMD_RX_BOOST_RESP, 1)
+    )
+    try:
+        await asyncio.sleep(0.02)
+        assert len(writes) == 1
+        assert not first.done()
+        first.cancel()
+        await asyncio.sleep(0)
+        assert not first.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await second == (CMD_RX_BOOST_RESP, b"\x00")
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_cancelled_write_queued_for_worker_cannot_send(monkeypatch, cls):
+    radio = _live_radio(cls)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    to_thread = asyncio.to_thread
+
+    async def delayed_worker(func, *args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", delayed_worker)
+    request = asyncio.create_task(
+        radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 1)
+    )
+    await entered.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    radio._rf_write_frame.assert_not_called()
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+async def test_serial_reopen_does_not_quarantine_an_unsent_write(monkeypatch):
+    radio = _live_radio(USBLoRaRadio)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_worker(func):
+        entered.set()
+        await release.wait()
+        return func()
+
+    monkeypatch.setattr(asyncio, "to_thread", delayed_worker)
+    request = asyncio.create_task(
+        radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 1)
+    )
+    await entered.wait()
+    radio.apply_saved_rf_controls()
+    release.set()
+    assert await request is None
+    radio._rf_write_frame.assert_not_called()
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_reconnect_handshake_excludes_runtime_commands(cls):
+    radio = _live_radio(cls)
+    radio._rf_reconnecting = True
+    assert await asyncio.to_thread(radio.set_rx_boosted_gain, True) is None
+    assert await radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.01) is None
+    radio._rf_write_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_socket_close_retires_inflight_rf_exchange():
+    radio = _live_radio(TCPLoRaRadio)
+    request = asyncio.create_task(
+        asyncio.to_thread(radio._rf_transact, CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.1)
+    )
+    while not radio._rf_write_frame.called:
+        await asyncio.sleep(0.001)
+    radio._close_sock()
+    assert await request is None
+    assert radio._rf_expect_stale == set()
+    assert radio._rf_reconnecting
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_sync_drain_cannot_send_after_deadline(monkeypatch, cls):
+    radio = cls("unused")
+    radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+    radio._rf_write_frame = Mock()
+    now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def read(timeout):
+        now[0] = 1.0
+        return CMD_RX_BOOST_RESP, b"\x00"
+
+    radio._read_frame_sync = read
+    assert radio._rf_transact_sync(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.1) is None
+    radio._rf_write_frame.assert_not_called()
+    assert radio._rf_expect_stale == set()
+
+
+def test_serial_reopen_preserves_deferred_reply_ownership():
+    radio = USBLoRaRadio("unused")
+    radio._serial = SimpleNamespace(is_open=True)
+    radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+    radio.apply_saved_rf_controls()
+    assert radio._rf_expect_stale == {CMD_RX_BOOST_RESP, CMD_ERROR}
+
+
+@pytest.mark.parametrize("late_cmd,payload", [(CMD_RX_BOOST_RESP, b"\x01"), (CMD_ERROR, b"\x10")])
+def test_serial_handshake_consumes_deferred_terminal_reply(late_cmd, payload):
+    radio = USBLoRaRadio("unused")
+    radio._rf_expect_stale = {CMD_RX_BOOST_RESP, CMD_ERROR}
+    frames = bytearray(build_frame(late_cmd, payload) + build_frame(CMD_CONFIG_RESP, b"config"))
+
+    def read(size):
+        part = bytes(frames[:size])
+        del frames[:size]
+        return part
+
+    radio._serial = SimpleNamespace(timeout=0.1, read=read)
+    assert radio._read_frame_sync(0.1, CMD_CONFIG_RESP) == (CMD_CONFIG_RESP, b"config")
+    assert radio._rf_expect_stale == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_link_retirement_waits_for_started_write(cls):
+    radio = _live_radio(cls)
+    started = threading.Event()
+    release = threading.Event()
+
+    def write(frame):
+        started.set()
+        release.wait(1)
+        radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+
+    radio._rf_write_frame = write
+    request = asyncio.create_task(asyncio.to_thread(radio.set_rx_boosted_gain, True))
+    while not started.is_set():
+        await asyncio.sleep(0.001)
+    generation = radio._rf_generation
+    retiring = asyncio.create_task(asyncio.to_thread(radio._rf_retire_link, cls is USBLoRaRadio))
+    try:
+        await asyncio.sleep(0.02)
+        assert not retiring.done()
+        assert radio._rf_generation == generation
+    finally:
+        release.set()
+    await retiring
+    await request
+    assert radio._rf_generation == generation + 1

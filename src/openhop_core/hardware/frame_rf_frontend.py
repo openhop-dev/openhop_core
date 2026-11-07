@@ -30,12 +30,15 @@ from .protocol_constants import (
     CMD_SET_AGC_INTERVAL,
     CMD_SET_FEM_STATE,
     CMD_SET_RX_BOOST,
+    CMD_STATUS_RESP,
+    ERR_RADIO_FAULT,
     FEM_STATE_RX_LNA,
     FEM_STATE_TX_PA,
     RF_CAP_AGC,
     RF_CAP_FEM_RX_LNA,
     RF_CAP_FEM_TX_PA,
     RF_CAP_RX_BOOSTED_GAIN,
+    STATUS_RESP_SIZE,
     build_frame,
 )
 
@@ -48,8 +51,8 @@ FRONTEND_KEYS = (
     "rx_boosted_gain",
 )
 
-# A SET can wait out the packet already on air. Gets and AGC are answered
-# in the command handler, so they do not need that budget.
+# FEM/boost GETs can queue behind a SET waiting for reception to end.
+# AGC and capability requests are answered directly in the command handler.
 _RF_SET_TIMEOUT_S = 8.0
 _RF_GET_TIMEOUT_S = 3.0
 
@@ -86,7 +89,13 @@ class FrameRfControls:
         self.applied_hardware_config: Dict[str, object] = {}
         self._rf_caps: Optional[int] = None
         self._rf_expect_stale: set[int] = set()
-        self._rf_lock = threading.Lock()
+        self._rf_inflight_reply: Optional[int] = None
+        self._rf_generation = 0
+        self._rf_restoring = False
+        self._rf_reconnecting = False
+        self._rf_restore_thread = None
+        self._rf_lock = threading.RLock()
+        self._rf_write_lock = threading.Lock()
         if not hasattr(self, "_response_lock"):
             self._response_lock = threading.Lock()
 
@@ -102,6 +111,8 @@ class FrameRfControls:
         return value
 
     def _rf_link_open(self) -> bool:
+        if self._rf_reconnecting and self._rf_restore_thread is not threading.current_thread():
+            return False
         sock = getattr(self, "_sock", None)
         if sock is not None:
             return True
@@ -113,18 +124,29 @@ class FrameRfControls:
             self._sock_write(frame)
             return
         self._serial.write(frame)
-        self._serial.flush()
 
     def _rf_use_sync(self) -> bool:
         """True while the RX worker is not the reader, so a direct read is safe."""
-        loop = getattr(self, "_event_loop", None)
-        if loop is None or not loop.is_running():
-            return True
         rx = getattr(self, "_rx_thread", None)
-        return rx is not None and threading.current_thread() is rx
+        if rx is not None:
+            if threading.current_thread() is rx:
+                return True
+            if rx.is_alive():
+                return False
+        loop = getattr(self, "_event_loop", None)
+        return loop is None or not loop.is_running()
+
+    def _rf_note_state(self, cmd: int, payload: bytes) -> None:
+        if (cmd == CMD_ERROR and payload and payload[0] == ERR_RADIO_FAULT) or (
+            cmd == CMD_STATUS_RESP
+            and len(payload) >= STATUS_RESP_SIZE
+            and payload[STATUS_RESP_SIZE - 1] == 2
+        ):
+            self.applied_hardware_config.pop("rx_boosted_gain", None)
 
     def _deliver_waiting_frame(self, cmd: int, payload: bytes) -> bool:
         """Wake the command waiting for ``cmd``. Caller holds ``_response_lock``."""
+        self._rf_note_state(cmd, payload)
         if self._rf_discard_late(cmd):
             return True
         evt = self._response_events.get(cmd)
@@ -154,6 +176,8 @@ class FrameRfControls:
         deadline = time.monotonic() + timeout
         while True:
             with self._response_lock:
+                if self._rf_restoring or self._rf_reconnecting:
+                    return False
                 if not self._rf_expect_stale:
                     return True
             if time.monotonic() >= deadline:
@@ -165,13 +189,18 @@ class FrameRfControls:
         self, cmd: int, payload: bytes, expect: int, timeout: float
     ) -> Optional[tuple[int, bytes]]:
         try:
-            if asyncio.get_running_loop() is getattr(self, "_event_loop", None):
-                logger.error("RF control was called on the radio event loop")
+            if asyncio.get_running_loop():
+                logger.error("RF control was called on an event loop")
                 return None
         except RuntimeError:
             pass
         with self._rf_lock:
-            return self._rf_transact_fresh(cmd, payload, expect, timeout)
+            if self._rf_restoring and self._rf_restore_thread is not threading.current_thread():
+                return None
+            reply = self._rf_transact_fresh(cmd, payload, expect, timeout)
+            if reply:
+                self._rf_note_state(*reply)
+            return reply
 
     def _rf_transact_fresh(
         self, cmd: int, payload: bytes, expect: int, timeout: float
@@ -180,6 +209,11 @@ class FrameRfControls:
             return None
         if self._rf_use_sync():
             return self._rf_transact_sync(cmd, payload, expect, timeout)
+        loop = getattr(self, "_event_loop", None)
+        if loop is None or not loop.is_running():
+            logger.warning("RF control requires the radio event loop while RX is running")
+            return None
+        generation = self._rf_generation
         finished = threading.Event()
         cancelled = threading.Event()
 
@@ -187,7 +221,8 @@ class FrameRfControls:
             try:
                 # Include command-lock contention and draining in the same budget.
                 return await asyncio.wait_for(
-                    self._rf_transact_async(cmd, payload, expect, timeout, cancelled), timeout
+                    self._rf_transact_async(cmd, payload, expect, timeout, cancelled, generation),
+                    timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning("RF command timed out: 0x%02X", cmd)
@@ -219,10 +254,17 @@ class FrameRfControls:
             resp = self._read_frame_sync(timeout=max(0.01, deadline - time.monotonic()))
             if resp:
                 with self._response_lock:
-                    self._rf_discard_late(resp[0])
+                    discarded = self._rf_discard_late(resp[0])
+                if not discarded:
+                    self._dispatch_frame(*resp)
+        if time.monotonic() >= deadline:
+            return None
         try:
-            self._rf_write_frame(build_frame(cmd, payload))
+            with self._rf_write_lock:
+                self._rf_write_frame(build_frame(cmd, payload))
         except Exception as exc:
+            with self._response_lock:
+                self._rf_expect_stale = {expect, CMD_ERROR}
             logger.warning("RF write failed: %s", exc)
             return None
         accept = {expect, CMD_ERROR}
@@ -231,6 +273,8 @@ class FrameRfControls:
             resp = self._read_frame_sync(timeout=remaining)
             if resp and resp[0] in accept:
                 return resp
+            if resp:
+                self._dispatch_frame(*resp)
         with self._response_lock:
             self._rf_expect_stale = {expect, CMD_ERROR}
         return None
@@ -242,8 +286,13 @@ class FrameRfControls:
         expect: int,
         timeout: float,
         cancelled: Optional[threading.Event] = None,
+        generation: Optional[int] = None,
     ) -> Optional[tuple[int, bytes]]:
         async with self._command_lock:
+            if generation is None:
+                generation = self._rf_generation
+            if generation != self._rf_generation:
+                return None
             if not self._rf_link_open():
                 return None
             if not await self._rf_wait_clean_async(timeout):
@@ -263,11 +312,31 @@ class FrameRfControls:
                 self._response_events[CMD_ERROR] = err_evt
                 self._response_data.pop(CMD_ERROR, None)
             sent = False
+            aborted = threading.Event()
+            write_task = None
             waiters = set()
             try:
                 try:
-                    self._rf_write_frame(build_frame(cmd, payload))
-                    sent = True
+
+                    def write():
+                        nonlocal sent
+                        with self._rf_write_lock:
+                            with self._response_lock:
+                                if (
+                                    generation != self._rf_generation
+                                    or aborted.is_set()
+                                    or (cancelled is not None and cancelled.is_set())
+                                ):
+                                    return
+                                # Partial writes can still produce a reply.
+                                sent = True
+                                self._rf_inflight_reply = expect
+                            self._rf_write_frame(build_frame(cmd, payload))
+
+                    write_task = asyncio.create_task(asyncio.to_thread(write))
+                    await asyncio.shield(write_task)
+                    if not sent or generation != self._rf_generation:
+                        return None
                 except Exception as exc:
                     logger.warning("RF write failed: %s", exc)
                     return None
@@ -286,6 +355,8 @@ class FrameRfControls:
                     logger.warning("Timeout: cmd=0x%02X → expected 0x%02X", cmd, expect)
                     return None
                 with self._response_lock:
+                    if generation != self._rf_generation:
+                        return None
                     if err_evt.is_set() and self._response_data.get(CMD_ERROR) is not None:
                         return (CMD_ERROR, self._response_data[CMD_ERROR])
                     data = self._response_data.get(expect)
@@ -293,9 +364,20 @@ class FrameRfControls:
                         return None
                     return (expect, data)
             finally:
+                aborted.set()
+                while write_task is not None and not write_task.done():
+                    # Cancellation cannot stop a worker already writing to the modem.
+                    try:
+                        await asyncio.shield(write_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
                 with self._response_lock:
+                    self._rf_inflight_reply = None
                     if (
                         sent
+                        and generation == self._rf_generation
                         and expect not in self._response_data
                         and CMD_ERROR not in self._response_data
                     ):
@@ -466,10 +548,48 @@ class FrameRfControls:
 
     def apply_saved_rf_controls(self) -> None:
         """Push configured front-end settings after connect. Never fatal."""
+        self._rf_restoring = True
+        self._rf_restore_thread = threading.current_thread()
+        try:
+            # Serial reopen does not cancel deferred requests on the modem.
+            self._rf_retire_link(preserve_pending=getattr(self, "_serial", None) is not None)
+            with self._rf_lock:
+                self._restore_rf_controls()
+        finally:
+            self._rf_restoring = False
+            self._rf_reconnecting = False
+            self._rf_restore_thread = None
+
+    def _rf_retire_link(self, preserve_pending: bool = False) -> None:
+        """Release old waiters before the RX worker starts a new handshake."""
+        # A started write must finish on its original handle before replacement.
+        with self._rf_write_lock:
+            self._rf_retire_waiters(preserve_pending)
+
+    def _rf_retire_waiters(self, preserve_pending: bool) -> None:
+        with self._response_lock:
+            self._rf_generation += 1
+            if preserve_pending:
+                cmd = self._rf_inflight_reply
+                if (
+                    cmd is not None
+                    and cmd not in self._response_data
+                    and CMD_ERROR not in self._response_data
+                ):
+                    self._rf_expect_stale.update({cmd, CMD_ERROR})
+            else:
+                self._rf_expect_stale.clear()
+            for cmd, evt in self._response_events.items():
+                self._response_data[cmd] = None
+                loop = getattr(self, "_event_loop", None)
+                if loop is not None and loop.is_running():
+                    loop.call_soon_threadsafe(evt.set)
+                else:
+                    evt.set()
+
+    def _restore_rf_controls(self) -> None:
         self._rf_caps = None
         self.applied_hardware_config.clear()
-        with self._response_lock:
-            self._rf_expect_stale.clear()
         if not any(key in self.radio_config for key in FRONTEND_KEYS):
             return
 

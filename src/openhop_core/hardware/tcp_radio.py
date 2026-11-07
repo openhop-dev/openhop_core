@@ -596,6 +596,8 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
     # ══════════════════════════════════════════════════════════
 
     def _close_sock(self):
+        self._rf_reconnecting = True
+        self._rf_retire_link()
         if self._sock is not None:
             try:
                 self._sock.close()
