@@ -5,8 +5,8 @@ a reconnect must send again; ``applied_hardware_config`` is only what a reply
 has confirmed on this link.
 
 FEM and RX-boost replies, including a bare ``CMD_ERROR``, carry no request id
-and can be held until the current reception ends. A timed-out exchange must
-drain its reply before another command is sent on that link.
+and can be held until the current reception ends. A timed-out exchange drains
+its reply within a bounded grace before another command is sent on that link.
 """
 
 import asyncio
@@ -55,6 +55,8 @@ FRONTEND_KEYS = (
 # AGC and capability requests are answered directly in the command handler.
 _RF_SET_TIMEOUT_S = 8.0
 _RF_GET_TIMEOUT_S = 3.0
+# Reception has no fixed deferral limit; allow three SET budgets before recovery.
+_RF_QUARANTINE_GRACE_S = 3 * _RF_SET_TIMEOUT_S
 
 _RF_REPLY_CMDS = {
     CMD_RF_CAPS_RESP,
@@ -89,6 +91,8 @@ class FrameRfControls:
         self.applied_hardware_config: Dict[str, object] = {}
         self._rf_caps: Optional[int] = None
         self._rf_expect_stale: set[int] = set()
+        self._rf_stale_deadline: Optional[float] = None
+        self._rf_last_uptime: Optional[tuple[int, float]] = None
         self._rf_inflight_reply: Optional[int] = None
         self._rf_generation = 0
         self._rf_restoring = False
@@ -137,6 +141,19 @@ class FrameRfControls:
         return loop is None or not loop.is_running()
 
     def _rf_note_state(self, cmd: int, payload: bytes) -> None:
+        if cmd == CMD_STATUS_RESP and len(payload) >= STATUS_RESP_SIZE:
+            uptime = struct.unpack_from("<I", payload)[0]
+            now = time.monotonic()
+            previous = self._rf_last_uptime
+            if previous is not None:
+                old_uptime, observed = previous
+                # millis() wraps at 2**32 ms; an ambiguous wrap is not a reboot.
+                if uptime < old_uptime and old_uptime + now - observed + 1 < 2**32 / 1000:
+                    if self._rf_expect_stale:
+                        self._rf_expect_stale.clear()
+                        self._rf_stale_deadline = None
+                        logger.info("Modem uptime decreased; clearing RF quarantine after reboot")
+            self._rf_last_uptime = (uptime, now)
         if (cmd == CMD_ERROR and payload and payload[0] == ERR_RADIO_FAULT) or (
             cmd == CMD_STATUS_RESP
             and len(payload) >= STATUS_RESP_SIZE
@@ -168,20 +185,49 @@ class FrameRfControls:
         """Consume either terminal reply, never leave an orphan CMD_ERROR marker."""
         if cmd in self._rf_expect_stale:
             self._rf_expect_stale.clear()
+            self._rf_stale_deadline = None
             logger.debug("Discarding late RF reply 0x%02X", cmd)
             return True
         return False
+
+    def _rf_quarantine(self, expect: int) -> None:
+        """Retain terminal-reply ownership for a bounded grace under _response_lock."""
+        self._rf_expect_stale = {expect, CMD_ERROR}
+        self._rf_stale_deadline = time.monotonic() + _RF_QUARANTINE_GRACE_S
+
+    def _rf_expire_stale(self) -> bool:
+        """Release lost replies once, under _response_lock."""
+        if self._rf_expect_stale:
+            if self._rf_stale_deadline is None:
+                self._rf_stale_deadline = time.monotonic() + _RF_QUARANTINE_GRACE_S
+            if time.monotonic() >= self._rf_stale_deadline:
+                self._rf_expect_stale.clear()
+                self._rf_stale_deadline = None
+                logger.warning(
+                    "RF reply quarantine expired after %.0fs; resuming commands "
+                    "with possible stale untagged replies",
+                    _RF_QUARANTINE_GRACE_S,
+                )
+                return True
+        return False
+
+    def _rf_serial_reopened(self) -> None:
+        """Allow deferred USB work a fresh grace measured from the reopen."""
+        with self._response_lock:
+            if self._rf_expect_stale:
+                self._rf_stale_deadline = time.monotonic() + _RF_QUARANTINE_GRACE_S
 
     async def _rf_wait_clean_async(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while True:
             with self._response_lock:
-                if self._rf_restoring or self._rf_reconnecting:
+                if self._stop_event.is_set():
                     return False
-                if not self._rf_expect_stale:
+                self._rf_expire_stale()
+                if not (self._rf_restoring or self._rf_reconnecting or self._rf_expect_stale):
                     return True
             if time.monotonic() >= deadline:
-                logger.warning("Previous RF reply still pending; command not sent")
+                logger.warning("RF restore, reconnect or reply still pending; command not sent")
                 return False
             await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
@@ -246,12 +292,14 @@ class FrameRfControls:
         deadline = time.monotonic() + timeout
         while True:
             with self._response_lock:
+                self._rf_expire_stale()
                 if not self._rf_expect_stale:
                     break
+                drain_deadline = min(deadline, self._rf_stale_deadline)
             if time.monotonic() >= deadline:
                 logger.warning("Previous RF reply still pending; command not sent")
                 return None
-            resp = self._read_frame_sync(timeout=max(0.01, deadline - time.monotonic()))
+            resp = self._read_frame_sync(timeout=max(0.001, drain_deadline - time.monotonic()))
             if resp:
                 with self._response_lock:
                     discarded = self._rf_discard_late(resp[0])
@@ -264,7 +312,7 @@ class FrameRfControls:
                 self._rf_write_frame(build_frame(cmd, payload))
         except Exception as exc:
             with self._response_lock:
-                self._rf_expect_stale = {expect, CMD_ERROR}
+                self._rf_quarantine(expect)
             logger.warning("RF write failed: %s", exc)
             return None
         accept = {expect, CMD_ERROR}
@@ -276,7 +324,7 @@ class FrameRfControls:
             if resp:
                 self._dispatch_frame(*resp)
         with self._response_lock:
-            self._rf_expect_stale = {expect, CMD_ERROR}
+            self._rf_quarantine(expect)
         return None
 
     async def _rf_transact_async(
@@ -381,7 +429,7 @@ class FrameRfControls:
                         and expect not in self._response_data
                         and CMD_ERROR not in self._response_data
                     ):
-                        self._rf_expect_stale = {expect, CMD_ERROR}
+                        self._rf_quarantine(expect)
                     self._response_events.pop(expect, None)
                     self._response_data.pop(expect, None)
                     self._response_events.pop(CMD_ERROR, None)
@@ -576,9 +624,12 @@ class FrameRfControls:
                     and cmd not in self._response_data
                     and CMD_ERROR not in self._response_data
                 ):
-                    self._rf_expect_stale.update({cmd, CMD_ERROR})
+                    if not self._rf_expect_stale:
+                        self._rf_quarantine(cmd)
             else:
                 self._rf_expect_stale.clear()
+                self._rf_stale_deadline = None
+            self._rf_inflight_reply = None
             for cmd, evt in self._response_events.items():
                 self._response_data[cmd] = None
                 loop = getattr(self, "_event_loop", None)

@@ -25,6 +25,7 @@ from openhop_core.hardware.protocol_constants import (
     CMD_SET_AGC_INTERVAL,
     CMD_SET_FEM_STATE,
     CMD_SET_RX_BOOST,
+    CMD_STATUS_REQ,
     CMD_STATUS_RESP,
     CMD_TX_DONE,
     CMD_TX_REQUEST,
@@ -729,3 +730,309 @@ async def test_link_retirement_waits_for_started_write(cls):
     await retiring
     await request
     assert radio._rf_generation == generation + 1
+
+
+def _tx_writer(radio):
+    writer = Mock(side_effect=lambda frame: radio._dispatch_frame(CMD_TX_DONE, _u32(1000)))
+    if isinstance(radio, TCPLoRaRadio):
+        radio._sock_write = writer
+    else:
+        radio._serial = Mock(is_open=True)
+        radio._serial.write = writer
+    return writer
+
+
+@pytest.mark.asyncio
+async def test_usb_missing_reply_expires_from_reopen_and_commands_resume(monkeypatch, caplog):
+    from openhop_core.hardware import frame_rf_frontend as frontend
+
+    now = [0.0]
+    monkeypatch.setattr(frontend, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr("openhop_core.hardware.usb_radio.time.sleep", lambda delay: None)
+    radio = _live_radio(USBLoRaRadio)
+    radio._serial = Mock(is_open=True)
+    radio._rf_inflight_reply = CMD_RX_BOOST_RESP
+
+    def reopen():
+        now[0] = 100.0
+        return Mock(is_open=True)
+
+    radio._open_serial_sync = reopen
+    radio._apply_config_sync = Mock(return_value=True)
+    assert radio._reconnect_serial_sync()
+    radio._serial.reset_input_buffer.assert_not_called()
+    writer = _tx_writer(radio)
+    grace = frontend._RF_QUARANTINE_GRACE_S
+    assert grace == 3 * frontend._RF_SET_TIMEOUT_S
+    now[0] = 100.0 + grace - 0.001
+    with radio._response_lock:
+        assert not radio._rf_expire_stale()
+    assert radio._rf_expect_stale
+    now[0] += 0.001
+    with caplog.at_level("WARNING", logger="FrameRfControls"):
+        assert await radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.1) == _u32(1000)
+        assert await radio._send_command(CMD_TX_REQUEST, b"more", CMD_TX_DONE, 0.1) == _u32(1000)
+    assert writer.call_count == 2
+    assert not radio._rf_expect_stale
+    assert sum("quarantine expired" in record.message for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_missing_reply_expires_without_reconnect(monkeypatch, cls):
+    from openhop_core.hardware import frame_rf_frontend as frontend
+
+    radio = _live_radio(cls)
+    assert (
+        await radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.01) is None
+    )
+    assert radio._rf_expect_stale
+    expires = radio._rf_stale_deadline
+    monkeypatch.setattr(frontend, "time", SimpleNamespace(monotonic=lambda: expires))
+    writer = _tx_writer(radio)
+    assert await radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.1) == _u32(1000)
+    writer.assert_called_once()
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_sync_commands_resume_after_lost_reply_grace(monkeypatch, cls):
+    from openhop_core.hardware import frame_rf_frontend as frontend
+
+    radio = cls("unused")
+    now = [0.0]
+    monkeypatch.setattr(frontend, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    radio._rf_write_frame = Mock()
+
+    def lose_reply(timeout):
+        now[0] += timeout
+        return None
+
+    radio._read_frame_sync = lose_reply
+    assert radio._rf_transact_sync(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.1) is None
+    now[0] = radio._rf_stale_deadline - 0.01
+
+    def read(timeout):
+        if radio._rf_expect_stale:
+            now[0] += timeout
+            return None
+        return CMD_RX_BOOST_RESP, b"\x01"
+
+    radio._read_frame_sync = read
+    assert radio._rf_transact_sync(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.1) == (
+        CMD_RX_BOOST_RESP,
+        b"\x01",
+    )
+    assert radio._rf_write_frame.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_cmd,payload", [(CMD_RX_BOOST_RESP, b"\x00"), (CMD_ERROR, b"\x10")])
+async def test_late_usb_reply_inside_reopen_grace_is_discarded(monkeypatch, late_cmd, payload):
+    monkeypatch.setattr("openhop_core.hardware.usb_radio.time.sleep", lambda delay: None)
+    radio = _live_radio(USBLoRaRadio)
+    radio._serial = Mock(is_open=True)
+    radio._rf_inflight_reply = CMD_RX_BOOST_RESP
+    radio._open_serial_sync = Mock(return_value=Mock(is_open=True))
+    radio._apply_config_sync = Mock(return_value=True)
+    assert radio._reconnect_serial_sync()
+    request = asyncio.create_task(
+        radio._rf_transact_async(CMD_SET_RX_BOOST, b"\x01", CMD_RX_BOOST_RESP, 0.5)
+    )
+    await asyncio.sleep(0.02)
+    assert not request.done()
+    radio._rf_write_frame.assert_not_called()
+    radio._dispatch_frame(late_cmd, payload)
+    while not radio._rf_write_frame.called:
+        await asyncio.sleep(0.001)
+    assert not request.done()
+    radio._dispatch_frame(CMD_RX_BOOST_RESP, b"\x01")
+    assert await request == (CMD_RX_BOOST_RESP, b"\x01")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+@pytest.mark.parametrize("times_out", [False, True])
+async def test_tx_waits_for_rf_restore_with_its_own_deadline(cls, times_out):
+    radio = _live_radio(cls)
+    writer = _tx_writer(radio)
+    started = threading.Event()
+    release = threading.Event()
+
+    def restore():
+        started.set()
+        assert release.wait(1)
+
+    radio._restore_rf_controls = restore
+    restoring = asyncio.create_task(asyncio.to_thread(radio.apply_saved_rf_controls))
+    while not started.is_set():
+        await asyncio.sleep(0.001)
+    tx = asyncio.create_task(radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.08))
+    try:
+        await asyncio.sleep(0.02)
+        assert not tx.done()
+        writer.assert_not_called()
+        if times_out:
+            assert await tx is None
+            writer.assert_not_called()
+        else:
+            release.set()
+            assert await tx == _u32(1000)
+            writer.assert_called_once()
+    finally:
+        release.set()
+        await restoring
+    assert not radio._response_events
+    assert not radio._response_data
+
+
+@pytest.mark.parametrize("failure", ["open", "config"])
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_failed_reconnect_clears_gate_and_later_success_can_restore(monkeypatch, cls, failure):
+    radio = cls("unused")
+    handle = Mock(is_open=True)
+    radio._apply_config_sync = Mock(return_value=failure != "config")
+    if cls is TCPLoRaRadio:
+        monkeypatch.setattr(
+            "openhop_core.hardware.tcp_radio.socket.socket", Mock(return_value=handle)
+        )
+        radio._ping_sync = Mock(return_value=True)
+        if failure == "open":
+            handle.connect.side_effect = OSError("missing modem")
+        reconnect = radio._reopen_socket
+    else:
+        monkeypatch.setattr("openhop_core.hardware.usb_radio.time.sleep", lambda delay: None)
+        radio._open_serial_sync = Mock(return_value=handle)
+        if failure == "open":
+            radio._open_serial_sync.side_effect = OSError("missing modem")
+        radio._stop_event.wait = Mock(side_effect=lambda delay: radio._stop_event.set())
+        reconnect = radio._reconnect_serial_sync
+    assert not reconnect()
+    assert not radio._rf_reconnecting
+    radio._stop_event.clear()
+    handle.connect.side_effect = None
+    if cls is USBLoRaRadio:
+        radio._open_serial_sync.side_effect = None
+    radio._apply_config_sync.return_value = True
+    assert reconnect()
+    assert not radio._rf_reconnecting
+
+
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+def test_stopped_reconnect_clears_gate(cls):
+    radio = cls("unused")
+    radio._rf_reconnecting = True
+    radio._stop_event.set()
+    reconnect = (
+        radio._reconnect_with_backoff if cls is TCPLoRaRadio else radio._reconnect_serial_sync
+    )
+    assert not reconnect()
+    assert not radio._rf_reconnecting
+    radio._rf_reconnecting = True
+    radio.cleanup()
+    assert not radio._rf_reconnecting
+
+
+@pytest.mark.parametrize(
+    "before,after,elapsed,cleared",
+    [
+        (120, 2, 2, True),
+        (120, 122, 2, False),
+        (None, 2, 2, False),
+        (4294966, 1, 3, False),
+        (120, None, 2, False),
+    ],
+)
+def test_usb_reopen_status_detects_reboot_before_rf_restore(
+    monkeypatch, before, after, elapsed, cleared
+):
+    from openhop_core.hardware import frame_rf_frontend as frontend
+
+    now = [0.0]
+    monkeypatch.setattr(frontend, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr("openhop_core.hardware.usb_radio.time.sleep", lambda delay: None)
+    radio = USBLoRaRadio("unused")
+    radio._serial = Mock(is_open=True)
+
+    def status(uptime):
+        return struct.pack(STATUS_RESP_FMT, uptime, 0, 0, 0, -100, 0, -1100, 20, 0)
+
+    if before is not None:
+        radio._dispatch_frame(CMD_STATUS_RESP, status(before))
+    radio._rf_inflight_reply = CMD_RX_BOOST_RESP
+    frames = bytearray(build_frame(CMD_CONFIG_RESP, b"config"))
+    frames.extend(build_frame(CMD_STATUS_RESP, status(after) if after is not None else b"short"))
+
+    def read(size):
+        part = bytes(frames[:size])
+        del frames[:size]
+        return part
+
+    handle = Mock(is_open=True, timeout=0.1)
+    handle.read.side_effect = read
+
+    def reopen():
+        now[0] += elapsed
+        return handle
+
+    radio._open_serial_sync = reopen
+    quarantined_at_restore = []
+    radio._restore_rf_controls = Mock(
+        side_effect=lambda: quarantined_at_restore.append(bool(radio._rf_expect_stale))
+    )
+    assert radio._reconnect_serial_sync()
+    assert bool(radio._rf_expect_stale) is not cleared
+    assert handle.write.call_args_list[1].args[0] == build_frame(CMD_STATUS_REQ)
+    radio._restore_rf_controls.assert_called_once()
+    assert quarantined_at_restore == [not cleared]
+    handle.reset_input_buffer.assert_not_called()
+    assert not radio._rf_reconnecting
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_tx_waits_for_missing_transport_during_reconnect(cls):
+    radio = _live_radio(cls)
+    radio._rf_reconnecting = True
+    if cls is TCPLoRaRadio:
+        radio._sock = None
+    else:
+        radio._connected_event.clear()
+    tx = asyncio.create_task(radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.2))
+    try:
+        await asyncio.sleep(0.02)
+        assert not tx.done()
+        writer = _tx_writer(radio)
+        if cls is TCPLoRaRadio:
+            radio._sock = Mock()
+        else:
+            radio._connected_event.set()
+        radio._rf_reconnecting = False
+        assert await tx == _u32(1000)
+        writer.assert_called_once()
+    finally:
+        tx.cancel()
+        await asyncio.gather(tx, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_restore_and_reply_share_one_command_timeout(cls):
+    radio = _live_radio(cls)
+    radio._rf_restoring = True
+    writer = Mock()
+    if cls is TCPLoRaRadio:
+        radio._sock_write = writer
+    else:
+        radio._serial = Mock(is_open=True)
+        radio._serial.write = writer
+    loop = asyncio.get_running_loop()
+    restore_done = loop.call_later(0.04, setattr, radio, "_rf_restoring", False)
+    late_reply = loop.call_later(0.12, radio._dispatch_frame, CMD_TX_DONE, _u32(1000))
+    try:
+        assert await radio._send_command(CMD_TX_REQUEST, b"data", CMD_TX_DONE, 0.1) is None
+        writer.assert_called_once()
+        assert not radio._response_events
+        assert not radio._response_data
+    finally:
+        restore_done.cancel()
+        late_reply.cancel()

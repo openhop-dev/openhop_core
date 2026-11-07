@@ -589,6 +589,7 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
             self._rx_thread.join(timeout=2.0)
 
         self._close_sock()
+        self._rf_reconnecting = False
         logger.info("TCPLoRaRadio cleanup complete")
 
     # ══════════════════════════════════════════════════════════
@@ -780,6 +781,7 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
         Does NOT start a new RX worker (we are already in one); does NOT flip
         self._initialized (the radio is still the same instance from the host's
         point of view). Used by _reconnect_with_backoff after a dropped link."""
+        self._rf_reconnecting = True
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(self.connect_timeout)
@@ -803,9 +805,18 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
             logger.error(f"Reconnect socket open failed: {e}")
             self._close_sock()
             return False
+        finally:
+            self._rf_reconnecting = False
 
     def _reconnect_with_backoff(self) -> bool:
         """Exponential backoff (1, 2, 5, 10, 30 s) until socket is up or stop_event fires."""
+        self._rf_reconnecting = True
+        try:
+            return self._reconnect_attempts_with_backoff()
+        finally:
+            self._rf_reconnecting = False
+
+    def _reconnect_attempts_with_backoff(self) -> bool:
         for delay in (1.0, 2.0, 5.0, 10.0, 30.0):
             if self._stop_event.is_set():
                 return False
@@ -999,10 +1010,15 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
         expect_cmd: int,
         timeout: float = 5.0,
     ) -> Optional[bytes]:
+        deadline = time.monotonic() + timeout
         async with self._command_lock:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not await self._rf_wait_clean_async(remaining):
+                return None
             if self._sock is None:
                 return None
-            if not await self._rf_wait_clean_async(timeout):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
 
             if self._event_loop is None:
@@ -1025,7 +1041,7 @@ class TCPLoRaRadio(_RadioBase, FrameRfControls):
                     return None
 
                 try:
-                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                    await asyncio.wait_for(evt.wait(), timeout=max(0, deadline - time.monotonic()))
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                     return None
