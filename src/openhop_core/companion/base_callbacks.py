@@ -200,6 +200,8 @@ class _CallbackMixin:
         )
         contact.out_path_len = path_len
         contact.out_path = path_bytes
+        # As BaseChatMesh::onContactPathRecv does, so CMD_GET_CONTACTS since a cursor returns it.
+        contact.lastmod = int(time.time())
         self.contacts.update(contact)
         await self._fire_callbacks("contact_path_updated", contact)
 
