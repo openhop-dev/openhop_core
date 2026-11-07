@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from ...protocol import Packet
-from ...protocol.constants import PAYLOAD_TYPE_GRP_TXT, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD
+from ...protocol.constants import (
+    CIPHER_BLOCK_SIZE,
+    PAYLOAD_TYPE_GRP_TXT,
+    ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_FLOOD,
+)
 from ...protocol.crypto import CryptoUtils
 from ...protocol.packet_filter import PacketHashCache
 from ...protocol.utils import derive_channel_hash
@@ -145,6 +150,8 @@ class GroupTextHandler(BaseHandler):
         validate (which is expected during candidate iteration when multiple
         channels share the same 1-byte hash).
         """
+        if not ciphertext or len(ciphertext) % CIPHER_BLOCK_SIZE:
+            return None
         try:
             # Convert hex secret to bytes
             try:

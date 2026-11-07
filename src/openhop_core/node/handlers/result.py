@@ -21,10 +21,13 @@ class HandlerResult:
             the caller must leave the packet available to the forwarding engine.
         response: An optional packet to transmit in reply (e.g. a request
             response or path return); None when no reply is warranted.
+        response_claimed: A pending request already claimed this response.
+            PATH dispatch must not interpret it again as a login reply.
     """
 
     authenticated: bool
     response: Optional[Any] = None
+    response_claimed: bool = False
 
     @classmethod
     def not_for_us(cls) -> "HandlerResult":
@@ -32,6 +35,8 @@ class HandlerResult:
         return cls(authenticated=False)
 
     @classmethod
-    def consumed(cls, response: Optional[Any] = None) -> "HandlerResult":
+    def consumed(
+        cls, response: Optional[Any] = None, *, response_claimed: bool = False
+    ) -> "HandlerResult":
         """Authenticated for a local identity; optionally reply with ``response``."""
-        return cls(authenticated=True, response=response)
+        return cls(authenticated=True, response=response, response_claimed=response_claimed)

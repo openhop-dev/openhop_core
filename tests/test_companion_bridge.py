@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from openhop_core.companion import CompanionBridge
-from openhop_core.companion.constants import ADV_TYPE_CHAT, AUTOADD_CHAT
+from openhop_core.companion.constants import (
+    ADV_TYPE_CHAT,
+    AUTOADD_CHAT,
+    AUTOADD_OVERWRITE_OLDEST,
+)
 from openhop_core.companion.models import Contact, MessageEvent, QueuedMessage
 from openhop_core.companion.timing import estimate_airtime_ms
 from openhop_core.node.events import MeshEvents
@@ -863,6 +867,167 @@ class TestCompanionBridgeNodeDiscoveredAdvertPipeline:
             "snr": 0.0,
             "rssi": 0,
         }
+
+    async def _full_overwrite_bridge(self, first_peer):
+        """One-slot bridge with overwrite-oldest, already holding *first_peer*."""
+        bridge = CompanionBridge(LocalIdentity(), MockPacketInjector(), max_contacts=1)
+        bridge.prefs.autoadd_config = AUTOADD_OVERWRITE_OLDEST
+        await bridge._handle_mesh_event(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(first_peer, name="A", advert_timestamp=1000),
+        )
+        return bridge
+
+    async def test_concurrent_node_discovered_events_are_serialized_through_callbacks(self):
+        """A second advert must not touch the contact store while the first advert's
+        callbacks are still running (hosts persist contact_deleted/advert_received)."""
+        a, b, c = LocalIdentity(), LocalIdentity(), LocalIdentity()
+        bridge = await self._full_overwrite_bridge(a)
+
+        first_delete_started = asyncio.Event()
+        release_first_delete = asyncio.Event()
+        callback_order = []
+
+        async def on_deleted(pubkey):
+            callback_order.append(("deleted", pubkey))
+            if pubkey == a.get_public_key():
+                first_delete_started.set()
+                await release_first_delete.wait()
+
+        async def on_advert(contact):
+            callback_order.append(("advert", contact.public_key))
+
+        async def on_discovered(contact):
+            callback_order.append(("discovered", contact.public_key))
+
+        bridge.on_contact_deleted(on_deleted)
+        bridge.on_advert_received(on_advert)
+        bridge.on_node_discovered(on_discovered)
+
+        task_b = asyncio.create_task(
+            bridge._handle_mesh_event(
+                MeshEvents.NODE_DISCOVERED,
+                self._advert_event(b, name="B", advert_timestamp=2000),
+            )
+        )
+        await asyncio.wait_for(first_delete_started.wait(), timeout=1.0)
+        task_c = asyncio.create_task(
+            bridge._handle_mesh_event(
+                MeshEvents.NODE_DISCOVERED,
+                self._advert_event(c, name="C", advert_timestamp=3000),
+            )
+        )
+        # Give C a chance to run; it must be parked on the advert lock.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert bridge.contacts.get_by_key(b.get_public_key()) is not None
+        assert bridge.contacts.get_by_key(c.get_public_key()) is None
+        assert not task_c.done()
+
+        release_first_delete.set()
+        await asyncio.wait_for(asyncio.gather(task_b, task_c), timeout=1.0)
+
+        contacts = bridge.get_contacts()
+        assert [ct.public_key for ct in contacts] == [c.get_public_key()]
+        assert callback_order == [
+            ("deleted", a.get_public_key()),
+            ("advert", b.get_public_key()),
+            ("discovered", b.get_public_key()),
+            ("deleted", b.get_public_key()),
+            ("advert", c.get_public_key()),
+            ("discovered", c.get_public_key()),
+        ]
+
+    async def test_publish_sync_node_discovered_events_are_serialized(self):
+        """Same interleaving driven through EventService.publish_sync(), which schedules
+        each event as its own task (the path that exposed the race)."""
+        a, b, c = LocalIdentity(), LocalIdentity(), LocalIdentity()
+        bridge = await self._full_overwrite_bridge(a)
+
+        first_delete_started = asyncio.Event()
+        release_first_delete = asyncio.Event()
+        c_discovered = asyncio.Event()
+        callback_order = []
+
+        async def on_deleted(pubkey):
+            callback_order.append(("deleted", pubkey))
+            if pubkey == a.get_public_key():
+                first_delete_started.set()
+                await release_first_delete.wait()
+
+        def on_advert(contact):
+            callback_order.append(("advert", contact.public_key))
+
+        def on_discovered(contact):
+            callback_order.append(("discovered", contact.public_key))
+            if contact.public_key == c.get_public_key():
+                c_discovered.set()
+
+        bridge.on_contact_deleted(on_deleted)
+        bridge.on_advert_received(on_advert)
+        bridge.on_node_discovered(on_discovered)
+
+        bridge._event_service.publish_sync(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(b, name="B", advert_timestamp=2000),
+        )
+        await asyncio.wait_for(first_delete_started.wait(), timeout=1.0)
+        bridge._event_service.publish_sync(
+            MeshEvents.NODE_DISCOVERED,
+            self._advert_event(c, name="C", advert_timestamp=3000),
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert bridge.contacts.get_by_key(c.get_public_key()) is None
+
+        release_first_delete.set()
+        await asyncio.wait_for(c_discovered.wait(), timeout=1.0)
+
+        assert [ct.public_key for ct in bridge.get_contacts()] == [c.get_public_key()]
+        assert callback_order == [
+            ("deleted", a.get_public_key()),
+            ("advert", b.get_public_key()),
+            ("discovered", b.get_public_key()),
+            ("deleted", b.get_public_key()),
+            ("advert", c.get_public_key()),
+            ("discovered", c.get_public_key()),
+        ]
+
+    async def test_node_discovered_lock_is_per_companion(self):
+        """A companion blocked in an advert callback must not stall another companion."""
+        a = LocalIdentity()
+        blocked = await self._full_overwrite_bridge(a)
+        other = CompanionBridge(LocalIdentity(), MockPacketInjector())
+
+        delete_started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def on_deleted(_pubkey):
+            delete_started.set()
+            await release.wait()
+
+        blocked.on_contact_deleted(on_deleted)
+        task = asyncio.create_task(
+            blocked._handle_mesh_event(
+                MeshEvents.NODE_DISCOVERED,
+                self._advert_event(LocalIdentity(), name="B", advert_timestamp=2000),
+            )
+        )
+        try:
+            await asyncio.wait_for(delete_started.wait(), timeout=1.0)
+            peer = LocalIdentity()
+            await asyncio.wait_for(
+                other._handle_mesh_event(
+                    MeshEvents.NODE_DISCOVERED,
+                    self._advert_event(peer, name="P", advert_timestamp=1000),
+                ),
+                timeout=1.0,
+            )
+            assert other.contacts.get_by_key(peer.get_public_key()) is not None
+        finally:
+            release.set()
+            await task
 
     async def test_newer_advert_updates_existing_contact(self):
         """An advert with a strictly newer timestamp updates the stored contact."""

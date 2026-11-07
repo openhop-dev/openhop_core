@@ -38,8 +38,10 @@ from ..constants import (
     CMD_IMPORT_CONTACT,
     CMD_IMPORT_PRIVATE_KEY,
     CMD_LOGOUT,
+    CMD_REBOOT,
     CMD_REMOVE_CONTACT,
     CMD_RESET_PATH,
+    CMD_RUN_CLI_COMMAND,
     CMD_SEND_ANON_REQ,
     CMD_SEND_BINARY_REQ,
     CMD_SEND_CHANNEL_DATA,
@@ -60,6 +62,7 @@ from ..constants import (
     CMD_SET_CHANNEL,
     CMD_SET_CUSTOM_VAR,
     CMD_SET_DEFAULT_FLOOD_SCOPE,
+    CMD_SET_DEVICE_PIN,
     CMD_SET_DEVICE_TIME,
     CMD_SET_FLOOD_SCOPE,
     CMD_SET_OTHER_PARAMS,
@@ -211,7 +214,17 @@ class CompanionFrameServer(
             CMD_SEND_RAW_PACKET: self._cmd_send_raw_packet,
             CMD_SET_PATH_HASH_MODE: self._cmd_set_path_hash_mode,
             CMD_GET_ALLOWED_REPEAT_FREQ: self._cmd_get_allowed_repeat_freq,
+            CMD_SET_DEVICE_PIN: self._cmd_set_device_pin,
+            CMD_RUN_CLI_COMMAND: self._cmd_run_cli_command,
+            CMD_REBOOT: self._cmd_reboot,
         }
+
+        # `board` on the companion's CLI answers what DEVICE_INFO says.
+        cli = getattr(bridge, "cli", None)
+        if callable(getattr(cli, "set_device_info", None)):
+            cli.set_device_info(
+                self._model_bytes.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            )
 
     # -------------------------------------------------------------------------
     # Persistence hooks (override in subclasses for SQLite, etc.)

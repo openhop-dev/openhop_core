@@ -130,7 +130,7 @@ class RegionMap:
 
         code = packet.transport_codes[0]
         if not code:
-            return None
+            return self.wildcard
 
         for region in self._regions:
             # Skip regions that explicitly deny this traffic type.
@@ -175,17 +175,14 @@ def capture_recv_region(region_map: Optional[RegionMap], pkt: Packet) -> None:
     outcomes rather than two:
 
     - ``TRANSPORT_FLOOD``: match against ``REGION_DENY_FLOOD``-honouring regions
-      and record that region's (single) key. Firmware tests ``isWildcard()`` on
-      the match before resolving any key. Its ``findMatch`` iterates the region
-      list only and so cannot return the wildcard -- ids are handed out from
-      ``next_id``, so nothing in ``regions[]`` has id 0 -- but nothing here stops
-      an application registering a RegionEntry with id 0, so honour the same
-      precedence rather than scoping a reply firmware would have sent plain.
+      and record that region's (single) key. A zero transport code resolves to
+      the wildcard, even when its deny flag is set, matching MeshCore 1.18's
+      ``findMatch`` early return. That request is mirrored as un-scoped.
     - ``FLOOD``: firmware sets ``recv_pkt_region = &getWildcard()`` unless the
       wildcard denies flood. Recorded as ``_recv_region_unscoped`` -- the
       requester chose un-scoped, and :func:`apply_reply_scope` mirrors it.
     - Direct, an unresolved transport code, a region with no usable key, or a
-      wildcard that denies flood: firmware leaves ``recv_pkt_region`` NULL, which
+      plain flood whose wildcard denies flood: ``recv_pkt_region`` stays NULL, which
       is *scope unknowable* rather than *un-scoped*. Both flags stay clear and
       the reply defers to the ordinary send precedence.
 

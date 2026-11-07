@@ -84,6 +84,9 @@ PUSH_CALLBACK_KEYS = [
     "contact_deleted",
     "contacts_full",
     "channel_updated",
+    # The companion reloaded its settings for a `reboot` (CMD_REBOOT or the CLI);
+    # a frame server drops its client so the app re-syncs, as after a real reboot.
+    "reboot",
 ]
 
 

@@ -94,6 +94,19 @@ class LoginResponseHandler(BaseHandler):
         """
         self._pending_logins[bytes(pubkey)] = callback
 
+    def expects_login_response(self, pubkey: bytes, tag: int) -> bool:
+        """Whether this sender's response belongs to a pending login."""
+        key = bytes(pubkey)
+        if key not in self._pending_logins:
+            return False
+        if self._foreign_request_probe is not None:
+            try:
+                if self._foreign_request_probe(tag, key):
+                    return False
+            except Exception as e:
+                self.log(f"Foreign-request probe failed: {e}")
+        return True
+
     def remove_login_callback(self, pubkey: bytes, callback) -> None:
         """Remove the pending login for ``pubkey`` only if it is ``callback``.
 

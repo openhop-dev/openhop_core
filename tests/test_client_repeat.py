@@ -7,7 +7,7 @@ retransmit.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -245,6 +245,68 @@ async def _drain_tasks():
     # Let the create_task'd forward run (delay patched to 0).
     for _ in range(5):
         await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hash_size", [1, 2, 3])
+async def test_direct_ack_jitter_uses_received_path_before_stripping_self(hash_size):
+    from openhop_core.protocol.packet_utils import calculate_lora_airtime_ms
+
+    dispatcher, radio = _make_dispatcher()
+    packet = PacketBuilder.create_ack_from_bytes(
+        b"\x11\x22\x33\x44\x00\x99",
+        path=SELF_KEY[:hash_size] + b"\xaa" * hash_size,
+        path_len_encoded=PathUtils.encode_path_len(hash_size, 2),
+    )
+    received_len = packet.get_path_byte_len() + packet.payload_len + 2
+    expected_airtime = calculate_lora_airtime_ms(received_len, 10, 250000, 5, 8)
+    delay_paths = []
+    original_delay = dispatcher._client_repeat_delay_ms
+
+    def capture_delay_path(pkt):
+        delay_paths.append(bytes(pkt.path))
+        return original_delay(pkt)
+
+    dispatcher._client_repeat_delay_ms = capture_delay_path
+    with patch("openhop_core.node.dispatcher.random.randint", return_value=0) as rng:
+        await dispatcher._process_received_packet(packet.write_to(), -70, 8.0)
+        await _drain_tasks()
+
+    rng.assert_called_once_with(0, int(5 * (expected_airtime * 0.2)))
+    assert delay_paths == [SELF_KEY[:hash_size] + b"\xaa" * hash_size]
+    assert radio.send_count == 1
+    forwarded = Packet()
+    forwarded.read_from(radio.tx_data)
+    assert forwarded.path == b"\xaa" * hash_size
+    assert forwarded.get_path_hash_count() == 1
+    assert forwarded.payload == packet.payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["flood", "trace"])
+async def test_flood_and_trace_jitter_use_the_appended_path(route):
+    dispatcher, radio = _make_dispatcher()
+    if route == "flood":
+        packet = _flood_txt(dest_hash=0x77)
+        expected_path = SELF_KEY[:1]
+    else:
+        packet = Packet()
+        packet.header = (PAYLOAD_TYPE_TRACE << 2) | ROUTE_TYPE_DIRECT
+        packet.payload = bytearray(bytes(range(1, 9)) + b"\x00" + SELF_KEY[:1])
+        packet.payload_len = len(packet.payload)
+        expected_path = bytes([32])  # received SNR 8 dB, scaled by four
+    delay_paths = []
+
+    def capture_delay_path(pkt):
+        delay_paths.append(bytes(pkt.path))
+        return 0
+
+    dispatcher._client_repeat_delay_ms = capture_delay_path
+    await dispatcher._process_received_packet(packet.write_to(), -70, 8.0)
+    await _drain_tasks()
+
+    assert delay_paths == [expected_path]
+    assert radio.send_count == 1
 
 
 @pytest.mark.asyncio

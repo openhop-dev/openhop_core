@@ -1,3 +1,7 @@
+from unittest.mock import patch
+
+import pytest
+
 from openhop_core import CryptoUtils
 
 
@@ -33,6 +37,32 @@ def test_crypto_utils_encrypt_then_mac():
     # Remove padding (null bytes at the end)
     decrypted = decrypted.rstrip(b"\x00")
     assert decrypted == plaintext
+
+
+@pytest.mark.parametrize("ciphertext_len", [n for n in range(1, 65) if n % 16])
+def test_mac_then_decrypt_rejects_incomplete_blocks_before_hmac(ciphertext_len):
+    key = bytes(range(16))
+    secret = bytes(range(32))
+    ciphertext = bytes(range(ciphertext_len))
+    valid_mac = CryptoUtils._hmac_sha256(secret, ciphertext)[:2]
+    with patch.object(CryptoUtils, "_hmac_sha256") as hmac_fn:
+        with pytest.raises(ValueError, match="block-aligned"):
+            CryptoUtils.mac_then_decrypt(key, secret, valid_mac + ciphertext)
+        hmac_fn.assert_not_called()
+    with pytest.raises(ValueError, match="block-aligned"):
+        CryptoUtils._aes_decrypt(key, ciphertext)
+
+
+@pytest.mark.parametrize("size", [1, 15, 16, 17, 31, 32, 63, 64, 165])
+def test_mac_then_decrypt_preserves_complete_blocks_and_zero_padding(size):
+    key = bytes(range(16))
+    secret = bytes(range(32))
+    plaintext = bytes(range(size))
+    encrypted = CryptoUtils.encrypt_then_mac(key, secret, plaintext)
+    assert CryptoUtils.mac_then_decrypt(key, secret, encrypted) == (plaintext + bytes((-size) % 16))
+    corrupted_mac = bytes([encrypted[0] ^ 1]) + encrypted[1:]
+    with pytest.raises(ValueError, match="Invalid HMAC"):
+        CryptoUtils.mac_then_decrypt(key, secret, corrupted_mac)
 
 
 def test_crypto_utils_key_exchange():

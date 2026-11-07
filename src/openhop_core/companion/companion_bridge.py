@@ -446,6 +446,14 @@ class CompanionBridge(CompanionBase):
         """Reject shared-radio TX-power changes without mutating preferences."""
         return False
 
+    def _apply_prefs_to_runtime(self) -> None:
+        """A bridge has no radio: only its own text-handler pref goes live."""
+        self._apply_multi_acks_pref()
+
+    def stage_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Reject staged shared-radio changes without mutating preferences."""
+        return False
+
     def _get_advert_handler(self):
         """Return the normal ADVERT handler used for contact-import loopback."""
         return self._handlers.get(PAYLOAD_TYPE_ADVERT)
@@ -521,7 +529,8 @@ class CompanionBridge(CompanionBase):
 
     async def start(self) -> None:
         self._running = True
-        self._apply_multi_acks_pref()
+        self._remote_cli_closed = False
+        self._apply_prefs_to_runtime()
         logger.info(
             "CompanionBridge started: name=%s, key=%s...",
             self.prefs.node_name,
@@ -530,6 +539,7 @@ class CompanionBridge(CompanionBase):
 
     async def stop(self) -> None:
         self._running = False
+        self._cancel_remote_cli_replies()
         self._clear_pending_frame_logins()
         protocol_handler = self._get_protocol_response_handler()
         if protocol_handler is not None:

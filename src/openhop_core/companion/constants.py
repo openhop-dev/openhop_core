@@ -63,6 +63,19 @@ AUTOADD_ROOM = 0x08
 AUTOADD_SENSOR = 0x10
 
 # ---------------------------------------------------------------------------
+# Contact flags (firmware ContactInfo::flags accessors, ContactInfo.h)
+# ---------------------------------------------------------------------------
+CONTACT_FLAG_FAVOURITE = 0x01
+CONTACT_FLAG_TELEM_BASE = 0x02
+CONTACT_FLAG_TELEM_LOC = 0x04
+CONTACT_FLAG_TELEM_ENV = 0x08
+# The app sets this to let the contact run this companion's CLI remotely with a
+# TXT_TYPE_CLI_COMMAND message (isRemoteCLIAllowed).
+CONTACT_FLAG_REMOTE_CLI = 0x10
+# Delay before answering a remote CLI command (BaseChatMesh CLI_REPLY_DELAY_MILLIS).
+CLI_REPLY_DELAY_MS = 600
+
+# ---------------------------------------------------------------------------
 # Message Send Result
 # ---------------------------------------------------------------------------
 MSG_SEND_FAILED = 0
@@ -167,7 +180,8 @@ TELEMETRY_TIMEOUT_HINT_MS = 15000
 #     CMD_GET_ALLOWED_REPEAT_FREQ and CMD_SEND_RAW_PACKET.
 # 13+ (MeshCore PR #2672, v1.16.0): non-contact CMD_SEND_ANON_REQ — the device
 #     creates a transient zero-hop contact for a pubkey not already in contacts.
-FIRMWARE_VER_CODE = 13
+# 14+ adds CMD_RUN_CLI_COMMAND / RESP_CODE_CLI_REPLY: the companion's local CLI.
+FIRMWARE_VER_CODE = 14
 
 # ---------------------------------------------------------------------------
 # Commands (app -> radio)
@@ -230,6 +244,7 @@ CMD_SEND_CHANNEL_DATA = 62
 CMD_SET_DEFAULT_FLOOD_SCOPE = 63
 CMD_GET_DEFAULT_FLOOD_SCOPE = 64
 CMD_SEND_RAW_PACKET = 65
+CMD_RUN_CLI_COMMAND = 66  # v14+
 
 # ---------------------------------------------------------------------------
 # Response codes (radio -> app)
@@ -263,6 +278,7 @@ RESP_CODE_AUTOADD_CONFIG = 25
 RESP_CODE_ALLOWED_REPEAT_FREQ = 26
 RESP_CODE_CHANNEL_DATA_RECV = 27
 RESP_CODE_DEFAULT_FLOOD_SCOPE = 28
+RESP_CODE_CLI_REPLY = 29  # v14+, reply to CMD_RUN_CLI_COMMAND
 
 # ---------------------------------------------------------------------------
 # Push codes (radio -> app, unsolicited)
@@ -348,7 +364,7 @@ OPENHOP_CHANNEL_TXT_SCOPED = 0x80
 # txt_type subtype: capability probe for the extensions above.
 OPENHOP_CHANNEL_SCOPE_PROBE = 0x81
 # Response code for a capability-probe reply. Clear of both the firmware
-# RESP_CODE_* range (0..28) and the PUSH_CODE_* range (0x80..0x90).
+# RESP_CODE_* range (0..29) and the PUSH_CODE_* range (0x80..0x90).
 RESP_CODE_OPENHOP_EXTENSION = 0xF0
 # Contract marker returned by the probe. Bump the digit for any incompatible
 # change to the byte layouts; a client must see this exact value before

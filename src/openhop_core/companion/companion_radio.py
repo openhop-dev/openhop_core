@@ -76,6 +76,9 @@ class CompanionRadio(CompanionBase):
         initial_contacts: Optional[Iterable[Any]] = None,
     ) -> None:
         """Initialise the companion radio."""
+        # Set before the stores: prefs are seeded from the radio's own params
+        # where radio_config is silent (see _configured_radio_prefs).
+        self._radio = radio
         self._init_companion_stores(
             identity=identity,
             node_name=node_name,
@@ -86,8 +89,11 @@ class CompanionRadio(CompanionBase):
             radio_config=radio_config,
             initial_contacts=initial_contacts,
         )
-        self._radio = radio
         self._dispatcher_task: Optional[asyncio.Task] = None
+        # Last radio params this companion applied, for a backend that doesn't
+        # report its own (see _running_radio_params). Kept apart from
+        # radio_config, which is the host's dict.
+        self._live_radio_prefs = self._configured_radio_prefs()
 
         self.node = MeshNode(
             radio=radio,
@@ -133,6 +139,10 @@ class CompanionRadio(CompanionBase):
     def _get_text_handler(self) -> Any:
         return self.node.dispatcher.text_message_handler
 
+    def _apply_multi_acks_pref(self) -> None:
+        super()._apply_multi_acks_pref()
+        self.node.dispatcher.set_multi_acks(self.prefs.multi_acks)
+
     def _get_advert_handler(self) -> Any:
         return self.node.dispatcher._handler_instances.get(PAYLOAD_TYPE_ADVERT)
 
@@ -144,21 +154,9 @@ class CompanionRadio(CompanionBase):
         if self._running:
             logger.warning("CompanionRadio already running")
             return
+        self._remote_cli_closed = False
         self._running = True
-        self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
-        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
-        # Seed the flood-scope mirrors from persisted prefs at boot: the
-        # default, the transient override and the sticky unscoped flag. Without
-        # this, a companion booted with only a persisted default would send every
-        # dispatcher-scoped packet as plain flood until the first set_* call.
-        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
-        self.node.dispatcher.flood_transport_key = self._flood_transport_key
-        self.node.dispatcher.flood_unscoped = self._flood_unscoped
-        # Sync the airtime budget factor before arming the bucket so the initial
-        # duty cycle is correct when client-repeat starts enabled.
-        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
-        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
-        self._apply_multi_acks_pref()
+        self._apply_prefs_to_runtime()
         self._dispatcher_task = asyncio.create_task(self.node.start())
         # Wait until the dispatcher loop is active so a following stop() cannot
         # lose a race where run_forever clears the stop event before starting.
@@ -185,8 +183,91 @@ class CompanionRadio(CompanionBase):
             self._identity.get_public_key().hex()[:16],
         )
 
+    def _apply_prefs_to_runtime(self) -> None:
+        """Push prefs into the radio and dispatcher: at start, and again when a
+        `reboot` reloads them."""
+        self._apply_staged_radio_params()
+        self._apply_cad_pref()
+        self.node.dispatcher.set_default_path_hash_mode(self.prefs.path_hash_mode)
+        self.node.dispatcher.rx_delay_base = self.prefs.rx_delay_base
+        # Seed the flood-scope mirrors from persisted prefs at boot: the
+        # default, the transient override and the sticky unscoped flag. Without
+        # this, a companion booted with only a persisted default would send every
+        # dispatcher-scoped packet as plain flood until the first set_* call.
+        self.node.dispatcher.default_flood_transport_key = self._default_scope_key()
+        self.node.dispatcher.flood_transport_key = self._flood_transport_key
+        self.node.dispatcher.flood_unscoped = self._flood_unscoped
+        # Sync the airtime budget factor before arming the bucket so the initial
+        # duty cycle is correct when client-repeat starts enabled.
+        self.node.dispatcher.airtime_budget_factor = self.prefs.airtime_factor
+        self.node.dispatcher.set_client_repeat_enabled(bool(self.prefs.client_repeat))
+        self._apply_multi_acks_pref()
+
+    def _radio_has_lbt(self) -> bool:
+        return hasattr(self._radio, "lbt_enabled")
+
+    def get_cad_enabled(self) -> Optional[bool]:
+        """The stored ``cad`` pref, else the radio's configured LBT mode."""
+        if not self._radio_has_lbt():
+            return None
+        if self.prefs.cad_enabled is not None:
+            return bool(self.prefs.cad_enabled)
+        return bool(self._radio.lbt_enabled)
+
+    def set_cad_enabled(self, enabled: bool) -> bool:
+        """Store and apply listen-before-talk on the owned radio."""
+        if not self._radio_has_lbt():
+            return False
+        self.prefs.cad_enabled = bool(enabled)
+        self._save_prefs()
+        self._apply_cad_pref()
+        return True
+
+    def _apply_cad_pref(self) -> None:
+        # Until someone sets `cad`, the radio keeps the LBT mode it was built with.
+        if self.prefs.cad_enabled is None or not self._radio_has_lbt():
+            return
+        setter = getattr(self._radio, "set_lbt_enabled", None)
+        if callable(setter):
+            setter(bool(self.prefs.cad_enabled))
+        else:
+            self._radio.lbt_enabled = bool(self.prefs.cad_enabled)
+
+    def _apply_staged_radio_params(self) -> None:
+        """Bring the radio up on the stored radio prefs, as firmware does at boot
+        (``radio_driver.setParams(_prefs.freq, ...)``).
+
+        Does nothing unless the stored prefs differ from what the radio is
+        running on: a persistence layer's ``_load_prefs`` restored other
+        values, or the CLI's ``set radio`` staged some ("OK - reboot to
+        apply").
+        """
+        stored = {field: getattr(self.prefs, field) for field in self._live_radio_prefs}
+        pending = getattr(self._radio, "pending_configure", None)
+        # A retune still queued behind a TX is not what the radio runs: issue
+        # the stored params anyway, which supersedes it.
+        if stored == self._running_radio_params() and (pending is None or pending.done()):
+            return
+        configure = getattr(self._radio, "configure_radio", None)
+        if not callable(configure):
+            return
+        params = {
+            "frequency": stored["frequency_hz"],
+            "bandwidth": stored["bandwidth_hz"],
+            "spreading_factor": stored["spreading_factor"],
+            "coding_rate": stored["coding_rate"],
+        }
+        try:
+            applied = configure(**params)
+        except Exception as e:
+            logger.error("Error applying stored radio params: %s", e)
+            return
+        if applied is not False:
+            self._live_radio_prefs = stored
+
     async def stop(self) -> None:
         self._running = False
+        self._cancel_remote_cli_replies()
         self._clear_pending_frame_logins()
         try:
             self.node.dispatcher.remove_raw_packet_subscriber(self._on_raw_packet_rx_log)
@@ -319,11 +400,12 @@ class CompanionRadio(CompanionBase):
         return super().get_max_tx_power_dbm()
 
     def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
-        """Apply parameters to owned hardware before persisting the change."""
-        if not (5 <= sf <= 12):
-            raise ValueError(f"Spreading factor out of range: {sf}")
-        if not (5 <= cr <= 8):
-            raise ValueError(f"Coding rate out of range: {cr}")
+        """Apply parameters to owned hardware before persisting the change.
+
+        From a coroutine prefer :meth:`set_radio_params_async`: during a TX the
+        synchronous backend call can only queue the retune, not confirm it.
+        """
+        self._check_radio_params(sf, cr)
         configure = getattr(self._radio, "configure_radio", None)
         if not callable(configure):
             return False
@@ -337,8 +419,71 @@ class CompanionRadio(CompanionBase):
         except Exception as e:
             logger.error("Error configuring radio: %s", e)
             return False
+        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr)
+
+    async def set_radio_params_async(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Like :meth:`set_radio_params`, but awaits an in-flight TX so the
+        result says whether the radio was actually retuned."""
+        self._check_radio_params(sf, cr)
+        configure_async = getattr(self._radio, "configure_radio_async", None)
+        if not callable(configure_async):
+            return self.set_radio_params(freq_hz, bw_hz, sf, cr)
+        try:
+            applied = await configure_async(
+                frequency=freq_hz,
+                bandwidth=bw_hz,
+                spreading_factor=sf,
+                coding_rate=cr,
+            )
+        except Exception as e:
+            logger.error("Error configuring radio: %s", e)
+            return False
+        return self._radio_params_applied(applied, freq_hz, bw_hz, sf, cr)
+
+    @staticmethod
+    def _check_radio_params(sf: int, cr: int) -> None:
+        if not (5 <= sf <= 12):
+            raise ValueError(f"Spreading factor out of range: {sf}")
+        if not (5 <= cr <= 8):
+            raise ValueError(f"Coding rate out of range: {cr}")
+
+    _RADIO_PARAM_ATTRS = (
+        ("frequency_hz", "frequency"),
+        ("bandwidth_hz", "bandwidth"),
+        ("spreading_factor", "spreading_factor"),
+        ("coding_rate", "coding_rate"),
+    )
+
+    def _configured_radio_prefs(self) -> dict:
+        """Where radio_config is silent, the radio's own params rather than
+        generic defaults: the backend was built with them, so seeding prefs
+        from a default like 915 MHz would report the wrong radio to the app
+        and have start() retune it there."""
+        prefs = super()._configured_radio_prefs()
+        radio = getattr(self, "_radio", None)
+        for pref, attr in self._RADIO_PARAM_ATTRS:
+            if attr not in self._radio_config and hasattr(radio, attr):
+                prefs[pref] = getattr(radio, attr)
+        return prefs
+
+    def _running_radio_params(self) -> dict:
+        """The radio params the hardware is actually on. Backends report them
+        (updated only when a retune is applied), so a queued or failed retune
+        can never be mistaken for live. A backend that doesn't falls back to
+        the last params this companion applied."""
+        if all(hasattr(self._radio, attr) for _, attr in self._RADIO_PARAM_ATTRS):
+            return {pref: getattr(self._radio, attr) for pref, attr in self._RADIO_PARAM_ATTRS}
+        return dict(self._live_radio_prefs)
+
+    def _radio_params_applied(self, applied, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
         if applied is False:
             return False
+        self._live_radio_prefs = {
+            "frequency_hz": freq_hz,
+            "bandwidth_hz": bw_hz,
+            "spreading_factor": sf,
+            "coding_rate": cr,
+        }
         return super().set_radio_params(freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:
@@ -391,6 +536,12 @@ class CompanionRadio(CompanionBase):
             radio_stats["last_rssi"] = self._radio.get_last_rssi()
         if hasattr(self._radio, "get_last_snr"):
             radio_stats["last_snr"] = self._radio.get_last_snr()
+        # Optional capability; None keeps the frame's existing 0 fallback.
+        getter = getattr(self._radio, "get_cached_noise_floor", None)
+        if callable(getter):
+            noise_floor = getter()
+            if noise_floor is not None:
+                radio_stats["noise_floor"] = noise_floor
         return radio_stats
 
     # -------------------------------------------------------------------------

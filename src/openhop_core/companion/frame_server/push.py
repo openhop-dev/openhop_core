@@ -8,7 +8,6 @@ import time
 
 from ...protocol.packet_utils import PathUtils
 from ..constants import (
-    MAX_PAYLOAD_SIZE,
     OUT_PATH_UNKNOWN,
     PUB_KEY_SIZE,
     PUSH_CODE_BINARY_RESPONSE,
@@ -46,6 +45,7 @@ _PUSH_SUBSCRIPTIONS = (
     ("contacts_full", "_on_contacts_full"),
     ("raw_data_received", "_on_raw_data_received"),
     ("trace_received", "_on_trace_received"),
+    ("reboot", "_on_reboot"),
 )
 
 
@@ -75,6 +75,24 @@ class _PushMixin:
     # -------------------------------------------------------------------------
     # Bridge event callbacks (registered by _setup_push_callbacks)
     # -------------------------------------------------------------------------
+
+    async def _on_reboot(self) -> None:
+        """The companion rebooted (reloaded its settings): save contacts, as
+        firmware does before resetting, and drop the app so it reconnects and
+        re-reads everything."""
+        # The app that asked for the reboot, not whichever one connects while
+        # contacts are saving.
+        writer = self._client_writer
+        try:
+            await self._save_contacts()
+        except Exception as e:
+            logger.error("Companion reboot: saving contacts failed: %s", e)
+        if writer is not None:
+            logger.info("Companion reboot: dropping client (port=%s)", self.port)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
     async def _on_message_event(self, event: MessageEvent):
         msg_dict = {
@@ -217,11 +235,12 @@ class _PushMixin:
             except (TypeError, ValueError):
                 return
         if tag_int not in self._companion_binary_tags:
-            # Region discovery replies can be generated outside this
-            # frame-server request path; allow those through for parity
-            # with pre-owner-tag behavior while keeping other responses
-            # isolated to the requesting virtual companion.
-            if not (isinstance(parsed, dict) and parsed.get("type") == "regions"):
+            # MeshCore 1.18 sends unmatched responses (including sensor pushes)
+            # to the app. Matched requests owned by another frame server stay
+            # isolated; regions retain their existing compatibility exception.
+            if request_type is not None and not (
+                isinstance(parsed, dict) and parsed.get("type") == "regions"
+            ):
                 return
         else:
             self._companion_binary_tags.discard(tag_int)
@@ -272,15 +291,18 @@ class _PushMixin:
 
     def _on_raw_data_received(self, payload_bytes: bytes, snr: float, rssi: int) -> None:
         """Push PUSH_CODE_RAW_DATA (0x84): code, SNR byte, RSSI byte,
-        path-len byte (unknown), payload."""
+        path-len byte (unknown), payload.
+
+        Never clipped: an over-long frame is dropped by _enqueue_frame, as
+        firmware onRawDataRecv() drops it.
+        """
         snr_byte = max(-128, min(127, int(round(snr * 4))))
         rssi_byte = max(-128, min(127, int(rssi)))
-        payload_len = min(len(payload_bytes), MAX_PAYLOAD_SIZE - 4)
         data = (
             bytes([PUSH_CODE_RAW_DATA])
             + struct.pack("<bb", snr_byte, rssi_byte)
             + bytes([OUT_PATH_UNKNOWN])
-            + payload_bytes[:payload_len]
+            + payload_bytes
         )
         self._enqueue_frame(data)
 
@@ -372,8 +394,9 @@ class _PushMixin:
             snr_byte += 256
         if rssi_byte < 0:
             rssi_byte += 256
-        payload_len = min(len(raw), MAX_PAYLOAD_SIZE - 3)  # 3 = code + snr + rssi
-        data = bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF]) + raw[:payload_len]
+        # Never clipped: a clipped frame still parses but its MAC fails. An
+        # over-long one is dropped by _enqueue_frame, as firmware logRxRaw() does.
+        data = bytes([PUSH_CODE_LOG_RX_DATA, snr_byte & 0xFF, rssi_byte & 0xFF]) + raw
         self._enqueue_frame(data)
 
     async def push_rx_raw_async(self, snr: float, rssi: int, raw: bytes) -> None:
@@ -412,8 +435,8 @@ class _PushMixin:
         if rssi_byte < 0:
             rssi_byte += 256
         path_len_byte = max(0, min(255, int(path_len) if path_len is not None else 0))
-        payload_max = MAX_PAYLOAD_SIZE - 4  # 4 = code + snr + rssi + path_len_byte
-        payload_slice = bytes(payload[:payload_max]) if payload else b""
+        # Never clipped; see _on_raw_data_received (firmware onControlDataRecv()).
+        payload_slice = bytes(payload) if payload else b""
         data = (
             bytes(
                 [

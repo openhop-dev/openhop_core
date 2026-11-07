@@ -2698,6 +2698,126 @@ class TestStopIoThreadsEndsThePreviousGeneration:
         assert not reader.is_alive(), "the previous generation reader outlived the stop"
 
 
+class TestWorkersBoundToTheirSerialHandle:
+    """A worker belongs to the handle it was started on, not to self.serial_conn.
+
+    Recovery closes a handle from another thread while its reader is blocked in
+    read(); pyserial then fails on fd=None with "'NoneType' object cannot be
+    interpreted as an integer". That teardown was logged as a fresh RX error and
+    marked the link degraded again, possibly closing the next generation's port.
+    """
+
+    def test_rx_worker_never_reads_from_a_replacement_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        replacement = MagicMock()
+        replacement.is_open = True
+
+        class OldSerial:
+            is_open = True
+            read_count = 0
+            in_waiting = 0
+
+            def read(self, _size):
+                self.read_count += 1
+                modem.serial_conn = replacement
+                return b""
+
+        old = OldSerial()
+        modem.serial_conn = old
+        modem._rx_worker(old)
+
+        assert old.read_count == 1
+        replacement.read.assert_not_called()
+
+    def test_rx_close_race_is_teardown_not_a_new_failure(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class ClosingSerial:
+            is_open = True
+
+            def read(self, _size):
+                modem.serial_conn = None
+                self.is_open = False
+                raise TypeError("'NoneType' object cannot be interpreted as an integer")
+
+        conn = ClosingSerial()
+        modem.serial_conn = conn
+        modem._mark_serial_failure = MagicMock()
+
+        modem._rx_worker(conn)
+
+        modem._mark_serial_failure.assert_not_called()
+
+    def test_failure_on_the_live_handle_still_marks_the_link_degraded(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+
+        class BrokenSerial:
+            is_open = True
+
+            def read(self, _size):
+                raise OSError(5, "Input/output error")
+
+        conn = BrokenSerial()
+        modem.serial_conn = conn
+        modem._mark_serial_failure = MagicMock()
+
+        modem._rx_worker(conn)
+
+        modem._mark_serial_failure.assert_called_once()
+        assert "Input/output error" in modem._mark_serial_failure.call_args.args[0]
+
+    def test_tx_worker_leaves_the_queue_to_the_live_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        old = MagicMock()
+        old.is_open = True
+        modem.serial_conn = MagicMock()
+        modem.serial_conn.is_open = True
+        modem.tx_buffer.append(b"frame")
+        modem._write_frame = MagicMock(return_value=True)
+
+        modem._tx_worker(old)
+
+        modem._write_frame.assert_not_called()
+        assert list(modem.tx_buffer) == [b"frame"]
+
+    def test_close_detaches_before_touching_the_handle(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        calls = []
+
+        class TrackingSerial:
+            is_open = True
+
+            def cancel_read(self):
+                calls.append(("cancel_read", modem.serial_conn))
+
+            def cancel_write(self):
+                calls.append(("cancel_write", modem.serial_conn))
+
+            def close(self):
+                calls.append(("close", modem.serial_conn))
+                self.is_open = False
+
+        conn = TrackingSerial()
+        modem.serial_conn = conn
+        modem._close_serial_connection()
+
+        assert calls == [("cancel_read", None), ("cancel_write", None), ("close", None)]
+        assert conn.is_open is False
+
+    def test_close_survives_cancel_failures(self):
+        modem = KissModemWrapper(port="/dev/null", auto_configure=False)
+        conn = MagicMock()
+        conn.is_open = True
+        conn.cancel_read.side_effect = OSError("unsupported")
+        conn.cancel_write.side_effect = OSError("unsupported")
+        modem.serial_conn = conn
+
+        modem._close_serial_connection()
+
+        assert modem.serial_conn is None
+        conn.close.assert_called_once()
+
+
 class TestRxCallbackDisarmRace:
     """RX dispatch must tolerate the callback being cleared concurrently.
 
@@ -2765,6 +2885,59 @@ class TestSerialPortOpen:
     def test_connect_does_not_enable_hardware_flow_control(self):
         """The firmware implements no RTS/CTS flow control on the RX pipe."""
         assert self._connect_with_fake_serial().get("rtscts") is False
+
+    class _DtrTrackingSerial:
+        def __init__(self):
+            self.is_open = True
+            self.dtr_writes = []
+            self._dtr = True
+
+        @property
+        def dtr(self):
+            return self._dtr
+
+        @dtr.setter
+        def dtr(self, value):
+            self.dtr_writes.append(value)
+            self._dtr = value
+
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def write(self, data):
+            return len(data)
+
+        def flush(self):
+            pass
+
+    def _wait_for_ready(self, **kwargs):
+        modem = KissModemWrapper(auto_configure=False, post_open_delay_ms=0, **kwargs)
+        conn = self._DtrTrackingSerial()
+        modem.serial_conn = conn
+        modem._send_command = MagicMock(return_value=(RESP_PONG, b""))
+        with patch("threading.Event.wait", return_value=None):
+            assert modem._wait_for_modem_ready() is True
+        return modem, conn
+
+    def test_by_id_port_does_not_imply_usb_reset(self):
+        """A stable /dev/serial/by-id path is how most ESP32 modems are configured.
+
+        Inferring a DTR reset from it rebooted ESP32-S3 native-USB modems on every
+        open: the device re-enumerated under the just-opened port, the readiness
+        PING timed out, and recovery reopened and reset it again, indefinitely.
+        """
+        modem, conn = self._wait_for_ready(
+            port="/dev/serial/by-id/usb-Espressif_Systems_Station_G3_ESP32-if00"
+        )
+        assert modem.usb_reset_on_connect is False
+        assert conn.dtr_writes == []
+
+    def test_explicit_usb_reset_still_pulses_dtr(self):
+        modem, conn = self._wait_for_ready(port="/dev/ttyACM0", usb_reset_on_connect=True)
+        assert conn.dtr_writes == [False, True]
 
 
 class TestKissPortRecovery:

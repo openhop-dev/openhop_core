@@ -252,12 +252,15 @@ class ProtocolResponseHandler:
 
     def set_binary_response_callback(self, callback: Callable[..., Any]) -> None:
         """Set callback for binary responses. (tag_bytes, response_data, path_info=None).
-        path_info = (out_path, in_path, contact_pubkey) for path-return format."""
+        path_info = (out_path, in_path, contact_pubkey) for path-return format.
+        A True return value claims the response for a pending request, preventing
+        PATH dispatch from also interpreting it as a login reply."""
         self._binary_response_callback = callback
 
     async def __call__(self, pkt: Packet) -> HandlerResult:
         """Handle PATH/RESPONSE and report ownership after MAC verification."""
         authenticated = False
+        response_claimed = False
         try:
             # Check if this looks like an encrypted protocol response
             if len(pkt.payload) < 4:
@@ -306,13 +309,14 @@ class ProtocolResponseHandler:
                 response_tag = int.from_bytes(response_payload[:4], "little")
                 callback = self._response_waiters.pop((matched_contact_pubkey, response_tag), None)
                 if callback is not None:
+                    response_claimed = True
                     if parsed_data.get("type") == "telemetry":
                         self._log(
                             f"[ProtocolResponse] Delivering telemetry to waiter "
                             f"(src=0x{src_hash:02X}, {parsed_data.get('sensor_count', 0)} sensors)"
                         )
                     callback(success, decoded_text, parsed_data)
-                    return HandlerResult.consumed()
+                    return HandlerResult.consumed(response_claimed=True)
 
             # If binary response callback set, parse and invoke (tag+data or path-return)
             if (
@@ -350,26 +354,30 @@ class ProtocolResponseHandler:
                             matched_contact_pubkey,
                         )
 
-                # Do not deliver login responses to the binary callback; they are
-                # handled by LoginResponseHandler. Login response format is
-                # tag(4) + response_code(1) + keep_alive(1) + is_admin(1) + ...
-                # = 13 bytes total, with response_code 0x00 or 0x01.
-                if len(response_data) == 9 and response_data[0] in (0x00, 0x01):
+                # Login ownership is state-based: padding changes the apparent
+                # reply size, and sensor timestamps can resemble response codes.
+                if (
+                    self._login_response_handler is not None
+                    and self._login_response_handler.expects_login_response(
+                        matched_contact_pubkey, int.from_bytes(tag_bytes, "little")
+                    )
+                ):
                     return HandlerResult.consumed()
 
                 try:
                     cb_result = self._binary_response_callback(tag_bytes, response_data, path_info)
                     if asyncio.iscoroutine(cb_result):
-                        await cb_result
+                        cb_result = await cb_result
+                    response_claimed = cb_result is True
                 except Exception as e:
                     self._log(f"[ProtocolResponse] Binary response callback error: {e}")
-                return HandlerResult.consumed()
+                return HandlerResult.consumed(response_claimed=response_claimed)
 
             return HandlerResult.consumed()
 
         except Exception as e:
             self._log(f"[ProtocolResponse] Error processing protocol response: {e}")
-            return HandlerResult(authenticated=authenticated)
+            return HandlerResult(authenticated=authenticated, response_claimed=response_claimed)
 
     def _update_contact_path(
         self,
@@ -551,15 +559,13 @@ class ProtocolResponseHandler:
         if len(payload) < 2 + 4:  # need dest+src + at least MAC(2)+min ciphertext
             return False, "Payload too short", {}, None, None, None
         encrypted_data = payload[2:]
-        # MAC(2) + ciphertext. Ciphertext may be block-aligned or truncated (e.g. long PATH
-        # packets lose one byte to header size; telemetry PATH 63 bytes). Allow MAC + 15 bytes
-        # minimum so we can pad to one block and attempt decrypt.
+        # MeshCore 1.18 rejects incomplete AES blocks before checking the MAC.
         enc_len = len(encrypted_data)
-        min_enc = CIPHER_MAC_SIZE + (CIPHER_BLOCK_SIZE - 1)  # 17: MAC(2) + 15 ciphertext
+        min_enc = CIPHER_MAC_SIZE + CIPHER_BLOCK_SIZE
         if enc_len < min_enc:
             self._log(
                 f"[ProtocolResponse] Payload too short for hash 0x{src_hash:02X}: "
-                f"encrypted_data={enc_len}B (need MAC(2)+≥15 bytes ciphertext)"
+                f"encrypted_data={enc_len}B (need MAC(2)+≥16 bytes ciphertext)"
             )
             return False, "Payload too short", {}, None, None, None
         pkt_type = pkt.get_payload_type()

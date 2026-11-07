@@ -23,6 +23,7 @@ from openhop_core.protocol.constants import (
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
     ROUTE_TYPE_TRANSPORT_FLOOD,
 )
 from openhop_core.protocol.utils import determine_contact_type_from_flags, get_contact_type_name
@@ -286,8 +287,9 @@ async def test_share_contact_returns_false_without_cached_blob():
 
 
 @pytest.mark.asyncio
-async def test_share_contact_replays_remote_pubkey_zero_hop():
-    """Replays stored wire bytes; payload pubkey stays the remote contact's, route=direct."""
+@pytest.mark.parametrize("route_type", ["flood", "direct", "transport_flood", "transport_direct"])
+async def test_share_contact_replays_remote_pubkey_zero_hop(route_type):
+    """Contact shares retain the signed advert and use transport-direct codes {0, 0}."""
 
     remote = LocalIdentity()
     sent = []
@@ -297,7 +299,9 @@ async def test_share_contact_replays_remote_pubkey_zero_hop():
         return True
 
     bridge = CompanionBridge(LocalIdentity(), _capture)
-    original = PacketBuilder.create_advert(remote, "RemoteName", route_type="flood")
+    original = PacketBuilder.create_advert(remote, "RemoteName", route_type=route_type)
+    original.transport_codes = [0x1234, 0x5678]
+    original.set_path(bytearray(b"\x11\x22"), 0x41)
     blob = original.write_to()
     bridge.contacts.add(
         Contact(
@@ -312,9 +316,19 @@ async def test_share_contact_replays_remote_pubkey_zero_hop():
     assert len(sent) == 1
     out = sent[0]
     assert bytes(out.payload[:32]) == remote.get_public_key()
-    assert out.get_route_type() == ROUTE_TYPE_DIRECT
+    assert out.get_route_type() == ROUTE_TYPE_TRANSPORT_DIRECT
+    assert out.transport_codes == [0, 0]
     assert out.path_len == 0
     assert len(out.path) == 0
+    assert bytes(out.payload) == bytes(original.payload)
+    assert bridge.contacts.get_by_key(remote.get_public_key()).last_advert_packet == blob
+    wire = out.write_to()
+    assert wire == bytes([out.header]) + b"\x00" * 5 + bytes(original.payload)
+    decoded = Packet()
+    assert decoded.read_from(wire)
+    assert decoded.get_route_type() == ROUTE_TYPE_TRANSPORT_DIRECT
+    assert decoded.transport_codes == [0, 0]
+    assert bytes(decoded.payload) == bytes(original.payload)
 
 
 @pytest.mark.asyncio

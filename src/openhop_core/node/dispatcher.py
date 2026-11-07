@@ -8,11 +8,13 @@ import random
 import time
 from typing import Any, Awaitable, Callable, List, Optional
 
-from ..protocol import Packet
+from ..protocol import Packet, PacketBuilder
 from ..protocol.constants import (  # Payload types
+    MAX_PACKET_PAYLOAD,
     MAX_PATH_SIZE,
     PAYLOAD_TYPE_ACK,
     PAYLOAD_TYPE_ADVERT,
+    PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_TRACE,
     ROUTE_TYPE_FLOOD,
     ROUTE_TYPE_TRANSPORT_FLOOD,
@@ -203,6 +205,9 @@ class Dispatcher:
         # default; only CompanionRadio.set_client_repeat toggles it. Nodes that
         # do their own forwarding (e.g. the repeater) leave this False.
         self._client_repeat_enabled: bool = False
+        self.multi_acks: int = 0
+        self._client_repeat_tasks: set[asyncio.Task] = set()
+        self._regenerated_acks_in_flight: set[Packet] = set()
 
         # TX airtime duty-cycle budget (MeshCore getAirtimeBudgetFactor =
         # prefs.airtime_factor). The leaky bucket is consulted ONLY while
@@ -668,7 +673,7 @@ class Dispatcher:
                 await self._hold_flood_packet(delay_ms)
 
         # When disabled, packet_filter still tracks hashes for stats/visibility.
-        packet_hash = pkt.calculate_packet_hash().hex()[:16]
+        packet_hash = self._seen_packet_hash(pkt)
         # MeshCore records a routed-direct packet in its seen table only when
         # this node is the next hop (Mesh::onRecvPacket). A node that overhears
         # an earlier route variant must not mark the path-independent hash seen,
@@ -700,9 +705,12 @@ class Dispatcher:
         await self._dispatch(pkt)
 
         if forward_pkt is not None and not (
-            forward_pkt.is_route_flood() and pkt.is_marked_do_not_retransmit()
+            (forward_pkt.is_route_flood() or pkt.get_payload_type() == PAYLOAD_TYPE_ACK)
+            and pkt.is_marked_do_not_retransmit()
         ):
-            asyncio.create_task(self._client_repeat_transmit(forward_pkt))
+            task = asyncio.create_task(self._client_repeat_transmit(forward_pkt, received_pkt=pkt))
+            self._client_repeat_tasks.add(task)
+            task.add_done_callback(self._client_repeat_tasks.discard)
 
     # ------------------------------------------------------------------
     # Public interface - sending and receiving packets
@@ -790,6 +798,13 @@ class Dispatcher:
         if enabled and not self._client_repeat_enabled:
             self._reset_tx_budget()
         self._client_repeat_enabled = enabled
+        if not enabled:
+            for task in tuple(self._client_repeat_tasks):
+                task.cancel()
+
+    def set_multi_acks(self, value: int) -> None:
+        """Set the uint8 extra-ACK count used by client-repeat regeneration."""
+        self.multi_acks = int(value) & 0xFF
 
     # ------------------------------------------------------------------
     # TX airtime duty-cycle budget (MeshCore Dispatcher budget mechanics)
@@ -949,6 +964,12 @@ class Dispatcher:
         self_key = self.local_identity.get_public_key()
         ptype = pkt.get_payload_type()
 
+        if ptype == PAYLOAD_TYPE_MULTIPART:
+            if not pkt.is_route_direct() or self._multipart_ack_bytes(pkt) is None:
+                return None
+        if ptype == PAYLOAD_TYPE_ACK and pkt.payload_len < 4:
+            return None
+
         if pkt.is_route_direct() and ptype == PAYLOAD_TYPE_TRACE:
             return self._build_trace_forward(pkt, self_key)
         if pkt.is_route_direct() and pkt.get_path_hash_count() > 0:
@@ -1041,14 +1062,91 @@ class Dispatcher:
             return 0.0
         return float(random.randint(0, int(5 * t)))
 
-    async def _client_repeat_transmit(self, pkt: Packet) -> None:
+    @staticmethod
+    def _multipart_ack_bytes(pkt: Packet) -> Optional[bytes]:
+        if (
+            pkt.get_payload_type() == PAYLOAD_TYPE_MULTIPART
+            and pkt.payload_len >= 5
+            and pkt.payload[0] & 0x0F == PAYLOAD_TYPE_ACK
+        ):
+            return bytes(pkt.payload[1 : pkt.payload_len])
+        return None
+
+    def _seen_packet_hash(self, pkt: Packet) -> str:
+        ack_bytes = self._multipart_ack_bytes(pkt)
+        if self._client_repeat_enabled and ack_bytes is not None:
+            # Firmware keeps the MULTIPART type but hashes the unwrapped ACK.
+            # Use that identity on both RX and TX so our own echoes are seen.
+            pkt = self._copy_packet_for_forward(pkt)
+            pkt.payload = bytearray(ack_bytes)
+            pkt.payload_len = len(ack_bytes)
+        return pkt.calculate_packet_hash().hex()[:16]
+
+    async def _client_repeat_direct_acks(
+        self, pkt: Packet, received_pkt: Packet, delay_ms: float
+    ) -> None:
+        """Regenerate this hop's ACK sequence at firmware queue deadlines."""
+        ack_bytes = self._multipart_ack_bytes(pkt)
+        if ack_bytes is not None:
+            delay_ms += ((pkt.payload[0] >> 4) + 1) * 300
+        else:
+            ack_bytes = bytes(pkt.payload[: pkt.payload_len])
+        next_send_at = time.monotonic() + delay_ms / 1000.0
+        # An otherwise valid full-size ACK cannot fit a multipart wrapper.
+        # Keep its ordinary ACK instead of losing the sequence to a size error.
+        extra = self.multi_acks if len(ack_bytes) < MAX_PACKET_PAYLOAD else 0
+        for remaining in range(extra, -1, -1):
+            if not self._client_repeat_enabled:
+                return
+            if remaining:
+                reply = PacketBuilder.create_multi_ack(
+                    ack_bytes, remaining, path=pkt.path, path_len_encoded=pkt.path_len
+                )
+            else:
+                reply = PacketBuilder.create_ack_from_bytes(
+                    ack_bytes, path=pkt.path, path_len_encoded=pkt.path_len
+                )
+            # Preserve the received hash width even when stripping self leaves
+            # a zero-hop path (the builders only encode non-empty paths).
+            reply.path_len = pkt.path_len
+            reply._rx_radio_id = getattr(received_pkt, "_rx_radio_id", None)
+            wait_s = next_send_at - time.monotonic()
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            if not self._client_repeat_enabled:
+                return
+            self._regenerated_acks_in_flight.add(reply)
+            try:
+                await self.send_packet(reply, wait_for_ack=False)
+            finally:
+                self._regenerated_acks_in_flight.discard(reply)
+            next_send_at += 0.3
+
+    async def _client_repeat_transmit(
+        self, pkt: Packet, *, received_pkt: Optional[Packet] = None
+    ) -> None:
         """Wait out the retransmit jitter then send the forward through the funnel.
 
         Stage 2 airtime budgeting slots in here / in the send funnel: the
         forward is a plain send_packet, so a budget gate can suppress it.
         """
         try:
-            delay_ms = self._client_repeat_delay_ms(pkt)
+            # Direct jitter uses the path before stripping self (MeshCore 1.18).
+            # Flood and TRACE jitter use the forwarded path after appending self.
+            delay_packet = (
+                received_pkt
+                if pkt.is_route_direct()
+                and pkt.get_payload_type() != PAYLOAD_TYPE_TRACE
+                and received_pkt is not None
+                else pkt
+            )
+            delay_ms = self._client_repeat_delay_ms(delay_packet)
+            if pkt.is_route_direct() and pkt.get_payload_type() in (
+                PAYLOAD_TYPE_ACK,
+                PAYLOAD_TYPE_MULTIPART,
+            ):
+                await self._client_repeat_direct_acks(pkt, received_pkt or pkt, delay_ms)
+                return
             if delay_ms > 0:
                 await asyncio.sleep(delay_ms / 1000.0)
             await self.send_packet(pkt, wait_for_ack=False)
@@ -1217,8 +1315,12 @@ class Dispatcher:
         # the RX-path dedupe check (packet_filter.is_duplicate) must catch
         # it. Uses the same hash the RX path tracks with, so a returned copy
         # with a mutated path (path excluded from the hash) still matches.
-        packet_hash = packet.calculate_packet_hash().hex()[:16]
-        self.packet_filter.track_packet(packet_hash)
+        # routeDirectRecvAcks queues fresh packets without marking them seen.
+        # In particular its trailing ACK must not claim a later inbound plain
+        # ACK when the receive-side claim was only for a multipart packet.
+        if packet not in self._regenerated_acks_in_flight:
+            packet_hash = self._seen_packet_hash(packet)
+            self.packet_filter.track_packet(packet_hash)
 
         # ------------------------------------------------------------------ #
         #  Send the packet (lock ensures only one transmission at a time)

@@ -311,11 +311,11 @@ class _CallbackMixin:
         tag_bytes: bytes,
         response_data: bytes,
         path_info: Optional[tuple] = None,
-    ) -> None:
-        """Called when binary response (tag + data, optional path) received."""
+    ) -> bool:
+        """Deliver a binary response; return whether a pending request claimed it."""
         if path_info is not None:
             if await self._try_handle_path_discovery(tag_bytes, path_info):
-                return
+                return True
         self.cleanup_expired_binary_requests()
         tag_hex = tag_bytes.hex()
         info = self._pending_binary_requests.pop(tag_hex, None)
@@ -331,7 +331,7 @@ class _CallbackMixin:
                 list(self._pending_binary_requests.keys()),
             )
             await self._fire_callbacks("binary_response", tag_bytes, response_data)
-            return
+            return False
         request_type = info["request_type"]
         logger.debug(
             "[PATHDIAG] anon/binary response MATCHED tag=%s type=%s (%dB)",
@@ -356,6 +356,7 @@ class _CallbackMixin:
         await self._fire_callbacks(
             "binary_response", tag_bytes, response_data, parsed, request_type
         )
+        return True
 
     async def _try_handle_path_discovery(self, tag_bytes: bytes, path_info: tuple) -> bool:
         """If tag is pending path discovery, fire path_discovery_response and return True."""

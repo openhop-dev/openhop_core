@@ -35,18 +35,10 @@ class CryptoUtils:
 
     @staticmethod
     def _aes_decrypt(key: bytes, ciphertext: bytes) -> bytes:
+        if len(ciphertext) % CIPHER_BLOCK_SIZE:
+            raise ValueError("Ciphertext is not block-aligned")
         cipher = AES.new(key, AES.MODE_ECB)
-        orig_len = len(ciphertext)
-        if orig_len % CIPHER_BLOCK_SIZE != 0:
-            # Firmware may send non-block-aligned ciphertext (e.g. telemetry 63 bytes).
-            # Pad to next block for decrypt, then return only original length.
-            pad_len = CIPHER_BLOCK_SIZE - (orig_len % CIPHER_BLOCK_SIZE)
-            ciphertext = ciphertext + (b"\x00" * pad_len)
-        out = b"".join(
-            cipher.decrypt(ciphertext[i : i + CIPHER_BLOCK_SIZE])
-            for i in range(0, len(ciphertext), CIPHER_BLOCK_SIZE)
-        )
-        return out[:orig_len]
+        return cipher.decrypt(ciphertext)
 
     @staticmethod
     def encrypt_then_mac(key_aes: bytes, shared_secret: bytes, plaintext: bytes) -> bytes:
@@ -67,6 +59,8 @@ class CryptoUtils:
 
         mac = data[:CIPHER_MAC_SIZE]
         ciphertext = data[CIPHER_MAC_SIZE:]
+        if len(ciphertext) % CIPHER_BLOCK_SIZE:
+            raise ValueError("Ciphertext is not block-aligned")
 
         expected_mac = CryptoUtils._hmac_sha256(shared_secret, ciphertext)[:CIPHER_MAC_SIZE]
         if not hmac.compare_digest(mac, expected_mac):

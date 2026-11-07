@@ -362,6 +362,12 @@ class KissModemWrapper(LoRaRadio):
                          of full-duplex modem on a physically half-duplex link, where a
                          host "is channel busy?" check can delay submitting the next frame
                          to avoid collisions.
+            usb_reset_on_connect: If True, pulse DTR during modem startup. Off by
+                         default, and never inferred from the port path: dropping
+                         DTR while RTS is asserted resets most ESP32 boards
+                         (auto-reset circuits on CP210x/CH340 bridges, and the
+                         on-chip logic of ESP32-S3 native USB-Serial-JTAG), and a
+                         native-USB modem then re-enumerates under the open port.
         """
         self.port = port
         self.baudrate = baudrate
@@ -371,10 +377,7 @@ class KissModemWrapper(LoRaRadio):
         self.connect_retries = max(1, int(connect_retries))
         self.post_open_delay_ms = max(0, int(post_open_delay_ms))
         self.startup_retry_budget_sec = max(1.0, float(startup_retry_budget_sec))
-        if usb_reset_on_connect is None:
-            self.usb_reset_on_connect = str(port).startswith("/dev/serial/by-id/")
-        else:
-            self.usb_reset_on_connect = bool(usb_reset_on_connect)
+        self.usb_reset_on_connect = bool(usb_reset_on_connect)
         self._shutting_down = False
 
         self.radio_config = radio_config or {}
@@ -612,7 +615,7 @@ class KissModemWrapper(LoRaRadio):
             # Drop any Data frames left over from a prior session so a stale payload
             # cannot pair with an RxMeta from the freshly opened link.
             self._clear_pending_rx()
-            self.serial_conn = serial.Serial(
+            conn = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
                 # Sole reader is _rx_worker, which does a short blocking read; cap the port
@@ -631,10 +634,14 @@ class KissModemWrapper(LoRaRadio):
                 dsrdtr=True,
                 rtscts=False,
             )
+            self.serial_conn = conn
             self.is_connected = False
 
-            self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
-            self.tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
+            # Each worker is bound to this handle and exits once it is replaced,
+            # so a straggler from a previous open can never read from or write
+            # to the next one.
+            self.rx_thread = threading.Thread(target=self._rx_worker, args=(conn,), daemon=True)
+            self.tx_thread = threading.Thread(target=self._tx_worker, args=(conn,), daemon=True)
             self.rx_thread.start()
             self.tx_thread.start()
             logger.info("KISS modem connected to %s at %s baud", self.port, self.baudrate)
@@ -670,10 +677,9 @@ class KissModemWrapper(LoRaRadio):
         """Return (vid, pid, serial_number) for *device*, or None if unavailable.
 
         Matches on the resolved path, not the configured string: a port is often
-        given as an alias (/dev/serial/by-id/..., or a udev-named /dev/openhop-modem
-        -- the constructor already treats the former specially) which never appears
-        verbatim in comports(), and a literal comparison would leave exactly those
-        setups with no identity to recover by.
+        given as an alias (/dev/serial/by-id/..., or a udev-named /dev/openhop-modem)
+        which never appears verbatim in comports(), and a literal comparison would
+        leave exactly those setups with no identity to recover by.
         """
         target = os.path.realpath(device)
         try:
@@ -893,14 +899,30 @@ class KissModemWrapper(LoRaRadio):
                 logger.info("Modem RX boosted gain set to %s", bool(boosted))
 
     def _close_serial_connection(self) -> None:
-        """Close serial handle without waiting for worker threads."""
+        """Detach and close the serial handle without waiting for worker threads.
+
+        Detaching comes first: workers treat an error on a handle that is no
+        longer self.serial_conn as teardown rather than a fresh link failure.
+        Cancelling pending I/O then wakes a reader parked in select() so it
+        returns cleanly instead of racing close() into pyserial's fd=None
+        ("'NoneType' object cannot be interpreted as an integer").
+        """
         conn = self.serial_conn
         self.serial_conn = None
-        if conn and conn.is_open:
+        if conn is None:
+            return
+        for name in ("cancel_read", "cancel_write"):
             try:
+                cancel = getattr(conn, name, None)
+                if callable(cancel):
+                    cancel()
+            except Exception as e:
+                logger.debug("Serial %s failed during close: %s", name, e)
+        try:
+            if getattr(conn, "is_open", False):
                 conn.close()
-            except Exception:
-                pass
+        except Exception as e:
+            logger.debug("Error closing serial port: %s", e)
 
     def _is_stopping(self) -> bool:
         """True when the workers are meant to be winding down."""
@@ -917,13 +939,7 @@ class KissModemWrapper(LoRaRadio):
         generation started on the new one. Two RX threads then shared a single
         KISS decoder buffer.
         """
-        conn = self.serial_conn
-        if conn is not None:
-            try:
-                if getattr(conn, "is_open", False):
-                    conn.close()
-            except Exception as e:
-                logger.debug("Closing serial port while stopping workers: %s", e)
+        self._close_serial_connection()
         current = threading.current_thread()
         for label, thread in (("RX", self.rx_thread), ("TX", self.tx_thread)):
             if thread and thread.is_alive() and thread is not current:
@@ -2850,17 +2866,16 @@ class KissModemWrapper(LoRaRadio):
         with self._pending_rx_lock:
             self._pending_rx_queue.clear()
 
-    def _rx_worker(self):
-        """Background thread for receiving data"""
-        while (
-            not self.stop_event.is_set()
-            and self.serial_conn is not None
-            and self.serial_conn.is_open
-        ):
+    def _owns_connection(self, conn) -> bool:
+        """True while *conn* is still the live serial handle."""
+        return self.serial_conn is conn and getattr(conn, "is_open", False)
+
+    def _rx_worker(self, conn=None):
+        """Background thread for receiving data on one serial handle."""
+        if conn is None:
+            conn = self.serial_conn
+        while not self.stop_event.is_set() and self._owns_connection(conn):
             try:
-                conn = self.serial_conn
-                if conn is None:
-                    break
                 # Flush Data frames whose RxMeta timed out. Runs every loop, including
                 # idle wakeups (the read below caps at RX_READ_TIMEOUT_S), so a stalled
                 # head is released within roughly RX_META_WAIT_SECONDS.
@@ -2885,37 +2900,45 @@ class KissModemWrapper(LoRaRadio):
                 # and no failure marked, nothing re-armed a reconnect, and the
                 # node went permanently deaf while the log read "reconnect
                 # successful". Observed in the field, and reproduced.
-                if not self._is_stopping():
+                #
+                # Ownership of the handle, not is_connected, separates the two:
+                # an error on a handle that has since been detached or closed is
+                # the recovery path tearing it down, and reporting it again would
+                # mark the next generation degraded too.
+                if self._is_stopping() or not self._owns_connection(conn):
+                    logger.debug("RX worker exiting after its serial handle closed: %s", e)
+                else:
                     logger.error(f"RX worker error: {e}")
                     self._mark_serial_failure(f"RX worker error: {e}")
                 break
 
-    def _tx_worker(self):
-        """Background thread for sending data"""
-        while (
-            not self.stop_event.is_set()
-            and self.serial_conn is not None
-            and self.serial_conn.is_open
-        ):
+    def _tx_worker(self, conn=None):
+        """Background thread for sending data on one serial handle."""
+        if conn is None:
+            conn = self.serial_conn
+        while not self.stop_event.is_set() and self._owns_connection(conn):
             try:
                 if self.tx_buffer:
                     frame = self.tx_buffer.popleft()
-
-                    if self.serial_conn and self.serial_conn.is_open:
-                        if self._write_frame(frame):
-                            self.stats["frames_sent"] += 1
-                            self.stats["bytes_sent"] += len(frame)
-                        else:
-                            logger.warning("TX frame write failed, dropping frame")
+                    if not self._owns_connection(conn):
+                        # Handle replaced or closed while we waited: leave the
+                        # frame for the worker that owns the live one.
+                        self.tx_buffer.appendleft(frame)
+                        break
+                    if self._write_frame(frame):
+                        self.stats["frames_sent"] += 1
+                        self.stats["bytes_sent"] += len(frame)
                     else:
-                        logger.warning("Serial connection not open")
-                        self._mark_serial_failure("Serial connection not open in TX worker")
+                        logger.warning("TX frame write failed, dropping frame")
                 else:
                     threading.Event().wait(0.01)
 
             except Exception as e:
-                # See _rx_worker: gated on deliberate shutdown, not is_connected.
-                if not self._is_stopping():
+                # See _rx_worker: gated on deliberate shutdown and handle
+                # ownership, not is_connected.
+                if self._is_stopping() or not self._owns_connection(conn):
+                    logger.debug("TX worker exiting after its serial handle closed: %s", e)
+                else:
                     logger.error(f"TX worker error: {e}")
                     self._mark_serial_failure(f"TX worker error: {e}")
                 break

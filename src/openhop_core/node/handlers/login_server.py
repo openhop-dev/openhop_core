@@ -196,7 +196,7 @@ class LoginServerHandler(BaseHandler):
             client_timestamp = struct.unpack("<I", plaintext[:4])[0]
 
             # Debug logging
-            self.log(f"[LoginServer] Plaintext hex: {plaintext.hex()}")
+            self.log("[LoginServer] Plaintext hex: ******")
             self.log(f"[LoginServer] Plaintext length: {len(plaintext)} bytes")
 
             # Use explicit identity type to determine format
@@ -218,10 +218,7 @@ class LoginServerHandler(BaseHandler):
                     f"[LoginServer] Room server: sync_since={sync_since}, "
                     f"password from byte 8 to {null_idx}"
                 )
-                self.log(
-                    f"[LoginServer] Password hex: "
-                    f"{password_bytes.hex() if password_bytes else '(empty)'}"
-                )
+                self.log(f"[LoginServer] Password hex: {'******' if password_bytes else '(empty)'}")
             else:
                 # Repeater format: password only
                 # Find null terminator after timestamp (starting from byte 4)

@@ -25,6 +25,7 @@ from ..protocol.constants import (
     REQ_TYPE_GET_STATUS,
     REQ_TYPE_GET_TELEMETRY_DATA,
     ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_TRANSPORT_DIRECT,
     TELEM_PERM_BASE,
 )
 from ..protocol.packet_utils import PathUtils
@@ -115,7 +116,7 @@ class _SendOpsMixin:
         return success
 
     async def share_contact(self, pub_key: bytes) -> bool:
-        """Share a contact's advert on zero hops (direct route, empty path).
+        """Share a contact's advert on zero hops with transport codes {0, 0}.
 
         Matches firmware ``BaseChatMesh::shareContactZeroHop``: replay the last stored
         raw ADVERT wire bytes for this contact (see ``Contact.last_advert_packet``),
@@ -142,8 +143,8 @@ class _SendOpsMixin:
                         "Cached advert pubkey does not match contact key; refusing share"
                     )
                     return False
-            # Mesh::sendZeroHop (non-transport): direct route, path_len=0, empty path
-            pkt.header = (pkt.header & ~PH_ROUTE_MASK) | ROUTE_TYPE_DIRECT
+            # Firmware's transport-direct {0, 0} marker identifies a contact share.
+            pkt.header = (pkt.header & ~PH_ROUTE_MASK) | ROUTE_TYPE_TRANSPORT_DIRECT
             pkt.transport_codes = [0, 0]
             pkt.path_len = 0
             pkt.path = bytearray()

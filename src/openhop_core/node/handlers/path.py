@@ -49,6 +49,7 @@ class PathHandler:
     async def __call__(self, pkt: Packet) -> HandlerResult:
         """Handle PATH and aggregate authenticated sub-handler results."""
         authenticated = False
+        response_claimed = False
         try:
             # First, check if this PATH packet contains protocol responses
             if self._protocol_response_handler:
@@ -56,9 +57,14 @@ class PathHandler:
                 authenticated = authenticated or (
                     isinstance(result, HandlerResult) and result.authenticated
                 )
+                response_claimed = (
+                    isinstance(result, HandlerResult)
+                    and result.authenticated
+                    and result.response_claimed
+                )
 
             # Then, check if this PATH packet contains login responses
-            if self._login_response_handler:
+            if self._login_response_handler and not response_claimed:
                 result = await self._login_response_handler(pkt)
                 authenticated = authenticated or (
                     isinstance(result, HandlerResult) and result.authenticated
@@ -112,4 +118,4 @@ class PathHandler:
 
             self._log(traceback.format_exc())
 
-        return HandlerResult.consumed() if authenticated else HandlerResult.not_for_us()
+        return HandlerResult(authenticated=authenticated, response_claimed=response_claimed)

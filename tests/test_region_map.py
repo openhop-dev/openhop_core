@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from openhop_core.node.dispatcher import Dispatcher
 from openhop_core.protocol import LocalIdentity, Packet, PacketBuilder
 from openhop_core.protocol.constants import (
@@ -43,6 +45,24 @@ def _make_scoped_packet(region_name: str) -> Packet:
 
 
 class TestRegionMapMatching:
+    @pytest.mark.parametrize("deny_wildcard", [False, True])
+    def test_zero_transport_code_matches_wildcard(self, deny_wildcard):
+        rmap = RegionMap([RegionEntry(id=1, name="#default")])
+        if deny_wildcard:
+            rmap.wildcard.flags |= REGION_DENY_FLOOD
+        pkt = _make_scoped_packet("#default")
+        pkt.transport_codes = [0, 0x1234]
+
+        assert rmap.find_match(pkt, mask=REGION_DENY_FLOOD) is rmap.wildcard
+        capture_recv_region(rmap, pkt)
+        assert pkt._recv_region_unscoped is True
+
+        reply = _flood_reply()
+        apply_reply_scope(reply, pkt)
+        _resolve_at_tx(reply, default_key=get_auto_key_for("#default"))
+        assert reply.get_route_type() == ROUTE_TYPE_FLOOD
+        assert reply.transport_codes == [0, 0]
+
     def test_match_explicit_hashtag_name(self):
         region = RegionEntry(id=1, name="#nl-li")
         rmap = RegionMap([region])

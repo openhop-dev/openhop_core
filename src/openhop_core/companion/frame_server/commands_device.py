@@ -18,6 +18,7 @@ from ..constants import (
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_AUTOADD_CONFIG,
     RESP_CODE_BATT_AND_STORAGE,
+    RESP_CODE_CLI_REPLY,
     RESP_CODE_CURR_TIME,
     RESP_CODE_CUSTOM_VARS,
     RESP_CODE_DEFAULT_FLOOD_SCOPE,
@@ -127,12 +128,13 @@ class _DeviceCommandsMixin:
         max_channels_val = getattr(getattr(self.bridge, "channels", None), "max_channels", 40)
         max_contacts_div_2 = min(max_contacts // 2, 255)
         max_channels = min(max_channels_val, 255)
-        ble_pin = 0
         try:
             prefs = self.bridge.get_self_info()
+            ble_pin = int(getattr(prefs, "ble_pin", 0)) & 0xFFFFFFFF
             client_repeat = getattr(prefs, "client_repeat", 0) & 0xFF
             path_hash_mode = getattr(prefs, "path_hash_mode", 0) & 0xFF
         except Exception:
+            ble_pin = 0
             client_repeat = 0
             path_hash_mode = 0
         frame = (
@@ -175,6 +177,48 @@ class _DeviceCommandsMixin:
         name = data.decode("utf-8", errors="replace").rstrip("\x00")
         self.bridge.set_advert_name(name)
         self._write_ok()
+
+    async def _cmd_set_device_pin(self, data: bytes) -> None:
+        # Firmware (MyMesh.cpp: CMD_SET_DEVICE_PIN) needs frame len >= 5; shorter
+        # frames fall through to the catch-all UNSUPPORTED_CMD. The PIN must be
+        # 0 (none) or six digits.
+        if len(data) < 4:
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        (pin,) = struct.unpack_from("<I", data, 0)
+        if pin != 0 and not 100000 <= pin <= 999999:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            return
+        self.bridge.set_device_pin(pin)
+        self._write_ok()
+
+    async def _cmd_run_cli_command(self, data: bytes) -> None:
+        # Firmware (MyMesh.cpp: CMD_RUN_CLI_COMMAND, v14+) needs frame len >= 3.
+        # The reply is always RESP_CODE_CLI_REPLY carrying the CLI's text, never
+        # an error frame -- an unknown command answers "Unknown command".
+        run = getattr(self.bridge, "run_cli_command", None)
+        if len(data) < 2 or not callable(run):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        # Firmware reads the text as a C string: it ends at the first NUL.
+        command = data.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        reply = run(command, 0)
+        cli = getattr(self.bridge, "cli", None)
+        if getattr(cli, "last_command_rebooted", False) is True:
+            return  # `reboot`: firmware never answers; the client is being dropped
+        self._write_frame(bytes([RESP_CODE_CLI_REPLY]) + reply.encode("utf-8"))
+
+    async def _cmd_reboot(self, data: bytes) -> None:
+        # Firmware (MyMesh.cpp: CMD_REBOOT) checks the 6-byte "reboot" magic
+        # (memcmp, so trailing bytes are ignored) and never replies: the device
+        # resets. Here the companion reloads its
+        # settings and the ``reboot`` push drops the client, so the app
+        # reconnects and re-syncs as it would after a real reboot.
+        reboot = getattr(self.bridge, "request_reboot", None)
+        if data[:6] != b"reboot" or not callable(reboot):
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
+            return
+        reboot()
 
     async def _cmd_set_advert_latlon(self, data: bytes) -> None:
         if len(data) < 8:
@@ -377,7 +421,12 @@ class _DeviceCommandsMixin:
             # such as the name and position can still be saved.
             self._write_ok()
             return
-        if not self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr):
+        apply_async = getattr(self.bridge, "set_radio_params_async", None)
+        if inspect.iscoroutinefunction(apply_async):
+            applied = await apply_async(freq_khz * 1000, bw, sf, cr)
+        else:
+            applied = self.bridge.set_radio_params(freq_khz * 1000, bw, sf, cr)
+        if not applied:
             self._write_err(ERR_CODE_BAD_STATE)
             return
         # Firmware persists client_repeat alongside the radio params (0 when the

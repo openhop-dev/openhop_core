@@ -6,6 +6,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from .constants import (
+    CONTACT_FLAG_FAVOURITE,
+    CONTACT_FLAG_REMOTE_CLI,
+    CONTACT_FLAG_TELEM_BASE,
+    CONTACT_FLAG_TELEM_ENV,
+    CONTACT_FLAG_TELEM_LOC,
+)
+
 
 @dataclass
 class Contact:
@@ -36,6 +44,26 @@ class Contact:
     def dest_hash(self) -> int:
         """First public-key byte — the destination hash used on the wire."""
         return self.public_key_bytes[0]
+
+    @property
+    def is_favourite(self) -> bool:
+        return bool(self.flags & CONTACT_FLAG_FAVOURITE)
+
+    @property
+    def is_telem_base_allowed(self) -> bool:
+        return bool(self.flags & CONTACT_FLAG_TELEM_BASE)
+
+    @property
+    def is_telem_loc_allowed(self) -> bool:
+        return bool(self.flags & CONTACT_FLAG_TELEM_LOC)
+
+    @property
+    def is_telem_env_allowed(self) -> bool:
+        return bool(self.flags & CONTACT_FLAG_TELEM_ENV)
+
+    @property
+    def is_remote_cli_allowed(self) -> bool:
+        return bool(self.flags & CONTACT_FLAG_REMOTE_CLI)
 
     @classmethod
     def from_dict(
@@ -159,6 +187,14 @@ class NodePrefs:
     path_hash_mode: int = 0  # 0=1-byte, 1=2-byte, 2=3-byte hashes
     default_scope_name: str = ""
     default_scope_key: bytes = b""
+    # Reported in DEVICE_INFO bytes 4..7 and set by CMD_SET_DEVICE_PIN or the CLI
+    # `set pin`. 0 = none. The TCP transport has no PIN; this is stored parity.
+    ble_pin: int = 0
+    # Hours from UTC for the node's local time display (CLI `tz.offset`, -12..14).
+    tz_offset: int = 0
+    # Listen-before-talk (CLI `cad`, firmware `cad_enabled`), for a companion
+    # that owns its radio. None = never set: the radio keeps its configured mode.
+    cad_enabled: Optional[bool] = None
 
 
 @dataclass

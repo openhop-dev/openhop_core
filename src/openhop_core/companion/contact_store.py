@@ -117,14 +117,14 @@ class ContactStore:
         if contact.public_key in self._contacts:
             return self.update(contact), None
         if len(self._contacts) >= self._max_contacts:
-            # Find oldest non-favourite (flags bit 0 = favourite)
+            # Find oldest non-favourite
             oldest_key: Optional[bytes] = None
             oldest_lastmod = 0xFFFFFFFF
             for key, c in self._contacts.items():
                 # Exclude transient/anon entries: real contacts never evict an
                 # anon slot, mirroring firmware allocateContactSlot (non-transient).
                 if (
-                    (c.flags & 0x01) == 0
+                    not c.is_favourite
                     and c.adv_type != ADV_TYPE_NONE
                     and c.lastmod < oldest_lastmod
                 ):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import time
@@ -98,6 +99,22 @@ class _DeviceConfigMixin:
         self.prefs.coding_rate = cr
         self._save_prefs()
         return True
+
+    async def set_radio_params_async(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Awaitable :meth:`set_radio_params`; a radio-owning companion
+        overrides it to wait for an in-flight TX instead of queueing."""
+        return self.set_radio_params(freq_hz, bw_hz, sf, cr)
+
+    def stage_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        """Persist radio parameters without touching the radio (CLI ``set radio``).
+
+        Firmware's CLI only stores the values and answers "OK - reboot to
+        apply"; retuning live could cut off the very peer that sent the command.
+        Applying the stored values at boot is the host's job.
+        """
+        # The mixin's own prefs-only setter, bypassing any subclass override
+        # that applies the change to hardware.
+        return _DeviceConfigMixin.set_radio_params(self, freq_hz, bw_hz, sf, cr)
 
     def set_tx_power(self, power_dbm: int) -> bool:
         """Set the transmit power in dBm."""
@@ -212,6 +229,68 @@ class _DeviceConfigMixin:
         """Set path hash encoding mode (0=1-byte, 1=2-byte, 2=3-byte hashes)."""
         self.prefs.path_hash_mode = mode
         self._save_prefs()
+
+    def set_device_pin(self, pin: int) -> None:
+        """Persist the device PIN reported in DEVICE_INFO (firmware ``ble_pin``)."""
+        self.prefs.ble_pin = int(pin) & 0xFFFFFFFF
+        self._save_prefs()
+
+    def set_tz_offset(self, hours: int) -> None:
+        """Persist the local-time offset from UTC, in hours (CLI ``tz.offset``)."""
+        self.prefs.tz_offset = int(hours)
+        self._save_prefs()
+
+    def get_cad_enabled(self) -> Optional[bool]:
+        """Listen-before-talk state, or None when this companion has no radio
+        it controls (CLI ``get cad``)."""
+        return None
+
+    def set_cad_enabled(self, enabled: bool) -> bool:
+        """Set listen-before-talk (CLI ``set cad``). False when unsupported."""
+        return False
+
+    def reload_settings(self) -> None:
+        """Reload preferences and re-apply them, as a firmware reboot would.
+
+        Persisted prefs are read back; the transient flood-scope override and
+        the sticky unscoped flag are cleared, since firmware keeps those in RAM.
+        Messages, contacts and channels are untouched.
+        """
+        self._load_prefs()
+        self._flood_transport_key = None
+        self._flood_unscoped = False
+        self._apply_prefs_to_runtime()
+
+    def _apply_prefs_to_runtime(self) -> None:
+        """Hook: push :attr:`prefs` into live components after a (re)load."""
+
+    def request_reboot(self) -> bool:
+        """Firmware ``reboot`` for a Python companion: reload the settings, then
+        tell ``reboot`` subscribers (a frame server drops its app client, which
+        reconnects and re-syncs exactly as after a real reboot).
+
+        The drop happens even if the reload fails: firmware's reboot always
+        ends the session, and the app must not be told it succeeded while
+        staying connected.
+        """
+        try:
+            self.reload_settings()
+        except Exception as e:
+            logger.error("reboot: reloading settings failed: %s", e, exc_info=True)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return True  # no event loop: nobody to notify
+        self._spawn_background_task(self._fire_callbacks("reboot"), "reboot")
+        return True
+
+    def run_cli_command(self, command: str, sender_timestamp: int = 0) -> str:
+        """Run one command on this companion's CLI and return the reply text.
+
+        Serves both ``CMD_RUN_CLI_COMMAND`` (``sender_timestamp`` 0) and a
+        ``TXT_TYPE_CLI_COMMAND`` from a contact allowed to use the remote CLI.
+        """
+        return self.cli.handle(command, sender_timestamp)
 
     def get_self_info(self) -> NodePrefs:
         """Return a copy of the current node preferences."""

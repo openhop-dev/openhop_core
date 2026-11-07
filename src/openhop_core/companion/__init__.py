@@ -7,6 +7,7 @@ statistics, and device configuration on top of MeshNode.
 """
 
 from .channel_store import ChannelStore
+from .cli import CompanionCLI
 from .companion_bridge import CompanionBridge
 from .companion_radio import CompanionRadio
 from .constants import (
@@ -21,6 +22,11 @@ from .constants import (
     AUTOADD_REPEATER,
     AUTOADD_ROOM,
     AUTOADD_SENSOR,
+    CONTACT_FLAG_FAVOURITE,
+    CONTACT_FLAG_REMOTE_CLI,
+    CONTACT_FLAG_TELEM_BASE,
+    CONTACT_FLAG_TELEM_ENV,
+    CONTACT_FLAG_TELEM_LOC,
     DEFAULT_MAX_CHANNELS,
     DEFAULT_MAX_CONTACTS,
     DEFAULT_OFFLINE_QUEUE_SIZE,
@@ -62,6 +68,7 @@ __all__ = [
     "CompanionRadio",
     "CompanionBridge",
     "CompanionFrameServer",
+    "CompanionCLI",
     # Stores
     "ContactStore",
     "ChannelStore",
@@ -102,6 +109,12 @@ __all__ = [
     "AUTOADD_REPEATER",
     "AUTOADD_ROOM",
     "AUTOADD_SENSOR",
+    # Contact flags
+    "CONTACT_FLAG_FAVOURITE",
+    "CONTACT_FLAG_TELEM_BASE",
+    "CONTACT_FLAG_TELEM_LOC",
+    "CONTACT_FLAG_TELEM_ENV",
+    "CONTACT_FLAG_REMOTE_CLI",
     # Message Send Result
     "MSG_SEND_FAILED",
     "MSG_SEND_SENT_FLOOD",

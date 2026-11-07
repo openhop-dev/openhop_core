@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openhop_core"
-version = "1.1.4.dev2"
+version = "1.1.4.dev6"
 authors = [
     {name = "Rightup", email = "rightup@openhop.dev"},
 ]

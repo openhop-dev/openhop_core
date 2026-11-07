@@ -3,7 +3,9 @@ import asyncio
 import pytest
 
 from openhop_core.companion import CompanionBridge
+from openhop_core.companion.constants import PUSH_CODE_BINARY_RESPONSE
 from openhop_core.companion.contact_store import ContactStore
+from openhop_core.companion.frame_server import CompanionFrameServer
 from openhop_core.companion.models import Contact
 from openhop_core.node.handlers.protocol_response import ProtocolResponseHandler
 from openhop_core.protocol import CryptoUtils, Identity, LocalIdentity, Packet
@@ -72,6 +74,268 @@ def _meshcore_response_packet(payload_type, payload):
     packet.payload = bytearray(payload)
     packet.payload_len = len(packet.payload)
     return packet
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [None, b"\xa1", b"\xa1\xb2"])
+@pytest.mark.parametrize("timestamp", [0x76543200, 0x76543201, 0x76543210])
+@pytest.mark.parametrize("colliding_login", [False, True])
+async def test_unsolicited_sensor_push_reaches_app_verbatim(path, timestamp, colliding_login):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    bridge.contacts.add(Contact(public_key=SECOND_COLLIDING_PEER.get_public_key(), name="Sensor"))
+    server = CompanionFrameServer(bridge, "test", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    server._setup_push_callbacks()
+    if colliding_login:
+        assert FIRST_COLLIDING_PEER.get_public_key()[0] == SECOND_COLLIDING_PEER.get_public_key()[0]
+        bridge.contacts.add(Contact(public_key=FIRST_COLLIDING_PEER.get_public_key(), name="Other"))
+        bridge._get_login_response_handler().register_login_callback(
+            FIRST_COLLIDING_PEER.get_public_key(), lambda *_args: pytest.fail("Wrong login")
+        )
+    tag = 0x12345678
+    # simple_sensor sends push_tag + timestamp + CayenneLPP, without a request.
+    data = timestamp.to_bytes(4, "little") + bytes.fromhex("0174019a")
+    packet = _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, tag, data, path)
+    result = await bridge.process_received_packet(packet)
+
+    assert result.authenticated
+    binary_frames = []
+    while not server._write_queue.empty():
+        payload = server._write_queue.get_nowait()[3:]
+        if payload[0] == PUSH_CODE_BINARY_RESPONSE:
+            binary_frames.append(payload)
+    plaintext_len = 4 + len(data) + (len(path) + 2 if path is not None else 0)
+    expected_data = data + bytes((-plaintext_len) % 16)
+    assert binary_frames == [
+        bytes([PUSH_CODE_BINARY_RESPONSE, 0]) + tag.to_bytes(4, "little") + expected_data
+    ]
+    assert not bridge._pending_binary_requests
+    assert not server._companion_binary_tags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["truncated", "bad_mac", "unknown_contact", "foreign_dest"])
+async def test_unauthenticated_response_cannot_emit_binary_push(invalid):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    bridge.contacts.add(Contact(public_key=SECOND_COLLIDING_PEER.get_public_key(), name="Sensor"))
+    server = CompanionFrameServer(bridge, "test", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    server._setup_push_callbacks()
+    packet = _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, 0x12345678, b"push")
+    if invalid == "truncated":
+        # Re-MAC so HMAC validity alone cannot reject the incomplete block.
+        secret = Identity(SECOND_COLLIDING_PEER.get_public_key()).calc_shared_secret(
+            LOCAL_IDENTITY.get_private_key()
+        )
+        ciphertext = bytes(packet.payload[4:-1])
+        mac = CryptoUtils._hmac_sha256(secret, ciphertext)[:2]
+        packet.payload = packet.payload[:2] + mac + ciphertext
+    elif invalid == "bad_mac":
+        packet.payload[2] ^= 1
+    elif invalid == "unknown_contact":
+        packet.payload[1] ^= 1
+    else:
+        packet.payload[0] ^= 1
+    packet.payload_len = len(packet.payload)
+
+    result = await bridge.process_received_packet(packet)
+
+    assert not result.authenticated
+    assert server._write_queue.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [None, b"", b"\xa1", b"\xa1\xb2", b"\xa1\xb2\xc3"])
+async def test_pending_path_login_does_not_also_emit_binary_push(path):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    peer = SECOND_COLLIDING_PEER.get_public_key()
+    bridge.contacts.add(Contact(public_key=peer, name="Repeater"))
+    server = CompanionFrameServer(bridge, "test", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    server._setup_push_callbacks()
+    logins = []
+    bridge._get_login_response_handler().register_login_callback(
+        peer, lambda success, data: logins.append((success, data))
+    )
+    # Padding varies with the inner path length, but this is always a login.
+    packet = _response_packet(
+        LOCAL_IDENTITY, SECOND_COLLIDING_PEER, 0x12345678, bytes(8) + b"\x02", path
+    )
+
+    result = await bridge.process_received_packet(packet)
+
+    assert result.authenticated
+    assert len(logins) == 1
+    assert logins[0][0] is True
+    frames = []
+    while not server._write_queue.empty():
+        frames.append(server._write_queue.get_nowait()[3:])
+    assert all(frame[0] != PUSH_CODE_BINARY_RESPONSE for frame in frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_login", [False, True])
+@pytest.mark.parametrize("path", [None, b"", b"\xa1", b"\xa1\xb2"])
+@pytest.mark.parametrize("data", [b"subscription", bytes(8) + b"\x02"])
+async def test_matched_binary_reply_reaches_only_its_requesting_frame_server(
+    pending_login, path, data
+):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    peer = SECOND_COLLIDING_PEER.get_public_key()
+    bridge.contacts.add(Contact(public_key=peer, name="Sensor"))
+    servers = [CompanionFrameServer(bridge, "test", port=0) for _ in range(2)]
+    for server in servers:
+        server._write_queue = asyncio.Queue(maxsize=16)
+        server._setup_push_callbacks()
+    tag = 0x12345678
+    tag_bytes = tag.to_bytes(4, "little")
+    bridge.register_binary_request(tag_bytes.hex(), 8, 30, pubkey_prefix=peer.hex())
+    servers[0]._companion_binary_tags.add(tag)
+    logins = []
+    if pending_login:
+        bridge._get_login_response_handler().register_login_callback(
+            peer, lambda success, _data: logins.append(success)
+        )
+
+    result = await bridge.process_received_packet(
+        _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, tag, data, path)
+    )
+
+    frames = [[], []]
+    for index, server in enumerate(servers):
+        while not server._write_queue.empty():
+            frame = server._write_queue.get_nowait()[3:]
+            if frame[0] == PUSH_CODE_BINARY_RESPONSE:
+                frames[index].append(frame)
+    plaintext_len = 4 + len(data) + (len(path) + 2 if path is not None else 0)
+    assert frames == [
+        [bytes([PUSH_CODE_BINARY_RESPONSE, 0]) + tag_bytes + data + bytes((-plaintext_len) % 16)],
+        [],
+    ]
+    assert result.authenticated
+    assert result.response_claimed
+    assert logins == []
+    assert not servers[0]._companion_binary_tags
+
+    if pending_login:
+        # Request ownership must not prevent the next real login reply.
+        await bridge.process_received_packet(
+            _response_packet(
+                LOCAL_IDENTITY, SECOND_COLLIDING_PEER, 0x10203040, bytes(8) + b"\x02", path
+            )
+        )
+        assert logins == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("callback_raises", [False, True])
+async def test_path_response_waiter_cannot_also_complete_login(callback_raises):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    peer = SECOND_COLLIDING_PEER.get_public_key()
+    bridge.contacts.add(Contact(public_key=peer, name="Repeater"))
+    logins = []
+    replies = []
+    bridge._get_login_response_handler().register_login_callback(
+        peer, lambda success, _data: logins.append(success)
+    )
+    tag = 0x12345678
+
+    def on_reply(success, _text, _parsed):
+        replies.append(success)
+        if callback_raises:
+            raise RuntimeError("Consumer failed after claiming response")
+
+    bridge._get_protocol_response_handler().set_response_callback(peer, tag, on_reply)
+    result = await bridge.process_received_packet(
+        _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, tag, bytes(8) + b"\x02", b"\xa1")
+    )
+
+    assert result.authenticated
+    assert result.response_claimed
+    assert replies == [True]
+    assert logins == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subscriber_raises", [False, True])
+async def test_concurrent_path_replies_keep_each_frame_server_and_login_owner(subscriber_raises):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    peer = SECOND_COLLIDING_PEER.get_public_key()
+    bridge.contacts.add(Contact(public_key=peer, name="Sensor"))
+    tags = [0x12345678, 0x23456789]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_first_response(tag_bytes, *_args):
+        if int.from_bytes(tag_bytes, "little") == tags[0]:
+            entered.set()
+            await release.wait()
+        if subscriber_raises:
+            raise RuntimeError("Subscriber failed")
+
+    bridge.add_push_callback("binary_response", hold_first_response)
+    servers = [CompanionFrameServer(bridge, "test", port=0) for _ in tags]
+    for server, tag in zip(servers, tags):
+        server._write_queue = asyncio.Queue(maxsize=16)
+        server._setup_push_callbacks()
+        server._companion_binary_tags.add(tag)
+        bridge.register_binary_request(tag.to_bytes(4, "little").hex(), 8, 30, peer.hex())
+    logins = []
+    bridge._get_login_response_handler().register_login_callback(
+        peer, lambda success, _data: logins.append(success)
+    )
+    packets = [
+        _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, tag, bytes(8) + b"\x02", b"\xa1")
+        for tag in tags
+    ]
+    first = asyncio.create_task(bridge.process_received_packet(packets[0]))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        second_result = await bridge.process_received_packet(packets[1])
+        assert second_result.response_claimed
+        assert logins == []
+    finally:
+        release.set()
+        first_result = await first
+
+    assert first_result.response_claimed
+    assert logins == []
+    for server, tag in zip(servers, tags):
+        pushed_tags = []
+        while not server._write_queue.empty():
+            frame = server._write_queue.get_nowait()[3:]
+            if frame[0] == PUSH_CODE_BINARY_RESPONSE:
+                pushed_tags.append(int.from_bytes(frame[2:6], "little"))
+        assert pushed_tags == [tag]
+    assert bridge._pending_binary_requests == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [None, b"\xa1", b"\xa1\xb2"])
+async def test_unmatched_push_during_same_contact_login_keeps_firmware_priority(path):
+    bridge = CompanionBridge(LOCAL_IDENTITY, _PacketInjector())
+    peer = SECOND_COLLIDING_PEER.get_public_key()
+    bridge.contacts.add(Contact(public_key=peer, name="Sensor"))
+    server = CompanionFrameServer(bridge, "test", port=0)
+    server._write_queue = asyncio.Queue(maxsize=16)
+    server._setup_push_callbacks()
+    logins = []
+    bridge._get_login_response_handler().register_login_callback(
+        peer, lambda success, _data: logins.append(success)
+    )
+    data = (0x76543200).to_bytes(4, "little") + bytes.fromhex("0174019a")
+
+    await bridge.process_received_packet(
+        _response_packet(LOCAL_IDENTITY, SECOND_COLLIDING_PEER, 0x12345678, data, path)
+    )
+
+    # As in firmware, an unmatched reply during login is interpreted as login
+    # data. Only a known request tag can disambiguate these wire payloads.
+    assert logins == [True]
+    frames = []
+    while not server._write_queue.empty():
+        frames.append(server._write_queue.get_nowait()[3:])
+    assert all(frame[0] != PUSH_CODE_BINARY_RESPONSE for frame in frames)
 
 
 class _PacketInjector:

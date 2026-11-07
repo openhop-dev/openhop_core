@@ -357,3 +357,22 @@ async def test_lbt_defaults():
     # Matches MeshCore: getCADFailMaxDuration() 4 s, 200 ms retry.
     assert r.lbt_max_wait_seconds == 4.0
     assert r.lbt_retry_interval_ms == 200
+
+
+# ─── lbt_enabled: the on/off switch (MeshCore getCADEnabled) ─────────
+
+
+async def test_disabled_lbt_transmits_without_any_channel_check(radio):
+    """With LBT off there is no CAD scan and no deferral, even on a busy channel
+    or a latched reception: firmware skips the check when getCADEnabled() is
+    false."""
+    radio.lbt_enabled = False
+    radio.perform_cad = AsyncMock(return_value=True)
+    _inject_irq(radio, IRQ_PREAMBLE_DETECTED)
+
+    success, delays = await radio._prepare_radio_for_tx()
+
+    assert success is True
+    assert delays == []
+    radio.perform_cad.assert_not_awaited()
+    assert radio.is_receiving_packet() is False  # TX commits; markers cleared

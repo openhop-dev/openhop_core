@@ -40,9 +40,12 @@ from openhop_core.companion.constants import (
     PUB_KEY_SIZE,
     PUSH_CODE_ADVERT,
     PUSH_CODE_BINARY_RESPONSE,
+    PUSH_CODE_CONTROL_DATA,
+    PUSH_CODE_LOG_RX_DATA,
     PUSH_CODE_MSG_WAITING,
     PUSH_CODE_NEW_ADVERT,
     PUSH_CODE_PATH_DISCOVERY_RESPONSE,
+    PUSH_CODE_RAW_DATA,
     RESP_CODE_ALLOWED_REPEAT_FREQ,
     RESP_CODE_CHANNEL_DATA_RECV,
     RESP_CODE_CHANNEL_INFO,
@@ -68,6 +71,8 @@ from openhop_core.companion.constants import (
     RESP_CODE_STATS,
     RESP_CODE_TUNING_PARAMS,
     STATS_TYPE_PACKETS,
+    STATS_TYPE_RADIO,
+    TXT_TYPE_SIGNED_PLAIN,
 )
 from openhop_core.companion import CompanionBridge
 from openhop_core.companion.frame_server import (
@@ -1377,6 +1382,7 @@ async def test_evicted_handler_cleanup_does_not_cancel_new_writer_task():
     """Old handler finally block must not tear down new client writer state."""
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
 
     first_release = asyncio.Event()
@@ -1422,6 +1428,7 @@ async def test_handle_client_idle_timeout_disconnects_cleanly(caplog):
     caplog.set_level(logging.INFO, logger="CompanionFrameServer")
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=0.01)
 
     await server._handle_client(_NeverReader(), _DummyWriter())
@@ -1438,6 +1445,7 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     caplog.set_level(logging.INFO, logger="CompanionFrameServer")
     bridge = Mock()
     bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 1000
     server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
 
     await server._handle_client(_RaisingReader(ConnectionResetError("boom")), _DummyWriter())
@@ -1446,6 +1454,31 @@ async def test_handle_client_connection_reset_disconnects_cleanly(caplog):
     assert server._client_reader is None
     assert server._writer_task is None
     assert any("ConnectionResetError" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_handle_client_queue_fits_contact_dump_above_default_limit():
+    """A raised max_contacts must not drop the tail of a full contact dump."""
+    bridge = Mock()
+    bridge.get_time = Mock(return_value=0)
+    bridge.contacts.max_contacts = 2130
+    bridge.get_contacts = Mock(return_value=[_contact()] * 2130)
+    bridge.get_contact_count = Mock(return_value=2130)
+    server = CompanionFrameServer(bridge, "hash", port=0, client_idle_timeout_sec=None)
+    release = asyncio.Event()
+    task = asyncio.create_task(server._handle_client(_BlockingReader(release), _DummyWriter()))
+    for _ in range(50):
+        if server._writer_task is not None:
+            break
+        await asyncio.sleep(0)
+    queue = server._write_queue
+
+    await server._cmd_get_contacts(b"")
+
+    assert queue.qsize() == 2132  # START + 2130 contacts + END
+
+    release.set()
+    await task
 
 
 class _FakeSocket:
@@ -1602,11 +1635,11 @@ def test_parse_binary_response_anon_not_mistaken_for_owner_info():
     assert "owner_info" not in parsed
 
 
-def test_device_info_reports_firmware_ver_code_13():
-    """Companion advertises FIRMWARE_VER_CODE 13 (PR #2672 non-contact anon requests)."""
+def test_device_info_reports_firmware_ver_code_14():
+    """Companion advertises FIRMWARE_VER_CODE 14 (CMD_RUN_CLI_COMMAND / RESP_CODE_CLI_REPLY)."""
     from openhop_core.companion.constants import FIRMWARE_VER_CODE
 
-    assert FIRMWARE_VER_CODE == 13
+    assert FIRMWARE_VER_CODE == 14
 
 
 class _MockBridgeAnonReq:
@@ -1655,8 +1688,8 @@ async def test_cmd_send_anon_req_success_writes_sent():
     assert 0x11223344 in server._companion_binary_tags
 
 
-def test_binary_response_push_only_for_owned_tag():
-    """Unowned non-region responses are ignored; owned and region responses pass."""
+def test_binary_response_push_preserves_request_ownership():
+    """Other servers' matched requests stay private; unsolicited responses pass."""
     bridge = Mock()
     server = CompanionFrameServer(bridge, "hash", port=0)
     server._write_queue = asyncio.Queue(maxsize=16)
@@ -1672,9 +1705,14 @@ def test_binary_response_push_only_for_owned_tag():
     tag = 0x11223344
     tag_bytes = struct.pack("<I", tag)
 
-    # Unowned response is ignored.
-    on_binary(tag_bytes, b"\xaa\xbb")
+    # A matched request from another server is ignored.
+    on_binary(tag_bytes, b"\xaa\xbb", None, 6)
     assert server._write_queue.qsize() == 0
+
+    on_binary(tag_bytes, b"\xaa\xbb")
+    assert server._write_queue.get_nowait()[3:] == (
+        bytes([PUSH_CODE_BINARY_RESPONSE, 0]) + tag_bytes + b"\xaa\xbb"
+    )
 
     # Unowned regions response is allowed for compatibility.
     on_binary(tag_bytes, b"\xaa\xbb", {"type": "regions"}, 7)
@@ -2999,6 +3037,49 @@ async def test_cmd_get_stats_packets_layout_and_invalid_type():
 
 
 @pytest.mark.asyncio
+async def test_cmd_get_stats_radio_frame_encodes_cached_noise_floor():
+    """A cached measurement reaches the packed STATS_TYPE_RADIO field."""
+    from openhop_core.companion import CompanionRadio
+    from openhop_core.protocol import LocalIdentity
+
+    class _StatsRadio:
+        def set_rx_callback(self, callback):
+            self.rx_callback = callback
+
+        async def send(self, data: bytes) -> bool:
+            return True
+
+        def get_last_rssi(self):
+            return -70
+
+        def get_last_snr(self):
+            return 5.0
+
+        def get_cached_noise_floor(self):
+            return -117.0
+
+    comp = CompanionRadio(_StatsRadio(), LocalIdentity())
+    server, frames = _make_capture_server(comp)
+    await server._cmd_get_stats(bytes([STATS_TYPE_RADIO]))
+    (frame,) = frames
+    assert frame[0] == RESP_CODE_STATS
+    assert frame[1] == STATS_TYPE_RADIO
+    (noise_floor,) = struct.unpack("<h", frame[2:4])
+    assert noise_floor == -117
+
+    class _NoMeasurementRadio(_StatsRadio):
+        def get_cached_noise_floor(self):
+            return None
+
+    comp2 = CompanionRadio(_NoMeasurementRadio(), LocalIdentity())
+    server2, frames2 = _make_capture_server(comp2)
+    await server2._cmd_get_stats(bytes([STATS_TYPE_RADIO]))
+    (frame2,) = frames2
+    (noise_floor2,) = struct.unpack("<h", frame2[2:4])
+    assert noise_floor2 == 0
+
+
+@pytest.mark.asyncio
 async def test_cmd_get_stats_empty_frame_is_unsupported():
     """Empty CMD_GET_STATS frame (firmware len < 2) is UNSUPPORTED_CMD, not a default stats dump.
 
@@ -4041,3 +4122,144 @@ async def test_openhop_probe_returns_exactly_32_public_key_bytes_from_real_bridg
     assert frames[0][1:7] == OPENHOP_EXTENSION_MARKER
     assert frames[0][7:] == bridge.get_public_key()
     assert len(frames[0]) == 1 + 6 + PUB_KEY_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Message frames over MAX_FRAME_SIZE: clip the text, never drop the frame
+# ---------------------------------------------------------------------------
+#
+# sync_next_message() pops the message before its frame is built, so a frame
+# _enqueue_frame refuses leaves the client waiting on CMD_SYNC_NEXT_MESSAGE for a
+# message that no longer exists.
+
+
+def _queued(text: str, **kw) -> QueuedMessage:
+    base = dict(
+        sender_key=bytes(range(6)),
+        txt_type=TXT_TYPE_SIGNED_PLAIN,
+        timestamp=1700000000,
+        text=text,
+        is_channel=False,
+        path_len=4,
+        snr=0.0,
+        rssi=-90,
+        sender_prefix=bytes(4),
+    )
+    base.update(kw)
+    return QueuedMessage(**base)
+
+
+def _msg_server(app_target_ver: int, bridge=None) -> CompanionFrameServer:
+    """A frame server on one app-protocol variant, with a real write queue."""
+    server = CompanionFrameServer(bridge or Mock(), "hash", port=0)
+    server._app_target_ver = app_target_ver
+    server._write_queue = asyncio.Queue(maxsize=8)
+    return server
+
+
+_MSG_KINDS = [
+    ("dm_signed", {}),
+    ("dm_plain", {"txt_type": 0}),
+    ("channel", {"is_channel": True, "txt_type": 0, "channel_idx": 0}),
+]
+
+
+@pytest.mark.parametrize("app_target_ver", [0, 3])
+@pytest.mark.parametrize("kind,kwargs", _MSG_KINDS, ids=[k for k, _ in _MSG_KINDS])
+def test_message_text_that_fits_is_sent_unchanged(app_target_ver, kind, kwargs):
+    server = _msg_server(app_target_ver)
+    text = "short message ěščř"
+    head = server._build_message_frame(_queued("", **kwargs))
+    assert server._build_message_frame(_queued(text, **kwargs)) == head + text.encode()
+
+
+@pytest.mark.parametrize("app_target_ver", [0, 3])
+@pytest.mark.parametrize("kind,kwargs", _MSG_KINDS, ids=[k for k, _ in _MSG_KINDS])
+@pytest.mark.parametrize("char", ["a", "ě", "€", "\U0001f600"], ids=["1b", "2b", "3b", "4b"])
+def test_over_long_message_text_is_sent_as_its_longest_fitting_prefix(
+    app_target_ver, kind, kwargs, char
+):
+    server = _msg_server(app_target_ver)
+    # Numbered, so no suffix or middle slice of the text is also a prefix of it.
+    text = "".join(f"{i}{char}" for i in range(MAX_FRAME_SIZE))
+    head = server._build_message_frame(_queued("", **kwargs))
+    frame = server._build_message_frame(_queued(text, **kwargs))
+
+    assert frame.startswith(head)
+    delivered = frame[len(head) :]
+    delivered.decode("utf-8")  # raises if a character was split
+    assert text.encode().startswith(delivered), "not a prefix of the text"
+    budget = MAX_FRAME_SIZE - len(head)
+    assert budget - len(char.encode()) < len(delivered) <= budget, "clipped more than needed"
+    server._enqueue_frame(frame)
+    assert not server._write_queue.empty(), f"{kind}/v{app_target_ver} frame was dropped"
+
+
+@pytest.mark.asyncio
+async def test_sync_next_message_answers_for_the_message_it_popped():
+    """The pop site: _cmd_sync_next_message -> _write_frame -> _enqueue_frame, unmocked."""
+    msg = _queued("x" * 160)  # v3 signed header is 20 bytes: 180 > MAX_FRAME_SIZE
+    bridge = Mock()
+    bridge.sync_next_message.return_value = msg
+    server = _msg_server(3, bridge)
+
+    await server._cmd_sync_next_message(b"")
+
+    bridge.sync_next_message.assert_called_once()
+    assert not server._write_queue.empty(), "message popped but no frame sent"
+    frame = server._write_queue.get_nowait()[3:]  # strip prefix + uint16 length
+    assert frame == server._build_message_frame(msg)
+    assert len(frame) == MAX_FRAME_SIZE, "text should be clipped to fill the frame, not emptied"
+
+
+# ---------------------------------------------------------------------------
+# RF-derived pushes over MAX_FRAME_SIZE: drop, never clip
+# ---------------------------------------------------------------------------
+#
+# A clipped RX-log frame still parses, so a client decoding the RX log stores a
+# packet whose MAC fails. Firmware drops these pushes (logRxRaw, onRawDataRecv,
+# onControlDataRecv).
+
+# (code, bytes the push puts in front of the packet data)
+_RF_PUSHES = [(PUSH_CODE_LOG_RX_DATA, 3), (PUSH_CODE_RAW_DATA, 4), (PUSH_CODE_CONTROL_DATA, 4)]
+_RF_PUSH_IDS = ["rx_log", "raw_data", "control_data"]
+
+
+async def _rf_push(server, code: int, body: bytes) -> None:
+    if code == PUSH_CODE_LOG_RX_DATA:
+        server.push_rx_raw(snr=0.0, rssi=-90, raw=body)
+    elif code == PUSH_CODE_RAW_DATA:
+        server._on_raw_data_received(body, snr=0.0, rssi=-90)
+    else:
+        await server.push_control_data(snr=0.0, rssi=-90, path_len=0, path_bytes=b"", payload=body)
+
+
+def _push_server() -> CompanionFrameServer:
+    server = CompanionFrameServer(Mock(), "hash", port=0)
+    server._write_queue = asyncio.Queue(maxsize=8)
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,head_len", _RF_PUSHES, ids=_RF_PUSH_IDS)
+async def test_rf_push_that_fits_is_sent_whole(code, head_len):
+    server = _push_server()
+    body = bytes(range(MAX_PAYLOAD_SIZE - head_len))
+
+    await _rf_push(server, code, body)
+
+    frame = server._write_queue.get_nowait()[3:]  # strip prefix + uint16 length
+    assert frame[0] == code
+    assert frame[head_len:] == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,head_len", _RF_PUSHES, ids=_RF_PUSH_IDS)
+async def test_rf_push_that_does_not_fit_is_dropped_not_clipped(code, head_len, caplog):
+    server = _push_server()
+
+    with caplog.at_level(logging.WARNING, logger="CompanionFrameServer"):
+        await _rf_push(server, code, bytes(MAX_PAYLOAD_SIZE - head_len + 1))
+
+    assert server._write_queue.empty()
+    assert f"code=0x{code:02x}" in caplog.text

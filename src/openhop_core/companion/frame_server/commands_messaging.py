@@ -442,6 +442,32 @@ class _MessagingCommandsMixin:
         # never synthesised here at send time.
         self._write_sent_response(result.is_flood, tag, result.timeout_ms)
 
+    @staticmethod
+    def _fit_message_text(head: bytes, text_bytes: bytes) -> bytes:
+        """Join a message frame head with its text, clipped to MAX_FRAME_SIZE.
+
+        The message is already off the queue when its frame is built, so a frame
+        that _enqueue_frame refuses leaves the client waiting on its
+        CMD_SYNC_NEXT_MESSAGE for a message that no longer exists. Firmware
+        clips the text instead (MyMesh.cpp: ``tlen = MAX_FRAME_SIZE - i``), but
+        by bytes; this re-encodes after the cut, as
+        PacketBuilder.create_group_datagram does, so a split multi-byte
+        character is dropped rather than sent corrupt.
+        """
+        budget = MAX_FRAME_SIZE - len(head)
+        if len(text_bytes) <= budget:
+            return head + text_bytes
+        clipped = text_bytes[: max(budget, 0)].decode("utf-8", errors="ignore").encode("utf-8")
+        logger.warning(
+            "Message text too long for frame (code=0x%02x, %s > %s bytes); "
+            "delivering %s bytes clipped on a character boundary",
+            head[0],
+            len(text_bytes),
+            budget,
+            len(clipped),
+        )
+        return head + clipped
+
     def _build_message_frame(self, msg: "QueuedMessage") -> bytes:
         """Encode a QueuedMessage into a response frame (shared by base and subclasses)."""
         snr_byte = max(-128, min(127, int(round(getattr(msg, "snr", 0) * 4))))
@@ -470,33 +496,27 @@ class _MessagingCommandsMixin:
             txt_type = 0
             text_bytes = (msg.text or "").rstrip("\x00").encode("utf-8", errors="replace")
             if self._app_target_ver >= 3:
-                return (
-                    bytes(
-                        [
-                            RESP_CODE_CHANNEL_MSG_RECV_V3,
-                            snr_byte & 0xFF,
-                            0,
-                            0,
-                            msg.channel_idx,
-                            path_len_byte,
-                            txt_type,
-                        ]
-                    )
-                    + struct.pack("<I", msg.timestamp)
-                    + text_bytes
-                )
-            return (
-                bytes(
+                head = bytes(
                     [
-                        RESP_CODE_CHANNEL_MSG_RECV,
+                        RESP_CODE_CHANNEL_MSG_RECV_V3,
+                        snr_byte & 0xFF,
+                        0,
+                        0,
                         msg.channel_idx,
                         path_len_byte,
                         txt_type,
                     ]
-                )
-                + struct.pack("<I", msg.timestamp)
-                + text_bytes
-            )
+                ) + struct.pack("<I", msg.timestamp)
+                return self._fit_message_text(head, text_bytes)
+            head = bytes(
+                [
+                    RESP_CODE_CHANNEL_MSG_RECV,
+                    msg.channel_idx,
+                    path_len_byte,
+                    txt_type,
+                ]
+            ) + struct.pack("<I", msg.timestamp)
+            return self._fit_message_text(head, text_bytes)
         prefix = (
             msg.sender_key[:6] if len(msg.sender_key) >= 6 else msg.sender_key.ljust(6, b"\x00")
         )
@@ -510,22 +530,22 @@ class _MessagingCommandsMixin:
             author = bytes(getattr(msg, "sender_prefix", b"") or b"")
             extra = author[:4].ljust(4, b"\x00")
         if self._app_target_ver >= 3:
-            return (
+            head = (
                 bytes([RESP_CODE_CONTACT_MSG_RECV_V3, snr_byte & 0xFF, 0, 0])
                 + prefix
                 + bytes([path_len_byte, msg.txt_type])
                 + struct.pack("<I", msg.timestamp)
                 + extra
-                + text_bytes
             )
-        return (
+            return self._fit_message_text(head, text_bytes)
+        head = (
             bytes([RESP_CODE_CONTACT_MSG_RECV])
             + prefix
             + bytes([path_len_byte, msg.txt_type])
             + struct.pack("<I", msg.timestamp)
             + extra
-            + text_bytes
         )
+        return self._fit_message_text(head, text_bytes)
 
     async def _cmd_sync_next_message(self, data: bytes) -> None:
         msg = self.bridge.sync_next_message()
