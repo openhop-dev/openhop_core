@@ -2860,7 +2860,14 @@ class TestSerialPortOpen:
             patch.object(KissModemWrapper, "_query_modem_info"),
             patch.object(KissModemWrapper, "_set_kiss_tx_delay"),
         ):
-            modem.connect()
+            try:
+                modem.connect()
+            finally:
+                # The patched Thread leaves MagicMock workers that report alive.
+                # Shut down here; otherwise __del__ does it during a later test,
+                # whose caplog then sees "worker still running" warnings.
+                modem.rx_thread = modem.tx_thread = modem.reconnect_thread = None
+                modem.cleanup()
         assert fake_serial.Serial.call_count == 1
         return fake_serial.Serial.call_args.kwargs
 
