@@ -438,6 +438,7 @@ class _SendOpsMixin:
             )
             self._apply_flood_scope(pkt)
             self._apply_path_hash_mode(pkt)
+            packet_hash = pkt.calculate_packet_hash()
             is_cli = txt_type in (TXT_TYPE_CLI_DATA, TXT_TYPE_CLI_COMMAND)
             # Firmware reports expected_ack = 0 for either CLI type (MyMesh.cpp
             # CMD_SEND_TXT_MSG) and skips its expected_ack_table entry on a zero
@@ -451,7 +452,12 @@ class _SendOpsMixin:
                 await self._fire_callbacks(
                     "message_sent",
                     SentMessageEvent(
-                        text, timestamp, txt_type, recipient_key=pub_key, expected_ack=ack_crc
+                        text,
+                        timestamp,
+                        txt_type,
+                        recipient_key=pub_key,
+                        expected_ack=ack_crc,
+                        packet_hash=packet_hash,
                     ),
                 )
                 self._track_pending_ack(ack_crc)
@@ -466,6 +472,7 @@ class _SendOpsMixin:
                     is_flood=is_flood,
                     expected_ack=reported_ack,
                     timeout_ms=None,
+                    packet_hash=packet_hash,
                 )
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
@@ -477,6 +484,7 @@ class _SendOpsMixin:
                 is_flood=is_flood,
                 expected_ack=reported_ack,
                 timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS,
+                packet_hash=packet_hash,
             )
         except Exception as e:
             logger.error("Error sending text message: %s", e)
@@ -490,7 +498,7 @@ class _SendOpsMixin:
         timestamp: Optional[int] = None,
         *,
         flood_scope_key: Optional[bytes] = None,
-    ) -> bool:
+    ) -> SentResult:
         """Send a message to a channel.
 
         ``flood_scope_key`` overrides the flood scope for this one message. With
@@ -500,21 +508,24 @@ class _SendOpsMixin:
         packet and this packet only -- no node, dispatcher or preference state
         is read or written, so concurrent sends cannot see each other's scope.
 
+        Returns a ``SentResult`` as ``send_text_message`` does: truthy on
+        success, with the sent packet's ``packet_hash``.
+
         Raises ``ValueError`` for a key that is not exactly 16 non-zero bytes.
         That check runs before any packet is built and outside the send's
         exception handling, so a bad key surfaces as an argument error rather
-        than as the ``False`` that means "transmit failed".
+        than as the failed result that means "transmit failed".
         """
         if flood_scope_key is not None:
             # Validated out here on purpose: the try below turns every exception
-            # into `return False`, which would hide a malformed key behind an
+            # into a failed result, which would hide a malformed key behind an
             # ordinary send failure and leave callers (the Frame extension
             # included) unable to tell the two apart.
             flood_scope_key = normalize_flood_scope_key(flood_scope_key)
         channel = self.channels.get(channel_idx)
         if not channel:
             logger.warning("Channel %s not found", channel_idx)
-            return False
+            return SentResult(success=False)
         try:
             if timestamp is None:
                 timestamp = PacketBuilder._get_timestamp()
@@ -536,22 +547,24 @@ class _SendOpsMixin:
             else:
                 self._apply_explicit_flood_scope(pkt, flood_scope_key)
             self._apply_path_hash_mode(pkt)
+            packet_hash = pkt.calculate_packet_hash()
             # Record before awaiting the transport because Repeater can queue
             # a local transmission back through its companion bridges first.
             self._check_and_track_group_packet(pkt)
             await self._fire_callbacks(
-                "message_sent", SentMessageEvent(text, timestamp, channel_idx=channel_idx)
+                "message_sent",
+                SentMessageEvent(text, timestamp, channel_idx=channel_idx, packet_hash=packet_hash),
             )
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=True)
             else:
                 self.stats.record_tx_error()
-            return success
+            return SentResult(success=success, is_flood=True, packet_hash=packet_hash)
         except Exception as e:
             logger.error("Error sending channel message: %s", e)
             self.stats.record_tx_error()
-            return False
+            return SentResult(success=False)
 
     async def send_channel_data(
         self,

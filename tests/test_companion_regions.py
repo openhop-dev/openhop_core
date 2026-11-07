@@ -753,7 +753,7 @@ class TestSendChannelMessageExplicitScope:
         finally:
             await companion.stop()
 
-        assert ok is False
+        assert ok.success is False
         assert companion._radio.sent == []
 
 
@@ -765,7 +765,7 @@ class TestExplicitScopeOnBridge:
         bridge, sent = _capturing_bridge()
         key = get_auto_key_for("#USA")
 
-        assert await bridge.send_channel_message(0, "hello", flood_scope_key=key) is True
+        assert (await bridge.send_channel_message(0, "hello", flood_scope_key=key)).success is True
 
         assert len(sent) == 1
         assert sent[0].get_route_type() == ROUTE_TYPE_TRANSPORT_FLOOD
@@ -857,7 +857,7 @@ class TestExplicitScopeOnBridge:
 
         ok = await bridge.send_channel_message(0, "hello", flood_scope_key=get_auto_key_for("#USA"))
 
-        assert ok is False
+        assert ok.success is False
 
 
 class TestTrailingNulDivergence:
