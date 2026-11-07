@@ -1003,6 +1003,30 @@ class TestDispatcherMaintenance:
 
         to_thread_mock.assert_awaited_once_with(dispatcher.radio.check_radio_health)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("interval", "error", "resets"),
+        [(0, None, 0), (4, None, 1), (4, RuntimeError("BUSY stuck"), 1)],
+    )
+    async def test_run_forever_resets_agc_once_per_interval(
+        self, dispatcher, interval, error, resets
+    ):
+        """A failing reset is logged and the loop keeps running."""
+        dispatcher.radio.reset_agc = AsyncMock(side_effect=error)
+        dispatcher.agc_reset_interval = interval
+        ticks = {"count": 0}
+
+        async def fake_wait_for(awaitable, timeout=None):
+            awaitable.close()
+            ticks["count"] += 1
+            raise asyncio.CancelledError() if ticks["count"] >= 3 else asyncio.TimeoutError()
+
+        with patch("openhop_core.node.dispatcher.asyncio.wait_for", side_effect=fake_wait_for):
+            with pytest.raises(asyncio.CancelledError):
+                await dispatcher.run_forever()
+
+        assert dispatcher.radio.reset_agc.await_count == resets
+
 
 class TestDispatcherErrorHandling:
     """Test error handling."""

@@ -543,18 +543,15 @@ class SX126x(BaseLoRa):
         return not self.busyCheck()
 
     def sleep(self, option=SLEEP_WARM_START):
-        # put device in sleep mode, wait for 500 us to enter sleep mode
+        # put device in sleep mode; it ignores SPI for about 500 us, so wait 1 ms as RadioLib does
         self.standby()
         self.setSleep(option)
-        time.sleep(0.0005)
+        time.sleep(0.001)
 
     def wake(self):
-        # wake device by set wake pin (cs pin) to low before spi transaction and put device in standby mode
-        if self._wake != -1:
-            wake_pin = _get_output_safe(self._wake, self._gpio())
-            if wake_pin:
-                wake_pin.write(False)
-                time.sleep(0.0005)
+        # the NSS falling edge of a NOP wakes the device (the NOP itself is ignored),
+        # then setStandby waits for BUSY
+        self._spi_transfer([0x00])
         self.setStandby(self.STANDBY_RC)
         self._fixResistanceAntenna()
 
@@ -1688,26 +1685,7 @@ class SX126x(BaseLoRa):
         for i in range(nBytes):
             buf.append(data[i])
 
-        bus = self._spi_bus()
-        if bus is None:
-            raise RuntimeError("SPI transport not configured")
-
-        def _xfer(payload):
-            if hasattr(bus, "xfer2"):
-                return bus.xfer2(payload)
-            if hasattr(bus, "transfer"):
-                return bus.transfer(payload)
-            raise RuntimeError(f"SPI transport {type(bus)!r} has no xfer2/transfer")
-
-        # Use manual CS control only if explicitly set
-        if self._cs_define != -1:
-            gm = self._gpio()
-            _get_output(self._cs_define, gm).write(False)
-            _xfer(buf)
-            _get_output(self._cs_define, gm).write(True)
-        else:
-            # Let SPI driver handle CS automatically
-            _xfer(buf)
+        self._spi_transfer(buf)
 
     def _readBytes(
         self, opCode: int, nBytes: int, address: tuple = (), nAddress: int = 0
@@ -1721,6 +1699,10 @@ class SX126x(BaseLoRa):
         for i in range(nBytes):
             buf.append(0x00)
 
+        feedback = self._spi_transfer(buf)
+        return tuple(feedback[nAddress + 1 :])
+
+    def _spi_transfer(self, buf: list) -> list:
         bus = self._spi_bus()
         if bus is None:
             raise RuntimeError("SPI transport not configured")
@@ -1741,8 +1723,7 @@ class SX126x(BaseLoRa):
         else:
             # Let SPI driver handle CS automatically
             feedback = _xfer(buf)
-
-        return tuple(feedback[nAddress + 1 :])
+        return feedback
 
     def start_cad(self, det_peak: int, det_min: int):
         """Start CAD with given thresholds."""
