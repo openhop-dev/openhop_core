@@ -71,6 +71,7 @@ PUSH_CALLBACK_KEYS = [
     "channel_data_event",
     "advert_received",
     "contact_path_updated",
+    "message_sent",
     "send_confirmed",
     "trace_received",
     "node_discovered",

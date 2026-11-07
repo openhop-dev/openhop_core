@@ -465,6 +465,22 @@ class TestCompanionRadioPathAndControl:
         assert path_updated_calls[0].out_path_len == path_len
         assert path_updated_calls[0].out_path == path_bytes
 
+    async def test_contact_path_updated_moves_lastmod(self):
+        """A learned path moves lastmod, so a listing since the old cursor returns it."""
+        radio = MockRadio()
+        comp = CompanionRadio(radio, LocalIdentity())
+        pub = b"\x22" * 32
+        comp.contacts.add(
+            Contact(public_key=pub, name="test", adv_type=ADV_TYPE_CHAT, lastmod=1000)
+        )
+
+        proto = comp.node.dispatcher.protocol_response_handler
+        cb_result = proto._contact_path_updated_callback(pub, 2, bytes([0x01, 0x02]))
+        if hasattr(cb_result, "__await__"):
+            await cb_result
+
+        assert [c.public_key for c in comp.get_contacts(since=1001)] == [pub]
+
 
 # ---------------------------------------------------------------------------
 # Stats and config

@@ -313,3 +313,22 @@ class ChannelDataEvent:
     # persistence layer can remove that entry by identity instead of guessing.
     # None when the protected queue rejected the push.
     queue_entry: Optional[QueuedMessage] = None
+
+
+@dataclass(frozen=True)
+class SentMessageEvent:
+    """A text message this companion is sending (single ``on_message_sent`` argument).
+
+    Fired once the packet is built, before the transport is awaited, so a send
+    that then fails to go out is reported too. A direct message has
+    ``recipient_key`` and the ``expected_ack`` that ``send_confirmed`` reports; a
+    channel message has ``channel_idx``. CLI commands, which earn no ACK, are not
+    reported.
+    """
+
+    text: str
+    timestamp: int
+    txt_type: int = 0
+    recipient_key: Optional[bytes] = None
+    channel_idx: Optional[int] = None
+    expected_ack: Optional[int] = None

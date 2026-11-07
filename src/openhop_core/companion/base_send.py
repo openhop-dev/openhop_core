@@ -45,7 +45,7 @@ from .constants import (
     TXT_TYPE_CLI_DATA,
     TXT_TYPE_PLAIN,
 )
-from .models import Contact, QueuedMessage, SentResult
+from .models import Contact, QueuedMessage, SentMessageEvent, SentResult
 from .timing import (
     DEFAULT_MAX_ATTEMPTS,
     calc_direct_timeout_ms_for_hops,
@@ -425,6 +425,8 @@ class _SendOpsMixin:
         try:
             is_flood = proxy.out_path_len < 0
             msg_type = "flood" if is_flood else "direct"
+            if timestamp is None:
+                timestamp = PacketBuilder._get_timestamp()
             pkt, ack_crc = PacketBuilder.create_text_message(
                 contact=proxy,
                 local_identity=self._identity,
@@ -445,6 +447,13 @@ class _SendOpsMixin:
             reported_ack = 0 if is_cli else ack_crc
             effective_wait_ack = wait_for_ack and not is_cli
             if not is_cli:
+                # Ahead of the send time, so a subscriber cannot add to the trip time.
+                await self._fire_callbacks(
+                    "message_sent",
+                    SentMessageEvent(
+                        text, timestamp, txt_type, recipient_key=pub_key, expected_ack=ack_crc
+                    ),
+                )
                 self._track_pending_ack(ack_crc)
             if effective_wait_ack:
                 success = await self._send_packet(pkt, wait_for_ack=True, expected_crc=ack_crc)
@@ -507,12 +516,17 @@ class _SendOpsMixin:
             logger.warning("Channel %s not found", channel_idx)
             return False
         try:
+            if timestamp is None:
+                timestamp = PacketBuilder._get_timestamp()
             pkt = PacketBuilder.create_group_datagram(
                 group_name=channel.name,
                 local_identity=self._identity,
                 message=text,
                 sender_name=self.prefs.node_name,
-                channels_config=self.channels.get_channels(),
+                # This slot alone: the builder finds the secret by name, and two
+                # slots can share a name (firmware sends by slot, MyMesh.cpp
+                # CMD_SEND_CHANNEL_TXT_MSG).
+                channels_config=[{"name": channel.name, "secret": channel.secret}],
                 timestamp=timestamp,
             )
             # Attached to the freshly built packet with no await in between, so
@@ -525,6 +539,9 @@ class _SendOpsMixin:
             # Record before awaiting the transport because Repeater can queue
             # a local transmission back through its companion bridges first.
             self._check_and_track_group_packet(pkt)
+            await self._fire_callbacks(
+                "message_sent", SentMessageEvent(text, timestamp, channel_idx=channel_idx)
+            )
             success = await self._send_packet(pkt, wait_for_ack=False)
             if success:
                 self.stats.record_tx(is_flood=True)

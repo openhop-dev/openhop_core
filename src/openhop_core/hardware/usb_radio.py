@@ -40,6 +40,7 @@ from typing import Callable, Optional
 import serial
 from serial.tools import list_ports
 
+from .frame_rf_frontend import FrameRfControls
 from .protocol_constants import (
     CMD_CAD_PARAMS_RESP,
     CMD_CAD_REQUEST,
@@ -104,7 +105,7 @@ else:
         pass
 
 
-class USBLoRaRadio(_RadioBase):
+class USBLoRaRadio(_RadioBase, FrameRfControls):
     """USB LoRa Radio — openhop_core LoRaRadio interface over USB-CDC serial.
 
     Communicates with an openHop Modem over a USB-CDC serial link.
@@ -127,6 +128,7 @@ class USBLoRaRadio(_RadioBase):
         lbt_max_attempts: int = 5,
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
+        radio_config: Optional[dict] = None,
     ):
         self.port = port
         self.baudrate = baudrate
@@ -203,6 +205,7 @@ class USBLoRaRadio(_RadioBase):
             f"sf={spreading_factor}, bw={bandwidth / 1000:.0f}kHz, "
             f"power={tx_power}dBm, syncword=0x{sync_word:04X}"
         )
+        self._init_rf_controls(radio_config)
 
     # ══════════════════════════════════════════════════════════
     # LoRaRadio interface implementation
@@ -248,6 +251,8 @@ class USBLoRaRadio(_RadioBase):
                 return False
 
             self._connected_event.set()
+
+            self._sample_rf_uptime_sync()
 
             # Start RX background thread
             self._stop_event.clear()
@@ -760,6 +765,7 @@ class USBLoRaRadio(_RadioBase):
         self._initialized = False
         self._connected_event.clear()
         self._stop_event.set()
+        self._rf_reconnecting = False
 
         if self._rx_thread and self._rx_thread.is_alive():
             self._rx_thread.join(timeout=2.0)
@@ -809,6 +815,14 @@ class USBLoRaRadio(_RadioBase):
 
     def _reconnect_serial_sync(self) -> bool:
         """Reopen a re-enumerated USB modem and restore radio/CAD state."""
+        self._rf_reconnecting = True
+        try:
+            return self._reconnect_serial_attempts_sync()
+        finally:
+            self._rf_reconnecting = False
+
+    def _reconnect_serial_attempts_sync(self) -> bool:
+        self._rf_retire_link(preserve_pending=True)
         if self._serial is not None:
             try:
                 self._serial.close()
@@ -818,10 +832,11 @@ class USBLoRaRadio(_RadioBase):
         attempt = 0
         while not self._stop_event.is_set():
             attempt += 1
+            self._rf_reconnecting = True
             try:
                 self._serial = self._open_serial_sync()
+                self._rf_serial_reopened()
                 time.sleep(0.3)
-                self._serial.reset_input_buffer()
                 if not self._apply_config_sync():
                     raise RuntimeError("modem did not acknowledge restored configuration")
                 self._connected_event.set()
@@ -840,8 +855,22 @@ class USBLoRaRadio(_RadioBase):
                         pass
                 if attempt == 1 or attempt % 10 == 0:
                     logger.warning("USB modem reconnect attempt %s failed: %s", attempt, exc)
+            finally:
+                self._rf_reconnecting = False
+            if not self._stop_event.is_set():
                 self._stop_event.wait(2.0)
         return False
+
+    def _sample_rf_uptime_sync(self) -> None:
+        """STATUS bypasses RF draining so a reboot can release old USB ownership."""
+        try:
+            self._serial.write(build_frame(CMD_STATUS_REQ))
+            resp = self._read_frame_sync(timeout=3.0, expect_cmd=CMD_STATUS_RESP)
+            if resp and resp[0] == CMD_STATUS_RESP:
+                with self._response_lock:
+                    self._rf_note_state(*resp)
+        except Exception as exc:
+            logger.debug("Unable to sample modem uptime: %s", exc)
 
     def _ping_sync(self, timeout: float = 3.0) -> bool:
         """Synchronous ping — ad-hoc liveness probe.
@@ -887,6 +916,9 @@ class USBLoRaRadio(_RadioBase):
             )
             if not self._apply_cad_config_sync():
                 logger.warning("Radio configured but cached CAD settings were not restored")
+            if self._rf_reconnecting:
+                self._sample_rf_uptime_sync()
+            self.apply_saved_rf_controls()
             return True
         elif resp and resp[0] == CMD_ERROR:
             err = resp[1][0] if len(resp) > 1 and len(resp[1]) > 0 else 0xFF
@@ -973,8 +1005,13 @@ class USBLoRaRadio(_RadioBase):
                     continue
 
                 if expect_cmd is not None and cmd != expect_cmd:
+                    with self._response_lock:
+                        discarded = self._rf_discard_late(cmd)
+                    if discarded:
+                        continue
                     if cmd == CMD_ERROR:
                         return (cmd, payload)
+                    self._dispatch_frame(cmd, payload)
                     continue
 
                 return (cmd, payload)
@@ -1102,13 +1139,16 @@ class USBLoRaRadio(_RadioBase):
             else:
                 logger.warning(f"Modem error: 0x{err_code:02X}")
             self._last_modem_error = err_code
-            # Also signal any waiting command in case the error
-            # is a response to our command
             with self._response_lock:
-                for evt_cmd, evt in list(self._response_events.items()):
-                    self._response_data[evt_cmd] = None
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if self._deliver_waiting_frame(CMD_ERROR, payload):
+                    pass
+                elif self._rf_note_unsolicited(CMD_ERROR, payload):
+                    pass
+                else:
+                    for evt_cmd, evt in list(self._response_events.items()):
+                        self._response_data[evt_cmd] = None
+                        if self._event_loop:
+                            self._event_loop.call_soon_threadsafe(evt.set)
 
         elif cmd == CMD_TX_FAIL:
             # The TX request reached the radio but the chip never asserted
@@ -1124,13 +1164,9 @@ class USBLoRaRadio(_RadioBase):
                         self._event_loop.call_soon_threadsafe(evt.set)
 
         else:
-            # ── Command response ─────────────────────────────
             with self._response_lock:
-                if cmd in self._response_events:
-                    self._response_data[cmd] = payload
-                    evt = self._response_events[cmd]
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if not self._deliver_waiting_frame(cmd, payload):
+                    self._rf_note_unsolicited(cmd, payload)
 
     # ── Async command/response ────────────────────────────────
 
@@ -1142,8 +1178,15 @@ class USBLoRaRadio(_RadioBase):
         timeout: float = 5.0,
     ) -> Optional[bytes]:
         """Send a command frame and wait for a specific response frame."""
+        deadline = time.monotonic() + timeout
         async with self._command_lock:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not await self._rf_wait_clean_async(remaining):
+                return None
             if not self._connected_event.is_set() or not self._serial or not self._serial.is_open:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
 
             # Ensure event loop is captured
@@ -1165,7 +1208,7 @@ class USBLoRaRadio(_RadioBase):
                 self._serial.flush()
 
                 try:
-                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                    await asyncio.wait_for(evt.wait(), timeout=max(0, deadline - time.monotonic()))
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                     return None

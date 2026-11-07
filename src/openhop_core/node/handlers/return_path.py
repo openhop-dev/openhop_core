@@ -94,7 +94,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Optional, Set
+from typing import Any, Callable, Optional, Set, Tuple
 
 from ...protocol import Identity, Packet
 from ...protocol.constants import (
@@ -216,6 +216,27 @@ RETURN_PATH_RELIABLE_MARGIN_DB = 6.0
 # cover a custom ``settle_s`` in __init__.
 RETURN_PATH_COPY_TTL_S = 8.0
 RETURN_PATH_COPY_CACHE_MAX = 128
+
+
+def _delivered_in_process(pkt: Packet) -> bool:
+    """True when the host handed us this copy in-process rather than over RF.
+
+    A host that runs several identities on one radio hands traffic between them
+    to the co-hosted addressee directly; the repeater's inject path marks that
+    very object ``_injected_for_tx`` before fanning it out. That copy is
+    zero-hop and loss-free, so no route heard over the air can beat it -- yet
+    its ``_rssi``/``_snr`` are 0, which would rank it as a weak radio copy. A
+    packet parsed off the radio never carries the marker.
+    """
+    return bool(getattr(pkt, "_injected_for_tx", False))
+
+
+def _hop_count(len_byte: int) -> int:
+    """Hop count encoded in a path_len byte; 0 when the byte does not decode."""
+    try:
+        return PathUtils.get_path_hash_count(len_byte)
+    except Exception:
+        return 0
 
 
 class _FloodCopy:
@@ -349,14 +370,7 @@ class ReturnPathTeacher:
                 return
             if not self._addressed_to_us(payload[0]):
                 return
-            len_byte = int(getattr(pkt, "path_len", 0) or 0)
-            path = self._validated_inbound_path(pkt, len_byte)
-            if path is None:
-                return
-            packet_hash = bytes(pkt.calculate_packet_hash())
-            rssi = int(getattr(pkt, "_rssi", 0) or 0)
-            snr = float(getattr(pkt, "_snr", 0) or 0)
-            self._record_copy(packet_hash, path, len_byte, rssi, snr)
+            self._record_packet(pkt)
         except Exception as e:  # never let a bad copy disturb RX
             self._log(f"[ReturnPath] note_flood_copy ignored a packet: {e}")
 
@@ -410,26 +424,18 @@ class ReturnPathTeacher:
             # behaviour, not a symptom. Firmware's OUT_PATH_UNKNOWN guard.
             return False
 
-        in_len_byte = int(getattr(pkt, "path_len", 0) or 0)
-        embedded_path = self._validated_inbound_path(pkt, in_len_byte)
-        if embedded_path is None:
-            self._log(
-                f"[ReturnPath] Skip teach to 0x{src_hash:02X}: inbound path "
-                f"(path_len 0x{in_len_byte:02X}) is malformed or truncated"
-            )
-            return False
-
         # Seed the best-copy table with this first-arrived copy so a teach still
         # has a source even when no raw subscriber is wired (standalone/tests);
         # note_flood_copy improves it with better copies during the settle window.
-        packet_hash = bytes(pkt.calculate_packet_hash())
-        self._record_copy(
-            packet_hash,
-            embedded_path,
-            in_len_byte,
-            int(getattr(pkt, "_rssi", 0) or 0),
-            float(getattr(pkt, "_snr", 0) or 0),
-        )
+        recorded = self._record_packet(pkt)
+        if recorded is None:
+            self._log(
+                f"[ReturnPath] Skip teach to 0x{src_hash:02X}: inbound path "
+                f"(path_len 0x{int(getattr(pkt, 'path_len', 0) or 0):02X}) "
+                f"is malformed or truncated"
+            )
+            return False
+        embedded_path, in_len_byte, packet_hash = recorded
 
         return await self._teach(
             contact_pubkey=contact_pubkey,
@@ -443,6 +449,26 @@ class ReturnPathTeacher:
             hash_key=packet_hash,
             settle_s=self._settle_s,
         )
+
+    def seed_copy(self, pkt: Packet, packet_hash: Optional[bytes] = None) -> None:
+        """Record the copy a caller is teaching from, so only a better one replaces it.
+
+        ``maybe_reteach_better_copy`` re-teaches whenever the best recorded copy
+        differs from the route it taught. That is only a *better* route if the
+        taught copy was itself in the table: the pre-dedup feed
+        (``note_flood_copy``) records every radio copy, but a copy the host
+        delivered in-process never passes the radio, so without this an echo of
+        our own flood -- relayed back by a nearby repeater -- was the sole entry
+        and re-taught a co-hosted peer a route through that repeater. Recording
+        the same radio copy twice is harmless (an equal rank keeps the entry).
+
+        Best-effort and never raises: the teach it refines has already gone out.
+        Pass ``packet_hash`` when the caller has computed it already.
+        """
+        try:
+            self._record_packet(pkt, packet_hash)
+        except Exception as e:
+            self._log(f"[ReturnPath] seed_copy ignored a packet: {e}")
 
     # ------------------------------------------------------------------
     # Refine a teach that was already sent from the first-arrived copy
@@ -653,10 +679,7 @@ class ReturnPathTeacher:
         every shorter copy is genuinely marginal and the longer one clears the
         threshold.
         """
-        try:
-            hops = PathUtils.get_path_hash_count(len_byte)
-        except Exception:
-            hops = 0
+        hops = _hop_count(len_byte)
         if margin >= self._reliable_margin_db:
             return (1, -hops, margin, rssi)
         return (0, margin, -hops, rssi)
@@ -675,12 +698,39 @@ class ReturnPathTeacher:
                 return True
         return dest_hash == self._local_hash
 
-    def _validated_inbound_path(self, pkt: Packet, len_byte: int) -> Optional[bytes]:
-        """The inbound flood path trimmed to its declared length, or None.
+    def _record_packet(
+        self, pkt: Packet, packet_hash: Optional[bytes] = None
+    ) -> Optional[Tuple[bytes, int, bytes]]:
+        """Validate a copy's inbound path and record it; the one way copies get in.
 
-        Shared by :meth:`note_flood_copy` (hot path) and
-        :meth:`maybe_teach_from_flood_reply`.
+        Every entry point (:meth:`note_flood_copy`, :meth:`seed_copy`,
+        :meth:`maybe_teach_from_flood_reply`) goes through here, so a copy is
+        always ranked the same way -- in-process detection included. Callers
+        keep their own pre-filters. ``packet_hash`` saves the SHA-256 when the
+        caller already has it.
+
+        Returns ``(path, len_byte, packet_hash)``, or None when the path is
+        malformed or truncated. A copy whose margin is too low is still
+        returned (the caller may teach from it) even though it is not recorded.
         """
+        len_byte = int(getattr(pkt, "path_len", 0) or 0)
+        path = self._validated_inbound_path(pkt, len_byte)
+        if path is None:
+            return None
+        if packet_hash is None:
+            packet_hash = bytes(pkt.calculate_packet_hash())
+        self._record_copy(
+            packet_hash,
+            path,
+            len_byte,
+            int(getattr(pkt, "_rssi", 0) or 0),
+            float(getattr(pkt, "_snr", 0) or 0),
+            in_process=_delivered_in_process(pkt),
+        )
+        return path, len_byte, packet_hash
+
+    def _validated_inbound_path(self, pkt: Packet, len_byte: int) -> Optional[bytes]:
+        """The inbound flood path trimmed to its declared length, or None."""
         if not PathUtils.is_valid_path_len(len_byte):
             return None
         byte_len = PathUtils.get_path_byte_len(len_byte)
@@ -696,6 +746,8 @@ class ReturnPathTeacher:
         len_byte: int,
         rssi: int,
         snr: float = 0.0,
+        *,
+        in_process: bool = False,
     ) -> None:
         """Keep the best-ranked copy of a flood reply, keyed by packet hash.
 
@@ -704,13 +756,22 @@ class ReturnPathTeacher:
         waterfall it is not a route, and teaching it would hand the peer a link
         that cannot carry its replies. Discarding leaves whatever the caller
         seeded (the first-arrived copy) as the fallback, so a teach is never lost.
+
+        ``in_process`` marks a copy the host delivered without RF (see
+        :func:`_delivered_in_process`). It has no last-hop measurement to rank by
+        and needs none: it gets a tier above every radio copy, so no relayed echo
+        of it can displace it.
         """
-        margin = self._copy_margin_db(rssi, snr)
-        if margin < self._min_margin_db:
-            return
+        if in_process:
+            margin = float("inf")
+            rank: tuple = (2, -_hop_count(len_byte), margin, rssi)
+        else:
+            margin = self._copy_margin_db(rssi, snr)
+            if margin < self._min_margin_db:
+                return
+            rank = self._copy_rank(margin, len_byte, rssi)
         now = self._time()
         self._prune_copies(now)
-        rank = self._copy_rank(margin, len_byte, rssi)
         existing = self._recent_copies.get(packet_hash)
         if existing is not None and rank <= existing.rank:
             existing.ts = now  # refresh so the winning copy outlives the window

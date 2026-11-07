@@ -39,6 +39,7 @@ import threading
 import time
 from typing import Callable, Optional
 
+from .frame_rf_frontend import FrameRfControls
 from .protocol_constants import (
     CMD_AUTH,
     CMD_AUTH_OK,
@@ -95,7 +96,7 @@ else:
         pass
 
 
-class TCPLoRaRadio(_RadioBase):
+class TCPLoRaRadio(_RadioBase, FrameRfControls):
     """TCP LoRa Radio — openhop_core LoRaRadio interface over Wi-Fi/TCP.
 
     Communicates with an openHop Modem in Wi-Fi STA mode. Provides the
@@ -120,6 +121,7 @@ class TCPLoRaRadio(_RadioBase):
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
         connect_timeout: float = 5.0,
+        radio_config: Optional[dict] = None,
     ):
         self.host = host
         self.port = port
@@ -198,6 +200,7 @@ class TCPLoRaRadio(_RadioBase):
             f"bw={bandwidth / 1000:.0f}kHz, power={tx_power}dBm, "
             f"syncword=0x{sync_word:04X}"
         )
+        self._init_rf_controls(radio_config)
 
     # ══════════════════════════════════════════════════════════
     # LoRaRadio interface
@@ -586,6 +589,7 @@ class TCPLoRaRadio(_RadioBase):
             self._rx_thread.join(timeout=2.0)
 
         self._close_sock()
+        self._rf_reconnecting = False
         logger.info("TCPLoRaRadio cleanup complete")
 
     # ══════════════════════════════════════════════════════════
@@ -593,6 +597,8 @@ class TCPLoRaRadio(_RadioBase):
     # ══════════════════════════════════════════════════════════
 
     def _close_sock(self):
+        self._rf_reconnecting = True
+        self._rf_retire_link()
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -672,6 +678,7 @@ class TCPLoRaRadio(_RadioBase):
                 )
                 if not self._apply_cad_config_sync():
                     logger.warning("Radio configured but cached CAD settings were not restored")
+                self.apply_saved_rf_controls()
                 return True
             if cmd == CMD_ERROR:
                 err = payload[0] if payload else 0xFF
@@ -774,6 +781,7 @@ class TCPLoRaRadio(_RadioBase):
         Does NOT start a new RX worker (we are already in one); does NOT flip
         self._initialized (the radio is still the same instance from the host's
         point of view). Used by _reconnect_with_backoff after a dropped link."""
+        self._rf_reconnecting = True
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(self.connect_timeout)
@@ -797,9 +805,18 @@ class TCPLoRaRadio(_RadioBase):
             logger.error(f"Reconnect socket open failed: {e}")
             self._close_sock()
             return False
+        finally:
+            self._rf_reconnecting = False
 
     def _reconnect_with_backoff(self) -> bool:
         """Exponential backoff (1, 2, 5, 10, 30 s) until socket is up or stop_event fires."""
+        self._rf_reconnecting = True
+        try:
+            return self._reconnect_attempts_with_backoff()
+        finally:
+            self._rf_reconnecting = False
+
+    def _reconnect_attempts_with_backoff(self) -> bool:
         for delay in (1.0, 2.0, 5.0, 10.0, 30.0):
             if self._stop_event.is_set():
                 return False
@@ -956,10 +973,15 @@ class TCPLoRaRadio(_RadioBase):
                 logger.warning(f"Modem error: 0x{err_code:02X}")
             self._last_modem_error = err_code
             with self._response_lock:
-                for evt_cmd, evt in list(self._response_events.items()):
-                    self._response_data[evt_cmd] = None
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if self._deliver_waiting_frame(CMD_ERROR, payload):
+                    pass
+                elif self._rf_note_unsolicited(CMD_ERROR, payload):
+                    pass
+                else:
+                    for evt_cmd, evt in list(self._response_events.items()):
+                        self._response_data[evt_cmd] = None
+                        if self._event_loop:
+                            self._event_loop.call_soon_threadsafe(evt.set)
 
         elif cmd == CMD_TX_FAIL:
             # The TX request reached the radio but the chip never asserted
@@ -976,11 +998,8 @@ class TCPLoRaRadio(_RadioBase):
 
         else:
             with self._response_lock:
-                if cmd in self._response_events:
-                    self._response_data[cmd] = payload
-                    evt = self._response_events[cmd]
-                    if self._event_loop:
-                        self._event_loop.call_soon_threadsafe(evt.set)
+                if not self._deliver_waiting_frame(cmd, payload):
+                    self._rf_note_unsolicited(cmd, payload)
 
     # ── Async command/response ────────────────────────────────
 
@@ -991,8 +1010,15 @@ class TCPLoRaRadio(_RadioBase):
         expect_cmd: int,
         timeout: float = 5.0,
     ) -> Optional[bytes]:
+        deadline = time.monotonic() + timeout
         async with self._command_lock:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not await self._rf_wait_clean_async(remaining):
+                return None
             if self._sock is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None
 
             if self._event_loop is None:
@@ -1015,7 +1041,7 @@ class TCPLoRaRadio(_RadioBase):
                     return None
 
                 try:
-                    await asyncio.wait_for(evt.wait(), timeout=timeout)
+                    await asyncio.wait_for(evt.wait(), timeout=max(0, deadline - time.monotonic()))
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout: cmd=0x{cmd:02X} → expected 0x{expect_cmd:02X}")
                     return None
