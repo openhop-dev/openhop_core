@@ -3010,14 +3010,22 @@ class TestCoverageSecondPass:
         radio._last_irq_status = IRQ_RX_DONE
         with caplog.at_level(logging.WARNING, logger="SX1262_wrapper"):
             radio._rx_done_event.set()
-            await asyncio.sleep(0.05)
+
+            def warned():
+                return any(
+                    "No RX callback registered" in r.getMessage() for r in caplog.records
+                )
+
+            # Wait for the warning rather than a fixed delay; slow CI runners lag.
+            for _ in range(200):
+                if warned():
+                    break
+                await asyncio.sleep(0.01)
         radio._initialized = False
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert any(
-            "No RX callback registered" in r.getMessage() for r in caplog.records
-        )
+        assert warned()
 
     @pytest.mark.parametrize(
         "irq", [IRQ_PREAMBLE_DETECTED, IRQ_SYNC_WORD_VALID, IRQ_HEADER_VALID, 0x0000]

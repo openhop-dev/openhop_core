@@ -451,6 +451,11 @@ async def test_sync_rf_wait_preserves_received_packets(cls, draining):
         return radio.set_rx_boosted_gain(True)
 
     assert await asyncio.to_thread(restore) is True
+    # The packet is posted to the loop and may land a tick after the setter returns.
+    for _ in range(100):
+        if radio.rx_callback.called:
+            break
+        await asyncio.sleep(0.001)
     radio.rx_callback.assert_called_once_with(b"packet")
 
 
