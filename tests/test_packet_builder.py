@@ -986,3 +986,18 @@ def test_broadcast_builders_leave_the_destination_key_unset():
         ("create_ack_from_bytes", ack),
     ):
         assert packet._dest_pubkey is None, name
+
+
+def test_read_from_clears_a_reused_packets_destination_key():
+    """A Packet parsed into again must not keep the previous frame's addressee."""
+    sender = LocalIdentity()
+    recipient = LocalIdentity()
+    dest = Identity(recipient.get_public_key())
+    secret = dest.calc_shared_secret(sender.get_private_key())
+    packet = PacketBuilder.create_datagram(0, dest, sender, secret, b"x")
+    assert packet._dest_pubkey == recipient.get_public_key()
+
+    advert = PacketBuilder.create_self_advert(sender, "node")
+    assert packet.read_from(advert.write_to())
+
+    assert packet._dest_pubkey is None

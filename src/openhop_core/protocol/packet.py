@@ -485,8 +485,10 @@ class Packet:
         # it: a stale _recv_region_* would have the next reply mirror the wrong
         # region, and a stale _flood_scope_applied / _path_hash_mode_applied
         # would make both send-layer resolvers skip a packet they have never
-        # seen. The dispatcher's own RX builds a fresh Packet, so this is a
-        # guard on the public API rather than a fix to a shipped path.
+        # seen. A stale _dest_pubkey would name the previous frame's addressee.
+        # The dispatcher's own RX builds a fresh Packet, so this is a guard on
+        # the public API rather than a fix to a shipped path.
+        self._dest_pubkey = None
         self._recv_region_captured = False
         self._recv_region_key = None
         self._recv_region_unscoped = False
