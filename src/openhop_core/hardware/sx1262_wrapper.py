@@ -15,6 +15,7 @@ from typing import Optional, Union
 from ..protocol.packet_utils import calculate_lora_airtime_ms, coding_rate_denominator
 from .base import LoRaRadio
 from .gpio_manager import GPIOPinManager
+from .lora.LoRaRF.LR11xx import LR11xx
 from .lora.LoRaRF.SX126x import SX126x, set_gpio_manager
 
 logger = logging.getLogger("SX1262_wrapper")
@@ -89,6 +90,8 @@ class SX1262Radio(LoRaRadio):
         use_dio3_tcxo: bool = False,
         dio3_tcxo_voltage: float = 1.8,
         use_dio2_rf: bool = False,
+        chip: str = "sx1262",
+        rf_switch: Optional[list[int]] = None,
         lbt_max_wait_seconds: float = 4.0,
         lbt_retry_interval_ms: int = 200,
         radio_timing_delay: float = RADIO_TIMING_DELAY,
@@ -125,10 +128,15 @@ class SX1262Radio(LoRaRadio):
             use_dio3_tcxo: Enable DIO3 TCXO control (default: False)
             dio3_tcxo_voltage: TCXO reference voltage in volts (default: 1.8)
             use_dio2_rf: Enable DIO2 as RF switch control (default: False)
+            chip: Radio chip, "sx1262" or "lr1121" (default: "sx1262")
+            rf_switch: LR1121 SetDioAsRfSwitch bytes: enable, standby, rx, tx, tx_hp,
+                tx_hf, gnss, wifi (default: None, no DIO drives an RF switch)
             radio_timing_delay: Delay used for radio state transitions (default: 10ms)
             spi_transport: Optional per-instance SPI transport (e.g. CH341SPITransport)
             gpio_manager: Optional per-instance GPIO manager (e.g. CH341GPIOManager)
         """
+        if chip not in ("sx1262", "lr1121"):
+            raise ValueError(f"Unsupported chip {chip!r}, expected 'sx1262' or 'lr1121'")
         self._owns_gpio_manager = False
         self._spi_transport = spi_transport
         self._external_gpio_manager = gpio_manager
@@ -162,6 +170,8 @@ class SX1262Radio(LoRaRadio):
         self.use_dio3_tcxo = use_dio3_tcxo
         self.dio3_tcxo_voltage = dio3_tcxo_voltage
         self.use_dio2_rf = use_dio2_rf
+        self.chip = chip
+        self.rf_switch = rf_switch
 
         # State variables
         self.lora: Optional[SX126x] = None
@@ -813,7 +823,7 @@ class SX1262Radio(LoRaRadio):
 
         try:
             logger.debug("Initializing SX1262 radio...")
-            self.lora = SX126x()
+            self.lora = LR11xx() if self.chip == "lr1121" else SX126x()
             # Bind this radio's GPIO manager to the chip instance first so pin
             # setup never races through a peer radio's manager.
             self.lora.set_gpio_manager(self._gpio_manager)
@@ -983,6 +993,8 @@ class SX1262Radio(LoRaRadio):
             self.lora.calibrateImage(calFreqMin, calFreqMax)
 
             self.lora.setDio2RfSwitch(self.use_dio2_rf)
+            if self.rf_switch:
+                self.lora.setDioAsRfSwitch(*self.rf_switch)
             time.sleep(self._RADIO_TIMING_DELAY)
             if self.use_dio2_rf:
                 logger.info("DIO2 RF switch control enabled")
@@ -990,8 +1002,11 @@ class SX1262Radio(LoRaRadio):
             # Common configuration for all board types
             self.lora._fixResistanceAntenna()
 
-            # Set frequency
-            rfFreq = int(self.frequency * 33554432 / 32000000)
+            # Set frequency (LR11xx takes Hz, SX126x the PLL step count)
+            if self.chip == "lr1121":
+                rfFreq = self.frequency
+            else:
+                rfFreq = int(self.frequency * 33554432 / 32000000)
             self.lora.setRfFrequency(rfFreq)
 
             # Set buffer base addresses
@@ -1028,7 +1043,8 @@ class SX1262Radio(LoRaRadio):
             self.lora.setDioIrqParams(rx_mask, rx_mask, self.lora.IRQ_NONE, self.lora.IRQ_NONE)
             self.lora.setRxGain(self.lora.RX_GAIN_BOOSTED)
 
-            self._apply_rx_sensitivity_fix()
+            if self.chip == "sx1262":
+                self._apply_rx_sensitivity_fix()
 
             # Program custom CAD thresholds to chip hardware if available
             if self._custom_cad_peak is not None and self._custom_cad_min is not None:
