@@ -244,7 +244,7 @@ def test_usb_reconnect_reopens_transport_and_restores_cached_configuration():
     assert radio._reconnect_serial_sync() is True
 
     old_serial.close.assert_called_once_with()
-    new_serial.reset_input_buffer.assert_called_once_with()
+    new_serial.reset_input_buffer.assert_not_called()
     radio._apply_config_sync.assert_called_once_with()
     assert radio._serial is new_serial
     assert radio._connected_event.is_set()

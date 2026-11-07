@@ -34,6 +34,13 @@ CMD_NOISE_REQ = 0x22
 CMD_CAD_REQUEST = 0x30
 CMD_RX_START = 0x31
 CMD_SET_CAD_PARAMS = 0x34  # v0.5.4
+CMD_GET_RF_CAPS = 0x14  # v0.8
+CMD_SET_AGC_INTERVAL = 0x16  # v0.8 — uint16 LE seconds; 0 disables
+CMD_GET_AGC_INTERVAL = 0x17  # v0.8
+CMD_SET_FEM_STATE = 0x19  # v0.8 — apply mask + value mask
+CMD_GET_FEM_STATE = 0x1A  # v0.8
+CMD_SET_RX_BOOST = 0x1C  # v0.8 — 0 power-saving, 1 boosted
+CMD_GET_RX_BOOST = 0x1D  # v0.8
 CMD_SET_WIFI = 0x41  # v0.5
 CMD_AUTH = 0x50
 CMD_WIFI_RESET = 0x60
@@ -51,6 +58,10 @@ CMD_NOISE_RESP = 0x23
 CMD_CAD_RESP = 0x32
 CMD_RX_STARTED = 0x33
 CMD_CAD_PARAMS_RESP = 0x35  # v0.5.4
+CMD_RF_CAPS_RESP = 0x15  # v0.8 — uint32 LE capability bits
+CMD_AGC_INTERVAL_RESP = 0x18  # v0.8 — uint16 LE effective seconds
+CMD_FEM_STATE_RESP = 0x1B  # v0.8 — capability mask + value mask
+CMD_RX_BOOST_RESP = 0x1E  # v0.8 — 0 power-saving, 1 boosted
 CMD_AUTH_OK = 0x51
 CMD_WIFI_STATUS = 0x62  # v0.5
 CMD_VERSION_RESP = 0x71  # v0.5.3
@@ -71,6 +82,22 @@ ERR_UNAUTHORIZED = 0x09
 # busy after all its retries. LBT feedback, not a failure: the host retries
 # within its own LBT time budget.
 ERR_CHANNEL_BUSY = 0x0E
+ERR_NO_RADIO = 0x0B
+ERR_UNSUPPORTED = 0x0F  # v0.8 — command known, control absent on this board
+ERR_RADIO_FAULT = 0x10  # v0.8 — RX boost rollback or RX restart failed
+
+# RF capability bits in CMD_RF_CAPS_RESP (uint32 LE).
+RF_CAP_AGC = 1 << 0
+RF_CAP_FEM_RX_LNA = 1 << 1
+RF_CAP_FEM_TX_PA = 1 << 2
+RF_CAP_RX_BOOSTED_GAIN = 1 << 3
+
+# FEM apply/value masks. Not the same bits as RF_CAP_*.
+FEM_STATE_RX_LNA = 1 << 0
+FEM_STATE_TX_PA = 1 << 1
+
+# Frame AGC interval: 0 disables, 1-second steps. Above this is ERR_INVALID_CONFIG.
+AGC_INTERVAL_MAX_SEC = 3600
 
 # ─── WIFI_STATUS mode codes ──────────────────────────────────────────
 # Matches firmware main.cpp::buildWifiStatusPayload
@@ -151,6 +178,13 @@ __all__ = [
     "CMD_CAD_REQUEST",
     "CMD_RX_START",
     "CMD_SET_CAD_PARAMS",
+    "CMD_GET_RF_CAPS",
+    "CMD_SET_AGC_INTERVAL",
+    "CMD_GET_AGC_INTERVAL",
+    "CMD_SET_FEM_STATE",
+    "CMD_GET_FEM_STATE",
+    "CMD_SET_RX_BOOST",
+    "CMD_GET_RX_BOOST",
     "CMD_SET_WIFI",
     "CMD_AUTH",
     "CMD_WIFI_RESET",
@@ -167,6 +201,10 @@ __all__ = [
     "CMD_CAD_RESP",
     "CMD_RX_STARTED",
     "CMD_CAD_PARAMS_RESP",
+    "CMD_RF_CAPS_RESP",
+    "CMD_AGC_INTERVAL_RESP",
+    "CMD_FEM_STATE_RESP",
+    "CMD_RX_BOOST_RESP",
     "CMD_AUTH_OK",
     "CMD_WIFI_STATUS",
     "CMD_VERSION_RESP",
@@ -183,6 +221,16 @@ __all__ = [
     "ERR_RADIO_INIT",
     "ERR_UNAUTHORIZED",
     "ERR_CHANNEL_BUSY",
+    "ERR_NO_RADIO",
+    "ERR_UNSUPPORTED",
+    "ERR_RADIO_FAULT",
+    "RF_CAP_AGC",
+    "RF_CAP_FEM_RX_LNA",
+    "RF_CAP_FEM_TX_PA",
+    "RF_CAP_RX_BOOSTED_GAIN",
+    "FEM_STATE_RX_LNA",
+    "FEM_STATE_TX_PA",
+    "AGC_INTERVAL_MAX_SEC",
     # WIFI_STATUS modes
     "WIFI_MODE_OFFLINE",
     "WIFI_MODE_STA_CONNECTING",
