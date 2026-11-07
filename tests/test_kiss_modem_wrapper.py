@@ -1095,7 +1095,7 @@ class TestSerialWriteSerialization:
         assert results.get("data") is True
         assert results.get("sethw") is True
         assert serial_conn.max_active == 1
-        assert serial_conn.flush_count == 2
+        assert serial_conn.flush_count == 0
         assert serial_conn.writes == [data_frame, sethw_frame]
 
     def test_ping_and_noise_floor_under_concurrent_data_load(self):
@@ -1857,6 +1857,7 @@ class TestShutdownAndConnectResilience:
         )
         serial_conn = MagicMock()
         serial_conn.is_open = True
+        serial_conn.write.side_effect = len
         modem.serial_conn = serial_conn
 
         responses = [None, None, (RESP_PONG, b"")]
@@ -1870,7 +1871,7 @@ class TestShutdownAndConnectResilience:
             assert modem._wait_for_modem_ready() is True
 
         assert modem.serial_conn.write.called
-        assert modem.serial_conn.flush.called
+        modem.serial_conn.flush.assert_not_called()
 
     def test_configure_radio_with_retries_eventually_succeeds(self):
         modem = KissModemWrapper(
@@ -1880,6 +1881,7 @@ class TestShutdownAndConnectResilience:
             startup_retry_budget_sec=30.0,
         )
 
+        modem.serial_conn = MagicMock(is_open=True)
         with (
             patch.object(modem, "configure_radio", side_effect=[False, False, True]) as mock_cfg,
             patch("threading.Event.wait", return_value=None),
@@ -2106,6 +2108,7 @@ class TestSerialRecovery:
             auto_configure=True,
             radio_config={"frequency": 869618000},
         )
+        modem.serial_conn = MagicMock(is_open=True)
         modem._open_serial_and_start_threads = MagicMock(return_value=True)
         modem._close_serial_connection = MagicMock()
         modem._query_modem_info = MagicMock()
@@ -2131,7 +2134,7 @@ class TestSerialRecovery:
         assert connected_states == [False, False]
         assert modem.is_connected is True
         assert modem._close_serial_connection.call_count == 0
-        assert len(sleep_mock.call_args_list) == 1  # post-connect settle only
+        sleep_mock.assert_not_called()
 
     def test_connect_persistent_configure_failures_still_fail(self):
         modem = KissModemWrapper(
@@ -2139,6 +2142,7 @@ class TestSerialRecovery:
             auto_configure=True,
             radio_config={"frequency": 869618000},
         )
+        modem.serial_conn = MagicMock(is_open=True)
         modem._open_serial_and_start_threads = MagicMock(return_value=True)
         modem._close_serial_connection = MagicMock()
         modem._query_modem_info = MagicMock()
@@ -2161,6 +2165,7 @@ class TestSerialRecovery:
             auto_configure=True,
             radio_config={"frequency": 869618000},
         )
+        modem.serial_conn = MagicMock(is_open=True)
         modem._open_serial_and_start_threads = MagicMock(return_value=True)
         modem._close_serial_connection = MagicMock()
         modem._query_modem_info = MagicMock()
@@ -2174,7 +2179,7 @@ class TestSerialRecovery:
 
         modem.configure_radio = MagicMock(side_effect=configure_with_one_retry)
 
-        with patch("openhop_core.hardware.kiss_modem_wrapper.time.sleep", return_value=None):
+        with patch.object(modem.stop_event, "wait", return_value=False):
             assert modem.connect() is True
 
         assert observed_states == [False, False]
@@ -3117,3 +3122,262 @@ class TestKissSendVerdictOwnership:
 
         with pytest.raises(Exception, match="mine: TX_DONE status=0x00"):
             await modem.send(b"\x01\x02\x03\x04")
+
+
+class TestStalledSerial:
+    def _modem(self, monkeypatch):
+        modem = KissModemWrapper(
+            port="/dev/ttyACM0",
+            auto_configure=False,
+            post_open_delay_ms=0,
+            connect_retries=1,
+        )
+        modem._post_connect_settle_s = 0
+        monkeypatch.setattr(modem, "_query_modem_info", MagicMock())
+        monkeypatch.setattr(modem, "_start_reconnect_worker", MagicMock())
+        return modem
+
+    @pytest.mark.parametrize("stage", ["resync", "ping", "txdelay", "configure"])
+    def test_connect_write_timeout_is_bounded_and_logged(
+        self,
+        monkeypatch,
+        caplog,
+        stalled_serial,
+        stage,
+    ):
+        modem = self._modem(monkeypatch)
+        if stage == "configure":
+            modem.auto_configure = True
+            modem.radio_config = {"frequency": 869618000}
+        stall_after = {"resync": 0, "ping": 1, "txdelay": 2, "configure": 2}[stage]
+        handles = []
+        open_kwargs = []
+
+        def respond(frame):
+            if len(frame) >= 4 and frame[1:3] == bytes([KISS_CMD_SETHARDWARE, CMD_PING]):
+                modem._decode_kiss(bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND]))
+
+        def open_serial(**kwargs):
+            open_kwargs.append(kwargs)
+            conn = stalled_serial(stall_after=stall_after, on_write=respond, **kwargs)
+            handles.append(conn)
+            return conn
+
+        monkeypatch.setattr(kiss_modem_wrapper.serial, "Serial", open_serial)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(modem.connect()), daemon=True)
+        started = time.monotonic()
+        worker.start()
+        try:
+            worker.join(timeout=2.8)
+            assert not worker.is_alive(), "connect() hung on serial output"
+            assert time.monotonic() - started < 2.8
+            assert result == [False]
+            assert open_kwargs[0]["write_timeout"] == 2.0
+            assert not modem.is_connected
+            assert modem.serial_conn is None
+            assert not handles[0].is_open
+            assert not handles[0].flush_started.is_set()
+            warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+            assert len(warnings) == 1
+            assert "/dev/ttyACM0" in warnings[0]
+            assert "modem is not reading" in warnings[0]
+            assert "boot-looping" in warnings[0]
+            modem._start_reconnect_worker.assert_called_once()
+        finally:
+            handles[0].close()
+            modem.cleanup()
+            worker.join(timeout=1)
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "ping",
+            "configure",
+            "sethardware",
+            "txdelay",
+            "persistence",
+            "slottime",
+            "txtail",
+            "duplex",
+            "tx",
+            "queued",
+        ],
+    )
+    def test_every_write_path_marks_link_failed(
+        self,
+        monkeypatch,
+        caplog,
+        stalled_serial,
+        operation,
+    ):
+        monkeypatch.setattr(kiss_modem_wrapper, "SERIAL_WRITE_TIMEOUT_S", 0.03)
+        modem = self._modem(monkeypatch)
+        conn = stalled_serial()
+        modem.serial_conn = conn
+        modem.is_connected = True
+        calls = {
+            "ping": modem.ping,
+            "configure": modem.configure_radio,
+            "sethardware": modem.get_tx_power,
+            "txdelay": lambda: modem._set_kiss_tx_delay(50),
+            "persistence": lambda: modem.set_kiss_persistence(64),
+            "slottime": lambda: modem.set_kiss_slottime(100),
+            "txtail": lambda: modem.set_kiss_txtail(10),
+            "duplex": lambda: modem.set_kiss_full_duplex(False),
+            "tx": lambda: modem.send_frame_and_wait(b"payload", timeout=10),
+            "queued": modem._tx_worker,
+        }
+        if operation == "queued":
+            assert modem.send_frame(b"payload")
+        if operation == "tx":
+            modem.tx_thread = threading.Thread(target=modem._tx_worker, daemon=True)
+            modem.tx_thread.start()
+        started = time.monotonic()
+        calls[operation]()
+        if operation == "tx":
+            modem.tx_thread.join(timeout=0.5)
+        assert time.monotonic() - started < 0.5
+        assert modem.is_degraded
+        assert not modem.is_connected
+        assert not conn.is_open
+        assert modem.serial_conn is None
+        assert modem.stats["frames_sent"] == 0
+        assert not conn.flush_started.is_set()
+        modem._start_reconnect_worker.assert_called_once()
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "modem is not reading" in warnings[0]
+
+    def test_runtime_timeout_reconnects_when_device_reads_again(self, monkeypatch, stalled_serial):
+        monkeypatch.setattr(kiss_modem_wrapper, "SERIAL_WRITE_TIMEOUT_S", 0.03)
+        modem = KissModemWrapper(
+            port="/dev/ttyACM0",
+            auto_configure=False,
+            post_open_delay_ms=0,
+            radio_config={"post_connect_settle_seconds": 0},
+        )
+        modem._query_modem_info = MagicMock()
+        modem._alternate_port_paths = lambda: []
+        recovered = threading.Event()
+        modem._remember_modem_identity = recovered.set
+        old = stalled_serial()
+        modem.serial_conn = old
+        modem.is_connected = True
+        handles = []
+
+        def respond(frame):
+            if len(frame) >= 4 and frame[1:3] == bytes([KISS_CMD_SETHARDWARE, CMD_PING]):
+                modem._decode_kiss(bytes([KISS_FEND, KISS_CMD_SETHARDWARE, RESP_PONG, KISS_FEND]))
+
+        def reopen(**kwargs):
+            conn = stalled_serial(stalled=False, on_write=respond, **kwargs)
+            handles.append(conn)
+            return conn
+
+        monkeypatch.setattr(kiss_modem_wrapper.serial, "Serial", reopen)
+        modem.tx_thread = threading.Thread(target=modem._tx_worker, daemon=True)
+        modem.tx_thread.start()
+        try:
+            assert modem.send_frame_and_wait(b"payload", timeout=10) is False
+            assert recovered.wait(1), "existing reconnect worker did not restore the link"
+            assert modem.is_connected
+            assert not modem.is_degraded
+            assert not old.is_open
+            assert modem.serial_conn is handles[0]
+            assert modem.ping()
+            assert not handles[0].flush_started.is_set()
+        finally:
+            modem.cleanup()
+
+    def test_disconnect_cancels_stalled_startup_and_reader(self, monkeypatch, stalled_serial):
+        modem = self._modem(monkeypatch)
+        conn = stalled_serial(write_timeout=2.0)
+        monkeypatch.setattr(kiss_modem_wrapper.serial, "Serial", lambda **kwargs: conn)
+        result = []
+        startup = threading.Thread(target=lambda: result.append(modem.connect()), daemon=True)
+        startup.start()
+        try:
+            assert conn.write_started.wait(1)
+            started = time.monotonic()
+            modem.disconnect()
+            startup.join(timeout=0.5)
+            assert time.monotonic() - started < 0.5
+            assert not startup.is_alive()
+            assert result == [False]
+            assert not modem.rx_thread.is_alive()
+            assert not modem.tx_thread.is_alive()
+            assert not conn.is_open
+            modem._start_reconnect_worker.assert_not_called()
+        finally:
+            conn.close()
+            modem.cleanup()
+
+    def test_partial_writes_share_one_budget(self, monkeypatch, stalled_serial):
+        monkeypatch.setattr(kiss_modem_wrapper, "SERIAL_WRITE_TIMEOUT_S", 0.05)
+        modem = self._modem(monkeypatch)
+        conn = stalled_serial(stalled=False)
+        modem.serial_conn = conn
+        timeouts = []
+
+        def partial_write(data):
+            timeouts.append(conn.write_timeout)
+            time.sleep(min(0.015, conn.write_timeout))
+            return 1
+
+        conn.write = partial_write
+        started = time.monotonic()
+        assert modem._write_frame(b"0123456789") is False
+        assert time.monotonic() - started < 0.2
+        assert len(timeouts) > 1
+        assert timeouts[-1] < timeouts[0]
+        assert modem.is_degraded
+
+    def test_disconnect_cancels_stalled_runtime_writer_and_reader(
+        self, monkeypatch, stalled_serial
+    ):
+        modem = self._modem(monkeypatch)
+        conn = stalled_serial(write_timeout=2)
+        modem.serial_conn = conn
+        modem.is_connected = True
+        modem.rx_thread = threading.Thread(target=modem._rx_worker, args=(conn,), daemon=True)
+        modem.tx_thread = threading.Thread(target=modem._tx_worker, args=(conn,), daemon=True)
+        modem.rx_thread.start()
+        modem.tx_thread.start()
+        try:
+            assert modem.send_frame(b"payload")
+            assert conn.write_started.wait(1)
+            started = time.monotonic()
+            modem.cleanup()
+            assert time.monotonic() - started < 0.5
+            assert not modem.rx_thread.is_alive()
+            assert not modem.tx_thread.is_alive()
+            assert not conn.is_open
+            modem._start_reconnect_worker.assert_not_called()
+        finally:
+            conn.close()
+            modem.cleanup()
+
+    def test_disconnect_interrupts_reconnect_backoff(self, monkeypatch):
+        modem = KissModemWrapper(port="/dev/ttyACM0", auto_configure=False)
+        modem._reconnect_base_delay_s = 30
+        modem._reconnect_max_delay_s = 30
+        monkeypatch.setattr(modem, "_open_serial_and_start_threads", lambda: False)
+        monkeypatch.setattr(modem, "_alternate_port_paths", lambda: [])
+        waiting = threading.Event()
+        wait = modem.stop_event.wait
+
+        def backoff(timeout):
+            waiting.set()
+            return wait(timeout)
+
+        monkeypatch.setattr(modem.stop_event, "wait", backoff)
+        try:
+            modem._start_reconnect_worker()
+            assert waiting.wait(1)
+            started = time.monotonic()
+            modem.disconnect()
+            assert time.monotonic() - started < 0.5
+            assert not modem.reconnect_thread.is_alive()
+        finally:
+            modem.cleanup()

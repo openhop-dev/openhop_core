@@ -6,6 +6,7 @@ KISS Serial Protocol Wrapper
 import asyncio
 import logging
 import threading
+import time
 from collections import deque
 from typing import Any, Callable, Dict, Optional
 
@@ -46,6 +47,7 @@ DEFAULT_TIMEOUT = 1.0
 # RX worker uses a short blocking read so it sleeps in the kernel (releasing the GIL)
 # instead of busy-polling. Actual port timeout is min(this, self.timeout).
 RX_READ_TIMEOUT_S = 0.1
+SERIAL_WRITE_TIMEOUT_S = 2.0
 
 logger = logging.getLogger("KissSerialWrapper")
 
@@ -106,6 +108,7 @@ class KissSerialWrapper(LoRaRadio):
         self.rx_thread: Optional[threading.Thread] = None
         self.tx_thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
+        self._serial_write_lock = threading.Lock()
 
         # Callbacks
         self.on_frame_received = on_frame_received
@@ -145,6 +148,7 @@ class KissSerialWrapper(LoRaRadio):
                 # Sole reader is _rx_worker (short blocking read); cap the port timeout so it
                 # releases the GIL while idle yet stays shutdown-responsive.
                 timeout=min(self.timeout, RX_READ_TIMEOUT_S),
+                write_timeout=SERIAL_WRITE_TIMEOUT_S,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -158,8 +162,9 @@ class KissSerialWrapper(LoRaRadio):
             self.stop_event.clear()
 
             # Start communication threads
-            self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
-            self.tx_thread = threading.Thread(target=self._tx_worker, daemon=True)
+            conn = self.serial_conn
+            self.rx_thread = threading.Thread(target=self._rx_worker, args=(conn,), daemon=True)
+            self.tx_thread = threading.Thread(target=self._tx_worker, args=(conn,), daemon=True)
 
             self.rx_thread.start()
             self.tx_thread.start()
@@ -169,7 +174,8 @@ class KissSerialWrapper(LoRaRadio):
             # Auto-configure if requested
             if self.auto_configure:
                 if not self.configure_radio_and_enter_kiss():
-                    logger.warning("Auto-configuration failed, KISS mode not active")
+                    if not self.stop_event.is_set():
+                        logger.warning("Auto-configuration failed, KISS mode not active")
                     self.disconnect()
                     return False
 
@@ -184,16 +190,13 @@ class KissSerialWrapper(LoRaRadio):
         """Disconnect from serial port and stop threads"""
         self.is_connected = False
         self.stop_event.set()
+        self._close_serial_connection()
 
-        # Wait for threads to finish
-        if self.rx_thread and self.rx_thread.is_alive():
+        current = threading.current_thread()
+        if self.rx_thread and self.rx_thread.is_alive() and self.rx_thread is not current:
             self.rx_thread.join(timeout=2.0)
-        if self.tx_thread and self.tx_thread.is_alive():
+        if self.tx_thread and self.tx_thread.is_alive() and self.tx_thread is not current:
             self.tx_thread.join(timeout=2.0)
-
-        # Close serial connection
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
 
         logger.info(f"KISS serial disconnected from {self.port}")
 
@@ -345,11 +348,12 @@ class KissSerialWrapper(LoRaRadio):
             logger.info(radio_cmd)
 
             # Send command
-            self.serial_conn.write(radio_cmd.encode("ascii"))
-            self.serial_conn.flush()
+            if not self._write_bytes(radio_cmd.encode("ascii")):
+                return False
 
             # Wait for response
-            threading.Event().wait(0.5)
+            if self.stop_event.wait(0.5):
+                return False
 
             # Read any response
             response = ""
@@ -382,11 +386,12 @@ class KissSerialWrapper(LoRaRadio):
         try:
             # Send command to enter KISS mode
             kiss_cmd = "serial mode kiss\r\n"
-            self.serial_conn.write(kiss_cmd.encode("ascii"))
-            self.serial_conn.flush()
+            if not self._write_bytes(kiss_cmd.encode("ascii")):
+                return False
 
             # Wait for mode switch
-            threading.Event().wait(1.0)
+            if self.stop_event.wait(1.0):
+                return False
 
             # Read any response
             response = ""
@@ -420,11 +425,12 @@ class KissSerialWrapper(LoRaRadio):
             return_frame = self._encode_kiss_frame(KISS_CMD_RETURN, b"")
 
             if self.serial_conn and self.serial_conn.is_open:
-                self.serial_conn.write(return_frame)
-                self.serial_conn.flush()
+                if not self._write_bytes(return_frame):
+                    return False
 
                 # Wait for mode switch
-                threading.Event().wait(1.0)
+                if self.stop_event.wait(1.0):
+                    return False
 
                 self.kiss_mode_active = False
                 logger.info("Exited KISS mode")
@@ -452,11 +458,12 @@ class KissSerialWrapper(LoRaRadio):
         try:
             # Send command
             cmd_line = f"{command}\r\n"
-            self.serial_conn.write(cmd_line.encode("ascii"))
-            self.serial_conn.flush()
+            if not self._write_bytes(cmd_line.encode("ascii")):
+                return None
 
             # Wait for response
-            threading.Event().wait(0.5)
+            if self.stop_event.wait(0.5):
+                return None
 
             # Read response
             response = ""
@@ -771,11 +778,12 @@ class KissSerialWrapper(LoRaRadio):
             # Configuration command response
             logger.debug(f"Received KISS config command: cmd=0x{cmd:02X}, data={data.hex()}")
 
-    def _rx_worker(self):
+    def _rx_worker(self, conn=None):
         """Background thread for receiving data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        if conn is None:
+            conn = self.serial_conn
+        while not self.stop_event.is_set() and self.is_connected and self.serial_conn is conn:
             try:
-                conn = self.serial_conn
                 if conn is None:
                     break
                 # Blocking read of >=1 byte: sleeps in the kernel (releasing the GIL) until
@@ -790,29 +798,27 @@ class KissSerialWrapper(LoRaRadio):
                 self._decode_kiss(chunk)
 
             except Exception as e:
-                if self.is_connected:  # Only log if we expect to be connected
+                if self.serial_conn is conn and not self.stop_event.is_set():
                     logger.error(f"RX worker error: {e}")
-                # Mark unhealthy and release the port so a later connect() can reopen it.
-                self._fail_transport()
+                    self._fail_transport()
                 break
 
-    def _tx_worker(self):
+    def _tx_worker(self, conn=None):
         """Background thread for sending data"""
-        while not self.stop_event.is_set() and self.is_connected:
+        if conn is None:
+            conn = self.serial_conn
+        while not self.stop_event.is_set() and self.is_connected and self.serial_conn is conn:
             try:
                 if self.tx_buffer:
                     # Get frame from buffer
                     frame = self.tx_buffer.popleft()
 
                     # Send via serial
-                    if self.serial_conn and self.serial_conn.is_open:
-                        self.serial_conn.write(frame)
-                        self.serial_conn.flush()
-
+                    if self._write_bytes(frame):
                         self.stats["frames_sent"] += 1
                         self.stats["bytes_sent"] += len(frame)
                     else:
-                        logger.warning("Serial connection not open or not available")
+                        break
                 else:
                     # Short sleep when no data to send
                     threading.Event().wait(0.01)
@@ -824,6 +830,46 @@ class KissSerialWrapper(LoRaRadio):
                 self._fail_transport()
                 break
 
+    def _write_bytes(self, data: bytes) -> bool:
+        """Serialise CLI and queued KISS writes within one timeout budget."""
+        with self._serial_write_lock:
+            conn = self.serial_conn
+            if self.stop_event.is_set():
+                return False
+            if conn is None or not conn.is_open:
+                self._fail_transport()
+                return False
+            deadline = time.monotonic() + SERIAL_WRITE_TIMEOUT_S
+            try:
+                offset = 0
+                while offset < len(data):
+                    if self.stop_event.is_set() or self.serial_conn is not conn:
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise serial.SerialTimeoutException("Serial write budget exhausted")
+                    conn.write_timeout = remaining
+                    count = conn.write(data[offset:])
+                    if count is None or count <= 0:
+                        raise serial.SerialTimeoutException(f"Serial write returned {count}")
+                    offset += count
+                # tcdrain() in flush() has no timeout, even with write_timeout set.
+                return self.serial_conn is conn and not self.stop_event.is_set()
+            except serial.SerialTimeoutException:
+                if self.serial_conn is conn and not self.stop_event.is_set():
+                    logger.warning(
+                        "Serial write timed out on %s: modem is not reading "
+                        "(firmware may not be running or may be boot-looping)",
+                        self.port,
+                    )
+                    self._fail_transport()
+                return False
+            except Exception as e:
+                if self.serial_conn is conn and not self.stop_event.is_set():
+                    logger.error("Serial write error on %s: %s", self.port, e)
+                    self._fail_transport()
+                return False
+
     def _fail_transport(self) -> None:
         """Mark the link unhealthy and close the serial port from a worker thread.
 
@@ -832,9 +878,21 @@ class KissSerialWrapper(LoRaRadio):
         """
         self.is_connected = False
         self.stop_event.set()
+        self._close_serial_connection()
+
+    def _close_serial_connection(self) -> None:
+        """Cancel pending I/O before closing, without waiting for worker locks."""
         conn = self.serial_conn
+        self.serial_conn = None
         if conn is None:
             return
+        for name in ("cancel_read", "cancel_write"):
+            try:
+                cancel = getattr(conn, name, None)
+                if callable(cancel):
+                    cancel()
+            except Exception as e:
+                logger.debug("Serial %s failed during close: %s", name, e)
         try:
             if conn.is_open:
                 conn.close()
@@ -861,8 +919,6 @@ class KissSerialWrapper(LoRaRadio):
 
 if __name__ == "__main__":
     # Example usage
-    import time
-
     def on_frame_received(data):
         print(f"Received frame: {data.hex()}")
 

@@ -215,6 +215,7 @@ DEFAULT_TIMEOUT = 1.0
 # instead of busy-polling, while still checking stop_event promptly on shutdown. The actual
 # port timeout is min(this, self.timeout) so a caller-supplied lower timeout still wins.
 RX_READ_TIMEOUT_S = 0.1
+SERIAL_WRITE_TIMEOUT_S = 2.0
 RESPONSE_TIMEOUT = 5.0  # Timeout for command responses
 # Max time a received Data frame waits for its trailing RxMeta before being
 # dispatched with sentinel metrics. RxMeta is only emitted when signal reporting
@@ -503,6 +504,7 @@ class KissModemWrapper(LoRaRadio):
         """
         with self._connection_lock:
             self.stop_event.clear()
+            self._shutting_down = False
             self.is_connected = False
             if not self._open_serial_and_start_threads():
                 return False
@@ -519,6 +521,12 @@ class KissModemWrapper(LoRaRadio):
 
     def disconnect(self):
         """Disconnect from serial port and stop threads"""
+        # Interrupt startup before waiting for its connection lock.
+        self._shutting_down = True
+        self.stop_event.set()
+        self._response_event.set()
+        self._tx_done_event.set()
+        self._close_serial_connection()
         with self._connection_lock:
             self.stop_event.set()
             self.is_connected = False
@@ -540,7 +548,6 @@ class KissModemWrapper(LoRaRadio):
     def _open_serial_and_start_threads(self) -> bool:
         """Open serial device and start RX/TX workers."""
         try:
-            self._shutting_down = False
             # Drop any Data frames left over from a prior session so a stale payload
             # cannot pair with an RxMeta from the freshly opened link.
             self._clear_pending_rx()
@@ -550,6 +557,7 @@ class KissModemWrapper(LoRaRadio):
                 # Sole reader is _rx_worker, which does a short blocking read; cap the port
                 # timeout so it releases the GIL while idle yet stays shutdown-responsive.
                 timeout=min(self.timeout, RX_READ_TIMEOUT_S),
+                write_timeout=SERIAL_WRITE_TIMEOUT_S,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
@@ -576,7 +584,8 @@ class KissModemWrapper(LoRaRadio):
             logger.info("KISS modem connected to %s at %s baud", self.port, self.baudrate)
 
             if not self._wait_for_modem_ready():
-                logger.warning("KISS modem did not become ready after reconnect")
+                self._close_serial_connection()
+                logger.debug("KISS modem did not become ready on %s", self.port)
                 return False
 
             # Postcondition: this function's whole job is a live link, and the
@@ -593,6 +602,7 @@ class KissModemWrapper(LoRaRadio):
             self._open_failure_count = 0
             return True
         except Exception as e:
+            self._close_serial_connection()
             self._note_open_failure(e)
             self.is_connected = False
             return False
@@ -739,12 +749,14 @@ class KissModemWrapper(LoRaRadio):
                 "Post-connect settle delay %.2fs before SetHardware handshake",
                 self._post_connect_settle_s,
             )
-            time.sleep(self._post_connect_settle_s)
+            if self.stop_event.wait(self._post_connect_settle_s):
+                return False
 
         # Auto-configure if requested
         if self.auto_configure and self.radio_config:
             if not self._configure_radio_with_retries():
-                logger.warning("Auto-configuration failed after retries")
+                if self.serial_conn is not None and not self._is_stopping():
+                    logger.warning("Auto-configuration failed after retries")
                 return False
 
         # Query modem info
@@ -761,7 +773,7 @@ class KissModemWrapper(LoRaRadio):
             self.set_kiss_txtail(self.radio_config["kiss_txtail_ms"])
         if "kiss_full_duplex" in self.radio_config:
             self.set_kiss_full_duplex(bool(self.radio_config["kiss_full_duplex"]))
-        return True
+        return self.serial_conn is not None and not self._is_stopping()
 
     def _close_serial_connection(self) -> None:
         """Detach and close the serial handle without waiting for worker threads.
@@ -841,7 +853,8 @@ class KissModemWrapper(LoRaRadio):
             return False
 
         if self.post_open_delay_ms > 0:
-            threading.Event().wait(self.post_open_delay_ms / 1000.0)
+            if self.stop_event.wait(self.post_open_delay_ms / 1000.0):
+                return False
 
         try:
             self.serial_conn.reset_input_buffer()
@@ -857,28 +870,28 @@ class KissModemWrapper(LoRaRadio):
             except Exception as e:
                 logger.debug("USB DTR toggle skipped/failed: %s", e)
 
-        try:
-            self.serial_conn.write(bytes([KISS_FEND]))
-            self.serial_conn.flush()
-        except Exception as e:
-            logger.debug("KISS parser resync write failed: %s", e)
+        if not self._write_frame(bytes([KISS_FEND])):
+            return False
 
         backoff_seconds = [0.5, 1.0, 2.0, 2.0, 2.0]
         deadline = time.monotonic() + self.startup_retry_budget_sec
 
         for attempt in range(self.connect_retries):
-            if self._shutting_down:
+            if self._is_stopping() or self.serial_conn is None:
                 return False
             resp = self._send_command(CMD_PING, timeout=1.0)
             if resp and resp[0] == RESP_PONG:
                 logger.debug("KISS modem responded to ping on attempt %d", attempt + 1)
                 return True
+            if self.serial_conn is None or self._is_stopping():
+                return False
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
-            threading.Event().wait(delay)
+            if self.stop_event.wait(delay):
+                return False
 
         return False
 
@@ -887,15 +900,18 @@ class KissModemWrapper(LoRaRadio):
         deadline = time.monotonic() + self.startup_retry_budget_sec
         backoff_seconds = [0.5, 1.0, 2.0, 2.0, 2.0]
         for attempt in range(self.connect_retries):
-            if self._shutting_down:
+            if self._is_stopping() or self.serial_conn is None:
                 return False
             if self.configure_radio():
                 return True
+            if self.serial_conn is None or self._is_stopping():
+                return False
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             delay = min(backoff_seconds[min(attempt, len(backoff_seconds) - 1)], remaining)
-            threading.Event().wait(delay)
+            if self.stop_event.wait(delay):
+                return False
         return False
 
     def _write_frame(self, frame: bytes) -> bool:
@@ -911,31 +927,45 @@ class KissModemWrapper(LoRaRadio):
             True if all bytes written, False on error or incomplete write.
         """
         with self._serial_write_lock:
-            if not self.serial_conn or not self.serial_conn.is_open:
+            conn = self.serial_conn
+            if self._is_stopping():
+                return False
+            if not conn or not conn.is_open:
                 self._mark_serial_failure("Serial connection closed during write")
                 return False
-            offset = 0
-            while offset < len(frame):
-                try:
-                    n = self.serial_conn.write(frame[offset:])
-                    if n is None or n <= 0:
-                        logger.error("Serial write returned %s", n)
-                        self._mark_serial_failure(f"Serial write returned {n}")
+            deadline = time.monotonic() + SERIAL_WRITE_TIMEOUT_S
+            try:
+                offset = 0
+                while offset < len(frame):
+                    if self._is_stopping() or not self._owns_connection(conn):
                         return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise serial.SerialTimeoutException("Serial write budget exhausted")
+                    conn.write_timeout = remaining
+                    n = conn.write(frame[offset:])
+                    if n is None or n <= 0:
+                        raise serial.SerialTimeoutException(f"Serial write returned {n}")
                     offset += n
-                except Exception as e:
+                # flush() uses tcdrain(), which ignores pyserial's write timeout.
+                # Ordered writes plus modem replies provide completion without it.
+                return self._owns_connection(conn) and not self._is_stopping()
+            except serial.SerialTimeoutException:
+                if self._owns_connection(conn) and not self._is_stopping():
+                    reason = (
+                        f"Serial write timed out on {self.port}: modem is not reading "
+                        "(firmware may not be running or may be boot-looping)"
+                    )
+                    logger.warning(reason)
+                    self._mark_serial_failure(reason, log_warning=False)
+                return False
+            except Exception as e:
+                if self._owns_connection(conn) and not self._is_stopping():
                     logger.error("Serial write error: %s", e)
                     self._mark_serial_failure(f"Serial write failed: {e}")
-                    return False
-            try:
-                self.serial_conn.flush()
-            except Exception as e:
-                logger.error("Serial flush error: %s", e)
-                self._mark_serial_failure(f"Serial flush failed: {e}")
                 return False
-            return True
 
-    def _mark_serial_failure(self, reason: str) -> None:
+    def _mark_serial_failure(self, reason: str, *, log_warning: bool = True) -> None:
         """Transition to degraded mode and trigger reconnect loop once."""
         if self.stop_event.is_set():
             return
@@ -943,9 +973,10 @@ class KissModemWrapper(LoRaRadio):
         now = time.time()
         with self._failure_log_lock:
             should_log = (now - self._last_failure_log_ts) >= self._failure_log_interval_s
-            if should_log:
+            if should_log or not log_warning:
                 self._last_failure_log_ts = now
-                logger.warning("Marking KISS serial link degraded: %s", reason)
+                if log_warning:
+                    logger.warning("Marking KISS serial link degraded: %s", reason)
 
         # Do not wait for the connection lock here. A failed SetHardware write can
         # hold _command_lock (or _serial_write_lock), while the reconnect worker
@@ -966,6 +997,7 @@ class KissModemWrapper(LoRaRadio):
         # Wake any in-flight DATA sender so it fails fast instead of waiting out the
         # full TX_DONE timeout on a link that is already gone (cleanup() does the same).
         self._tx_done_event.set()
+        self._response_event.set()
 
         self._start_reconnect_worker()
 
@@ -1005,7 +1037,8 @@ class KissModemWrapper(LoRaRadio):
             )
             jitter = random.uniform(0.0, min(0.25, delay * 0.2))
             if attempts > 1:
-                time.sleep(delay + jitter)
+                if self.stop_event.wait(delay + jitter):
+                    break
 
             with self._connection_lock:
                 if self.stop_event.is_set():
@@ -1063,7 +1096,7 @@ class KissModemWrapper(LoRaRadio):
         if self._write_frame(frame):
             logger.debug("KISS TXDELAY set to %dms (value %d)", value * 10, value)
         else:
-            logger.warning("Failed to set KISS TXDELAY")
+            logger.debug("Failed to set KISS TXDELAY")
 
     def set_kiss_persistence(self, value: int) -> bool:
         """
@@ -1407,9 +1440,10 @@ class KissModemWrapper(LoRaRadio):
             # frame may well have gone out -- but only 0x01 confirms a clean send, and
             # nothing else here can tell the two apart.
             reason = "modem reported TX_DONE status=0x00"
+            logger.warning("DATA send failed: %s", reason)
         else:
             reason = "transmit aborted (link lost or shutting down)"
-        logger.warning("DATA send failed: %s", reason)
+            logger.debug("DATA send failed: %s", reason)
         return self._verdict(reason)
 
     def _send_command(
@@ -1474,7 +1508,7 @@ class KissModemWrapper(LoRaRadio):
                 kiss_frame = self._encode_kiss_frame(KISS_CMD_SETHARDWARE, bytes([sub_cmd]) + data)
 
                 if not self._write_frame(kiss_frame):
-                    logger.warning("SetHardware frame write failed")
+                    logger.debug("SetHardware frame write failed")
                     return None
 
                 # Wait for response with shutdown-aware polling.
@@ -2525,7 +2559,7 @@ class KissModemWrapper(LoRaRadio):
                         self.stats["frames_sent"] += 1
                         self.stats["bytes_sent"] += len(frame)
                     else:
-                        logger.warning("TX frame write failed, dropping frame")
+                        logger.debug("TX frame write failed, dropping frame")
                 else:
                     threading.Event().wait(0.01)
 
