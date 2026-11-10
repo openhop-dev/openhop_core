@@ -58,6 +58,9 @@ class CH341GPIOPin:
         self._direction_configured = False
         self._gpio_manager = gpio_manager  # Reference to manager for CS state checking
 
+        # Re-fire the interrupt callback if the pin stays HIGH this long (missed edge).
+        self.stuck_high_refire_s = 0.2
+
     def read(self) -> bool:
         """Read pin value"""
         # Lazy configure: set direction on first access
@@ -173,11 +176,45 @@ class CH341GPIOPin:
         except Exception:
             self._poll_last_state = False
 
+        # Stuck-HIGH recovery (same idea as GPIOPinManager._monitor_polling for gpiod).
+        # Edges are inferred by sampling, and read() returns the cached state while an
+        # SPI transfer holds the CH341 lock. A short LOW between two IRQs (typically
+        # IRQ cleared in _restore_rx_mode() after TX, then PREAMBLE/HEADER of an
+        # incoming packet) can therefore be missed: the pin reads HIGH -> HIGH, no
+        # callback fires, nothing clears the IRQ and DIO1 stays HIGH forever (RX deaf).
+        # Treat a pin that stays HIGH as still pending and re-fire the callback.
+        # Time-based rather than every other poll: at 1 ms polling that would schedule
+        # hundreds of handler calls per second while the event loop is busy.
+        high_since = None
+        last_refire = 0.0
+
         while not self._stop_polling:
             iteration_count += 1
 
             try:
                 current_state = bool(self.read())
+
+                now = time.monotonic()
+                if current_state and self._poll_last_state:
+                    if high_since is None:
+                        high_since = now
+                    elif (
+                        now - high_since >= self.stuck_high_refire_s
+                        and now - last_refire >= self.stuck_high_refire_s
+                        and self._interrupt_callback
+                    ):
+                        last_refire = now
+                        interrupt_count += 1
+                        logger.debug(
+                            f"[POLL] pin={self.pin} stuck HIGH for "
+                            f"{now - high_since:.2f}s, re-firing callback"
+                        )
+                        try:
+                            self._interrupt_callback()
+                        except Exception as e:
+                            logger.error(f"Error in interrupt callback: {e}")
+                elif not current_state:
+                    high_since = None
 
                 # Periodic debug (very low rate)
                 current_time = time.time()
