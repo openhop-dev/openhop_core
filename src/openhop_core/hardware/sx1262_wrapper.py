@@ -586,11 +586,19 @@ class SX1262Radio(LoRaRadio):
         while self._initialized:
             try:
                 if self._interrupt_setup:
-                    # Wait for RX_DONE event
+                    # Wait for RX_DONE event. On a quiet channel the only other
+                    # work is the next noise floor sample, so sleep until it is
+                    # due; once due, retry at RADIO_TIMING_DELAY as before. The
+                    # upper bound covers a wall clock that was set back.
+                    until_sample = self.NOISE_FLOOR_UPDATE_INTERVAL - (
+                        time.time() - self._last_sample_check
+                    )
+                    idle_timeout = min(
+                        max(until_sample, self.RADIO_TIMING_DELAY),
+                        self.NOISE_FLOOR_UPDATE_INTERVAL,
+                    )
                     try:
-                        await asyncio.wait_for(
-                            self._rx_done_event.wait(), timeout=self.RADIO_TIMING_DELAY
-                        )
+                        await asyncio.wait_for(self._rx_done_event.wait(), timeout=idle_timeout)
                         self._rx_done_event.clear()
                         _trace("[RX] RX_DONE event triggered!")
 
@@ -764,7 +772,7 @@ class SX1262Radio(LoRaRadio):
                         # Sample noise floor during quiet periods
                         self._sample_noise_floor()
 
-                        # Log every 500 checks (roughly every 5 seconds) to show RX task is alive
+                        # Log every 500 checks to show RX task is alive
                         if rx_check_count % 500 == 0:
                             logger.debug(
                                 "[RX Task] Status check #%d, noise_floor=%.1fdBm",
