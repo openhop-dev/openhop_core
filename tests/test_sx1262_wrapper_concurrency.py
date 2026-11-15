@@ -978,6 +978,22 @@ class TestRxBackgroundTask:
         except (asyncio.CancelledError, Exception):
             pass
 
+    async def test_quiet_channel_sleeps_until_noise_sample_is_due(self, radio):
+        """No wake-ups between noise floor samples; a packet still gets through at once."""
+        radio._last_sample_check = time.time()  # a sample was just taken
+        received = []
+        radio.rx_callback = received.append  # set_rx_callback would start a second task
+        with patch.object(radio, "_sample_noise_floor") as sample:
+            task = asyncio.get_running_loop().create_task(radio._rx_irq_background_task())
+            await asyncio.sleep(0.1)
+            assert sample.call_count == 0
+            await self._one_rx_cycle(radio, IRQ_RX_DONE, b"hello")
+        radio._initialized = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert received == [b"hello"]
+
     async def test_rx_mode_restored_after_packet(self, radio, mock_lora):
         await self._run_task_with(radio, irq_flags=IRQ_RX_DONE, callback=lambda _: None)
         mock_lora.request.assert_called_with(mock_lora.RX_CONTINUOUS)
