@@ -16,8 +16,11 @@ LPP_TEMPERATURE = 0x67  # 103: 2 bytes, 0.1 C/LSB, signed
 LPP_RELATIVE_HUMIDITY = 0x68  # 104: 1 byte, 0.5 %/LSB, unsigned
 LPP_BAROMETRIC_PRESSURE = 0x73  # 115: 2 bytes, 0.1 hPa/LSB, unsigned
 LPP_VOLTAGE = 0x74  # 116: 2 bytes, 0.01 V/LSB, unsigned
-LPP_CURRENT = 0x75  # 115: 2 bytes, 0.001 A/LSB, signed
+LPP_CURRENT = 0x75  # 117: 2 bytes, 0.001 A/LSB, signed
 LPP_POWER = 0x80  # 128: 2 bytes, 1 W/LSB, unsigned
+LPP_PERCENTAGE = 0x78  # 120: 1 byte, 1 %/LSB, unsigned (max 100)
+LPP_LUMINOSITY = 0x65  # 101: 2 bytes, 1 lux/LSB, unsigned
+LPP_DIRECTION = 0x84  # 132: 2 bytes, 1 deg/LSB, unsigned
 # LPP data channel for the 'self' device (SensorManager.h:10).
 TELEM_CHANNEL_SELF = 1
 
@@ -33,6 +36,9 @@ _LPP_TYPES = {
     LPP_VOLTAGE: (2, 100, False),
     LPP_CURRENT: (2, 1000, True),
     LPP_POWER: (2, 1, False),
+    LPP_PERCENTAGE: (1, 1, False),
+    LPP_LUMINOSITY: (2, 1, False),
+    LPP_DIRECTION: (2, 1, False),
 }
 
 
@@ -89,3 +95,30 @@ def encode_relative_humidity(channel: int, percent: float) -> bytes:
 def encode_barometric_pressure(channel: int, hpa: float) -> bytes:
     """Encode a barometric-pressure entry (LPP_BAROMETRIC_PRESSURE, 0.1 hPa/LSB)."""
     return _add_field(channel, LPP_BAROMETRIC_PRESSURE, hpa)
+
+
+def encode_percentage(channel: int, percent: float) -> bytes:
+    """Encode a percentage entry (LPP_PERCENTAGE, 1 %/LSB, unsigned).
+
+    Clamped to 0-100: the field is one byte and an unclamped value would wrap
+    through the mask rather than saturate.
+    """
+    return _add_field(channel, LPP_PERCENTAGE, max(0.0, min(100.0, float(percent))))
+
+
+def encode_luminosity(channel: int, lux: float) -> bytes:
+    """Encode an illuminance entry (LPP_LUMINOSITY, 1 lux/LSB, unsigned).
+
+    Clamped to the 16-bit field so an out-of-range reading saturates instead of
+    wrapping.
+    """
+    return _add_field(channel, LPP_LUMINOSITY, max(0.0, min(65535.0, float(lux))))
+
+
+def encode_direction(channel: int, degrees: float) -> bytes:
+    """Encode a bearing entry (LPP_DIRECTION, 1 deg/LSB, unsigned).
+
+    Bearings are modular, so the value wraps into 0-360 rather than clamping.
+    """
+    return _add_field(channel, LPP_DIRECTION, float(degrees) % 360.0)
+
