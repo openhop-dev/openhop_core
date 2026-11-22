@@ -43,6 +43,9 @@ hardware = [
 
 gpiod = ["gpiod>=2.4.0"]
 
+# BLE companion transport (Linux/BlueZ): CompanionBleTransport
+ble = ["dbus-fast>=2.0.0; sys_platform == 'linux'"]
+
 websocket = [
     "websockets>=11.0.0",
 ]
@@ -54,6 +57,8 @@ test = [
     "pytest-cov>=4.0.0",
     "pytest-asyncio>=0.21.0",
     "pyserial>=3.5",
+    # The BLE transport's tests need its D-Bus message types, not a bus.
+    "dbus-fast>=2.0.0",
 ]
 # The full local toolchain. Note this pulls in black, which requires Python
 # 3.10+.
