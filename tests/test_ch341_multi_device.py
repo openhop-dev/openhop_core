@@ -127,6 +127,29 @@ def test_get_instance_two_locations_are_distinct():
     assert b.address == 8
 
 
+def test_spi_transfer_reverses_every_byte_value_both_ways():
+    """The CH341 clocks SPI LSB first: each byte goes out and comes back bit-reversed."""
+    sent = []
+
+    class _Loopback:
+        def write(self, data, timeout=None):
+            sent.append(bytes(data))
+            return len(data)
+
+        def read(self, length, timeout=None):
+            return sent[-1][1 : 1 + length]  # MISO tied to MOSI
+
+    ch = CH341Async.__new__(CH341Async)
+    ch.dev, ch._ep_out, ch._ep_in = object(), _Loopback(), _Loopback()
+    every_byte = bytes(range(256))
+
+    assert ch._spi_transfer_impl_core(every_byte) == every_byte
+    on_the_wire = b"".join(packet[1:] for packet in sent)
+    assert on_the_wire == bytes(CH341Async.reverse_byte(b) for b in every_byte)
+    assert {packet[0] for packet in sent} == {CH341Async.CMD_SPI_STREAM}
+    assert max(map(len, sent)) == CH341Async.CH341_PACKET_LENGTH
+
+
 def test_list_devices_returns_locations():
     d1 = _fake_dev(1, 5)
     d2 = _fake_dev(2, 9)
