@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import logging
+import os
+import struct
+import sys
 import threading
 import time
 from enum import IntEnum
@@ -10,10 +14,20 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+try:
     import usb.core
     import usb.util
 except Exception as e:  # pragma: no cover
     raise ImportError("PyUSB is required for CH341 support. Install with: pip install pyusb") from e
+
+
+# USBDEVFS_BULK = _IOWR('U', 2, struct usbdevfs_bulktransfer), linux/usbdevice_fs.h.
+_USBFS_BULK = struct.Struct("IIIP")
+_USBDEVFS_BULK = (3 << 30) | (_USBFS_BULK.size << 16) | (ord("U") << 8) | 2
 
 
 class CH341Error(Exception):
@@ -69,6 +83,10 @@ class CH341Async:
 
     # Timeout
     USB_TIMEOUT = 5000  # ms
+
+    # Pin status read (CMD_UIO_READ)
+    GPIO_READ_BYTES = 6
+    GPIO_READ_TIMEOUT_MS = 200
 
     @staticmethod
     def _identity_key(
@@ -219,6 +237,23 @@ class CH341Async:
 
         # Thread safety
         self._transfer_lock = threading.Lock()
+
+        # Bulk transfers through usbfs (Linux only); see _find_usbfs_fd. _transfer_lock
+        # guards the descriptor and these buffers. The IRQ poller reads the pins
+        # hundreds of times a second, so that read has its two requests built once.
+        self._usbfs_fd: Optional[int] = None
+        self._usbfs_pins = (ctypes.c_ubyte * self.GPIO_READ_BYTES)()
+        pins_at = ctypes.addressof(self._usbfs_pins)
+        self._usbfs_pins_out = bytearray(
+            _USBFS_BULK.pack(self.EP_OUT, 1, self.GPIO_READ_TIMEOUT_MS, pins_at)
+        )
+        self._usbfs_pins_in = bytearray(
+            _USBFS_BULK.pack(self.EP_IN, self.GPIO_READ_BYTES, self.GPIO_READ_TIMEOUT_MS, pins_at)
+        )
+        # Every other transfer shares one buffer and one request.
+        self._usbfs_io = (ctypes.c_ubyte * self.CH341_PACKET_LENGTH)()
+        self._usbfs_io_at = ctypes.addressof(self._usbfs_io)
+        self._usbfs_req = bytearray(_USBFS_BULK.size)
         self._operation_lock = threading.RLock()
 
         self._open_device()
@@ -404,6 +439,11 @@ class CH341Async:
         except Exception:
             pass
 
+        self._usbfs_fd = self._find_usbfs_fd()
+        logger.debug(
+            "CH341 bulk transfers through %s", "pyusb" if self._usbfs_fd is None else "usbfs"
+        )
+
         logger.info(
             "CH341 opened: VID=%04x PID=%04x bus=%s address=%s serial=%r",
             self.vid,
@@ -418,6 +458,10 @@ class CH341Async:
 
         if self.dev is None:
             return
+
+        # libusb is about to close the descriptor; let a transfer in flight finish first.
+        with self._transfer_lock:
+            self._usbfs_fd = None
 
         try:
             try:
@@ -436,6 +480,29 @@ class CH341Async:
             if type(self)._instance is self:
                 type(self)._instance = next(iter(type(self)._instances.values()), None)
 
+    def _find_usbfs_fd(self) -> Optional[int]:
+        """The descriptor libusb holds on this device's usbfs node (Linux), else None.
+
+        With it, _bulk_write_all, _bulk_read_exact and _gpio_get_impl make each
+        transfer as one USBDEVFS_BULK ioctl instead of going through pyusb.
+        Opening the device and the drain that follows stay on pyusb.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+        fds = []
+        try:
+            node = "/dev/bus/usb/%03d/%03d" % (self.dev.bus, self.dev.address)
+            for name in os.listdir("/proc/self/fd"):
+                try:
+                    if os.readlink(f"/proc/self/fd/{name}") == node:
+                        fds.append(int(name))
+                except OSError:
+                    continue
+        except (OSError, TypeError):
+            return None
+        # Anything but exactly one would be a guess; pyusb still works.
+        return fds[0] if len(fds) == 1 else None
+
     def _bulk_write_all(self, payload: bytes, timeout_ms: Optional[int] = None) -> None:
         if self.dev is None or self._ep_out is None:
             raise CH341Error("Device not open")
@@ -444,6 +511,23 @@ class CH341Async:
             timeout_ms = self.USB_TIMEOUT
 
         if not payload:
+            return
+
+        fd = self._usbfs_fd
+        if fd is not None and len(payload) <= self.CH341_PACKET_LENGTH:
+            req, at = self._usbfs_req, self._usbfs_io_at
+            offset = 0
+            while offset < len(payload):
+                left = len(payload) - offset
+                ctypes.memmove(at, bytes(payload[offset:]), left)
+                _USBFS_BULK.pack_into(req, 0, self.EP_OUT, left, timeout_ms, at)
+                try:
+                    written = fcntl.ioctl(fd, _USBDEVFS_BULK, req, True)
+                except OSError as e:
+                    raise CH341SPIError(f"SPI OUT bulk transfer failed: {e}") from e
+                if written <= 0:
+                    raise CH341SPIError("SPI OUT bulk transfer short write (0 bytes)")
+                offset += written
             return
 
         offset = 0
@@ -465,6 +549,21 @@ class CH341Async:
 
         if nbytes <= 0:
             return b""
+
+        fd = self._usbfs_fd
+        if fd is not None and nbytes <= self.CH341_PACKET_LENGTH:
+            req, at = self._usbfs_req, self._usbfs_io_at
+            data = b""
+            while len(data) < nbytes:
+                _USBFS_BULK.pack_into(req, 0, self.EP_IN, nbytes - len(data), timeout_ms, at)
+                try:
+                    got = fcntl.ioctl(fd, _USBDEVFS_BULK, req, True)
+                except OSError as e:
+                    raise CH341SPIError(f"SPI IN bulk transfer failed: {e}") from e
+                if got <= 0:
+                    raise CH341SPIError("SPI IN bulk transfer short read (0 bytes)")
+                data += ctypes.string_at(at, got)
+            return data
 
         out = bytearray()
         while len(out) < nbytes:
@@ -594,16 +693,29 @@ class CH341Async:
         if pin < 0 or pin > 15:
             raise ValueError(f"GPIO pin must be 0-15, got {pin}")
 
-        GPIO_READ_BYTES = 6
-        GPIO_READ_TIMEOUT_MS = 200
+        fd = self._usbfs_fd
+        if fd is not None:
+            data = self._usbfs_pins
+            try:
+                data[0] = self.CMD_UIO_READ
+                fcntl.ioctl(fd, _USBDEVFS_BULK, self._usbfs_pins_out, True)
+            except OSError as e:
+                raise CH341Error(f"GPIO read write failed: {e}") from e
+            try:
+                got = fcntl.ioctl(fd, _USBDEVFS_BULK, self._usbfs_pins_in, True)
+            except OSError as e:
+                raise CH341Error(f"GPIO read IN failed: {e}") from e
+            if got != self.GPIO_READ_BYTES:
+                raise CH341Error(f"GPIO read IN failed: short read ({got} bytes)")
+            return bool(data[pin >> 3] & (1 << (pin & 7)))
 
         try:
-            self._bulk_write_all(bytes([self.CMD_UIO_READ]), timeout_ms=GPIO_READ_TIMEOUT_MS)
+            self._bulk_write_all(bytes([self.CMD_UIO_READ]), timeout_ms=self.GPIO_READ_TIMEOUT_MS)
         except Exception as e:
             raise CH341Error(f"GPIO read write failed: {e}") from e
 
         try:
-            data = self._bulk_read_exact(GPIO_READ_BYTES, timeout_ms=GPIO_READ_TIMEOUT_MS)
+            data = self._bulk_read_exact(self.GPIO_READ_BYTES, timeout_ms=self.GPIO_READ_TIMEOUT_MS)
         except Exception as e:
             raise CH341Error(f"GPIO read IN failed: {e}") from e
 
