@@ -321,6 +321,9 @@ class CH341Async:
             b >>= 1
         return result
 
+    # reverse_byte() of every value, to translate a whole buffer in one call.
+    _REVERSED = bytes(map(reverse_byte, range(256)))
+
     def _is_timeout(self, e: Exception) -> bool:
         if not isinstance(e, usb.core.USBError):
             return False
@@ -506,15 +509,13 @@ class CH341Async:
             write_now = min(self.MAX_PAYLOAD, write_left)
             read_now = min(self.MAX_PAYLOAD - write_now, read_left)
 
-            packet = bytearray([self.CMD_SPI_STREAM])
+            packet = (
+                bytes((self.CMD_SPI_STREAM,))
+                + bytes(data_out[write_idx : write_idx + write_now]).translate(self._REVERSED)
+                + b"\xff" * read_now
+            )
 
-            for i in range(write_now):
-                packet.append(self.reverse_byte(data_out[write_idx + i]))
-
-            if read_now > 0:
-                packet.extend([0xFF] * read_now)
-
-            self._bulk_write_all(bytes(packet), timeout_ms=self.USB_TIMEOUT)
+            self._bulk_write_all(packet, timeout_ms=self.USB_TIMEOUT)
             miso_raw.extend(
                 self._bulk_read_exact(write_now + read_now, timeout_ms=self.USB_TIMEOUT)
             )
@@ -524,8 +525,8 @@ class CH341Async:
             read_left -= read_now
 
         if readcnt > 0:
-            return bytes(self.reverse_byte(b) for b in miso_raw[writecnt : writecnt + readcnt])
-        return bytes(self.reverse_byte(b) for b in miso_raw[:writecnt])
+            return bytes(miso_raw[writecnt : writecnt + readcnt]).translate(self._REVERSED)
+        return bytes(miso_raw[:writecnt]).translate(self._REVERSED)
 
     def _uio_stream(
         self,
