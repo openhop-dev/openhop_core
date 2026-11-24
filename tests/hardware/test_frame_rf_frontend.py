@@ -456,7 +456,7 @@ async def test_sync_rf_wait_preserves_received_packets(cls, draining):
         if radio.rx_callback.called:
             break
         await asyncio.sleep(0.001)
-    radio.rx_callback.assert_called_once_with(b"packet")
+    radio.rx_callback.assert_called_once_with(b"packet", -90, 2.5)
 
 
 @pytest.mark.asyncio

@@ -81,6 +81,7 @@ from .protocol_constants import (
     build_frame,
     crc16_ccitt,
 )
+from .rx_delivery import deliver_rx_packet
 
 logger = logging.getLogger("USBLoRaRadio")
 
@@ -1125,7 +1126,9 @@ class USBLoRaRadio(_RadioBase, FrameRfControls):
             # RuntimeError and the packet is silently dropped (dispatcher.py:306-308).
             if self.rx_callback:
                 if self._event_loop and self._event_loop.is_running():
-                    self._event_loop.call_soon_threadsafe(self.rx_callback, lora_data)
+                    self._event_loop.call_soon_threadsafe(
+                        deliver_rx_packet, self.rx_callback, lora_data, rssi, snr_x10 / 10.0
+                    )
                 else:
                     logger.warning("RX packet but event loop not running — dropping")
             else:
