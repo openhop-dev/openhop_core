@@ -1041,3 +1041,35 @@ async def test_restore_and_reply_share_one_command_timeout(cls):
     finally:
         restore_done.cancel()
         late_reply.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cls", [TCPLoRaRadio, USBLoRaRadio])
+async def test_saved_settings_apply_when_begin_runs_on_the_event_loop(cls):
+    """The repeater calls begin() from its async initialize(), on the loop's thread.
+
+    Before the RX worker starts, the restore must still reach the modem rather
+    than be refused as "called on an event loop".
+    """
+    radio = cls("unused", radio_config={"agc_reset_interval_seconds": 8})
+    if cls is TCPLoRaRadio:
+        radio._sock = object()
+    else:
+        radio._serial = SimpleNamespace(is_open=True)
+    radio._rf_write_frame = Mock()
+    replies = iter([_caps(RF_CAP_AGC), (CMD_AGC_INTERVAL_RESP, _u16(8))])
+    radio._read_frame_sync = lambda timeout: next(replies)
+
+    radio.apply_saved_rf_controls()  # synchronously, on the running loop's thread
+
+    assert radio.applied_hardware_config["agc_reset_interval_seconds"] == 8
+    assert radio._rf_write_frame.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rf_control_from_the_event_loop_is_still_refused_outside_restore():
+    radio = TCPLoRaRadio("unused")
+    radio._sock = object()
+    radio._rf_write_frame = Mock()
+    assert radio.get_agc_reset_interval() is None
+    radio._rf_write_frame.assert_not_called()
